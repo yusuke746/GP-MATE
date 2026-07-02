@@ -20,9 +20,14 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 
 ## Setup
 
-1. Install dependencies.
-2. Copy `.env.example` to `.env`.
-3. Fill required values in `.env`:
+1. Create and activate virtual environment (PowerShell):
+   - `python -m venv .venv`
+   - `.\.venv\Scripts\Activate.ps1`
+2. Upgrade pip and install dependencies:
+   - `python -m pip install --upgrade pip`
+   - `pip install -r requirements.txt`
+3. Copy `.env.example` to `.env`.
+4. Fill required values in `.env`:
    - MT5 credentials (`MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_PATH`)
    - API keys (`OPENAI_API_KEY`, optional `NEWS_API_KEY`, `FRED_API_KEY`)
 
