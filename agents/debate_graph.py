@@ -7,9 +7,19 @@ import time
 from operator import add
 from typing import Any, Callable, Literal, TypedDict, cast
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
-from langgraph.graph import END, START, StateGraph
+try:
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_openai import ChatOpenAI
+    from langgraph.graph import END, START, StateGraph
+    _LANGCHAIN_IMPORT_ERROR = ""
+except ModuleNotFoundError as exc:
+    HumanMessage = Any  # type: ignore[assignment]
+    SystemMessage = Any  # type: ignore[assignment]
+    ChatOpenAI = None  # type: ignore[assignment]
+    END = "END"  # type: ignore[assignment]
+    START = "START"  # type: ignore[assignment]
+    StateGraph = None  # type: ignore[assignment]
+    _LANGCHAIN_IMPORT_ERROR = str(exc)
 from typing_extensions import Annotated
 
 LOGGER = logging.getLogger(__name__)
@@ -722,6 +732,11 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
         "error": "",
     }
 
+    if ChatOpenAI is None:
+        fallback["error"] = f"missing dependency: {_LANGCHAIN_IMPORT_ERROR or 'langchain modules unavailable'}"
+        LOGGER.warning("debate_graph %s skipped: %s", role, fallback["error"])
+        return fallback
+
     attempts = BEAR_MAX_ATTEMPTS if role == "bear" else 1
     for attempt in range(attempts):
         try:
@@ -833,6 +848,19 @@ def _invoke_judge_llm(state: DebateState) -> _JudgeResponse:
         },
     }
     fallback = _default_judge_summary()
+
+    if ChatOpenAI is None:
+        summary = _build_judge_summary_from_state(
+            state,
+            f"missing dependency: {_LANGCHAIN_IMPORT_ERROR or 'langchain modules unavailable'}",
+        )
+        LOGGER.warning("debate_graph judge skipped: %s", _LANGCHAIN_IMPORT_ERROR or "langchain modules unavailable")
+        return {
+            "judge_summary": summary,
+            "usage": _zero_usage(),
+            "ok": False,
+            "error": f"missing dependency: {_LANGCHAIN_IMPORT_ERROR or 'langchain modules unavailable'}",
+        }
 
     for attempt in range(JUDGE_MAX_ATTEMPTS):
         try:
@@ -1062,6 +1090,9 @@ def _should_continue(state: DebateState) -> Literal["bull", "judge"]:
 
 
 def _build_graph(llm: RoleLLMCallable | None):
+    if StateGraph is None:
+        raise RuntimeError(f"langgraph unavailable: {_LANGCHAIN_IMPORT_ERROR or 'missing dependencies'}")
+
     graph = StateGraph(DebateState)
 
     graph.add_node("bull", lambda s: _bull_node(s, llm))
