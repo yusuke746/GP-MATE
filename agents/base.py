@@ -63,14 +63,34 @@ class LLMClient:
             )
 
             output_text = getattr(response, "output_text", "") or ""
-            payload = json.loads(output_text) if output_text else fallback_payload
-
             usage_obj = getattr(response, "usage", None)
             usage = LLMUsage(
                 prompt_tokens=int(getattr(usage_obj, "input_tokens", 0) or 0),
                 completion_tokens=int(getattr(usage_obj, "output_tokens", 0) or 0),
                 total_tokens=int(getattr(usage_obj, "total_tokens", 0) or 0),
             )
+
+            if not output_text.strip():
+                return LLMResult(
+                    ok=False,
+                    payload=fallback_payload,
+                    usage=usage,
+                    model=model,
+                    error="empty output",
+                )
+
+            try:
+                payload = json.loads(output_text)
+            except json.JSONDecodeError as exc:
+                LOGGER.warning("LLM JSON parse failed: %s", exc)
+                return LLMResult(
+                    ok=False,
+                    payload=fallback_payload,
+                    usage=usage,
+                    model=model,
+                    error="json parse error",
+                )
+
             return LLMResult(
                 ok=True,
                 payload=payload,
@@ -125,14 +145,19 @@ class LLMClient:
             )
 
             payload = fallback_payload
+            found_call = False
             output_items = getattr(response, "output", []) or []
             for item in output_items:
                 item_type = getattr(item, "type", "")
                 item_name = getattr(item, "name", "")
                 if item_type == "function_call" and item_name == function_name:
+                    found_call = True
                     arguments = str(getattr(item, "arguments", "") or "")
                     if arguments:
-                        payload = json.loads(arguments)
+                        try:
+                            payload = json.loads(arguments)
+                        except json.JSONDecodeError as exc:
+                            LOGGER.warning("LLM function arguments parse failed: %s", exc)
                     break
 
             usage_obj = getattr(response, "usage", None)
@@ -141,8 +166,27 @@ class LLMClient:
                 completion_tokens=int(getattr(usage_obj, "output_tokens", 0) or 0),
                 total_tokens=int(getattr(usage_obj, "total_tokens", 0) or 0),
             )
+
+            if not found_call:
+                return LLMResult(
+                    ok=False,
+                    payload=fallback_payload,
+                    usage=usage,
+                    model=model,
+                    error="function_call not found",
+                )
+
+            if payload is fallback_payload:
+                return LLMResult(
+                    ok=False,
+                    payload=fallback_payload,
+                    usage=usage,
+                    model=model,
+                    error="json parse error",
+                )
+
             return LLMResult(
-                ok=True,
+                ok=found_call,
                 payload=payload,
                 usage=usage,
                 model=model,

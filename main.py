@@ -13,7 +13,9 @@ from agents.sentiment import analyze_sentiment
 from agents.technical import analyze_technical
 from agents.trader import decide_trade
 from config import (
+    CONSECUTIVE_LOSS_LIMIT,
     JUDGMENT_TIMES,
+    MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
     NEWS_FILTER_MINUTES,
     SPREAD_SAMPLE_INTERVAL,
@@ -38,6 +40,8 @@ LOGGER = logging.getLogger(__name__)
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 TRADE_LOG_PATH = LOG_DIR / "trade_log.csv"
 CLOSED_DEAL_STATE_PATH = LOG_DIR / "closed_deal_state.json"
+SCHEDULER_CATCHUP_WINDOW_SECONDS = 5 * 60
+SCHEDULER_REFERENCE_BALANCE_JPY = 500000.0
 
 TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "timestamp_utc",
@@ -235,10 +239,165 @@ def _extract_model_name(payload: dict[str, Any]) -> str:
     return str(meta.get("model", "")) if isinstance(meta, dict) else ""
 
 
+def _parse_judgment_time(value: str) -> tuple[int, int] | None:
+    try:
+        hh_str, mm_str = value.split(":", 1)
+        hh = int(hh_str)
+        mm = int(mm_str)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+        return hh, mm
+    except Exception:
+        return None
+
+
+def calc_today_risk_stats() -> tuple[int, float]:
+    """Calculate today's consecutive losses and daily loss percentage from trade log.
+
+    - consecutive_losses: count trailing realized losing closures; reset by realized win or HOLD row.
+    - daily_loss_pct: today's realized loss percent (loss only) vs current balance.
+    - On aggregation failure, return blocking thresholds (safe side).
+    """
+    try:
+        if not TRADE_LOG_PATH.exists():
+            return 0, 0.0
+
+        now_utc = datetime.now(UTC)
+        today = now_utc.date()
+        today_rows: list[dict[str, Any]] = []
+
+        with TRADE_LOG_PATH.open("r", newline="", encoding="utf-8") as fp:
+            reader = csv.DictReader(fp)
+            for row in reader:
+                ts_raw = str(row.get("timestamp_utc", "") or "").strip()
+                if not ts_raw:
+                    continue
+
+                ts = datetime.fromisoformat(ts_raw)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+                else:
+                    ts = ts.astimezone(UTC)
+
+                if ts.date() != today:
+                    continue
+
+                action = str(row.get("action", "") or "").strip().upper()
+                reasoning = str(row.get("reasoning", "") or "").strip()
+
+                pnl_value: float | None = None
+                pnl_raw = str(row.get("pnl", "") or "").strip()
+                if pnl_raw:
+                    pnl_value = float(pnl_raw)
+
+                today_rows.append(
+                    {
+                        "timestamp": ts,
+                        "action": action,
+                        "reasoning": reasoning,
+                        "pnl": pnl_value,
+                    }
+                )
+
+        if not today_rows:
+            return 0, 0.0
+
+        today_rows.sort(key=lambda x: x["timestamp"])
+
+        consecutive_losses = 0
+        for row in reversed(today_rows):
+            action = str(row.get("action", ""))
+            if action == "HOLD":
+                break
+
+            pnl = row.get("pnl")
+            if pnl is None:
+                continue
+
+            pnl_value = float(pnl)
+            if pnl_value < 0:
+                consecutive_losses += 1
+                continue
+            break
+
+        realized_today_pnl = 0.0
+        has_realized_today = False
+        for row in today_rows:
+            if str(row.get("reasoning", "")) != "closed_trade_sync":
+                continue
+            pnl = row.get("pnl")
+            if pnl is None:
+                continue
+            has_realized_today = True
+            realized_today_pnl += float(pnl)
+
+        if not has_realized_today or realized_today_pnl >= 0:
+            return consecutive_losses, 0.0
+
+        account_info = get_account_info()
+        if not account_info.get("success") or account_info.get("data") is None:
+            LOGGER.warning("calc_today_risk_stats: account info unavailable, using safe fallback")
+            return CONSECUTIVE_LOSS_LIMIT, MAX_DAILY_LOSS_PCT
+
+        balance = float(account_info["data"].balance)
+        if balance <= 0:
+            LOGGER.warning("calc_today_risk_stats: non-positive balance, using safe fallback")
+            return CONSECUTIVE_LOSS_LIMIT, MAX_DAILY_LOSS_PCT
+
+        daily_loss_jpy = abs(min(realized_today_pnl, 0.0))
+        daily_loss_pct = daily_loss_jpy / balance
+        return consecutive_losses, daily_loss_pct
+    except Exception as exc:
+        LOGGER.exception("calc_today_risk_stats failed; using safe fallback: %s", exc)
+        return CONSECUTIVE_LOSS_LIMIT, MAX_DAILY_LOSS_PCT
+
+
+def _run_scheduler_due_jobs(
+    now_local: datetime,
+    executed_today: set[str],
+    baseline_spread: float | None,
+) -> None:
+    now_utc = now_local.astimezone(UTC) if now_local.tzinfo is not None else now_local.replace(tzinfo=UTC)
+
+    for value in JUDGMENT_TIMES:
+        parsed = _parse_judgment_time(value)
+        if parsed is None:
+            LOGGER.warning("Invalid JUDGMENT_TIMES entry skipped: %s", value)
+            continue
+
+        hour, minute = parsed
+        target = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        delta = (now_local - target).total_seconds()
+        execution_key = target.strftime("%Y-%m-%d-%H:%M")
+
+        if execution_key in executed_today:
+            continue
+        if not (0 <= delta <= SCHEDULER_CATCHUP_WINDOW_SECONDS):
+            continue
+
+        try:
+            consecutive_losses, daily_loss_pct = calc_today_risk_stats()
+        except Exception as exc:
+            LOGGER.exception("Risk aggregation failed; using safe fallback: %s", exc)
+            consecutive_losses = CONSECUTIVE_LOSS_LIMIT
+            daily_loss_pct = MAX_DAILY_LOSS_PCT
+
+        try:
+            run_once(
+                baseline_spread=baseline_spread,
+                consecutive_losses=consecutive_losses,
+                daily_loss_pct=daily_loss_pct,
+            )
+        except Exception as exc:
+            LOGGER.exception("run_once failed in scheduler loop (continuing): %s", exc)
+        finally:
+            executed_today.add(execution_key)
+
+
 def run_once(
     baseline_spread: float | None = None,
-    consecutive_losses: int = 0,
-    daily_loss_pct: float = 0.0,
+    consecutive_losses: int | None = None,
+    daily_loss_pct: float | None = None,
 ) -> dict[str, Any]:
     """Execute one full decision cycle.
 
@@ -260,6 +419,15 @@ def run_once(
                 samples=SPREAD_SAMPLES,
                 interval_sec=SPREAD_SAMPLE_INTERVAL,
             )
+
+        dynamic_consecutive_losses, dynamic_daily_loss_pct = calc_today_risk_stats()
+        effective_consecutive_losses = dynamic_consecutive_losses
+        if consecutive_losses is not None:
+            effective_consecutive_losses = max(consecutive_losses, dynamic_consecutive_losses)
+
+        effective_daily_loss_pct = dynamic_daily_loss_pct
+        if daily_loss_pct is not None:
+            effective_daily_loss_pct = max(daily_loss_pct, dynamic_daily_loss_pct)
 
         if calibrated_baseline is None:
             result = {
@@ -429,8 +597,8 @@ def run_once(
             spread=spread,
             baseline_spread=calibrated_baseline,
             is_news_soon=False,
-            consecutive_losses=consecutive_losses,
-            daily_loss_pct=daily_loss_pct,
+            consecutive_losses=effective_consecutive_losses,
+            daily_loss_pct=effective_daily_loss_pct,
         )
 
         account_info = get_account_info()
@@ -530,26 +698,25 @@ def run_once(
 
 def run_scheduler(
     baseline_spread: float | None = None,
-    consecutive_losses: int = 0,
-    daily_loss_pct: float = 0.0,
+    consecutive_losses: int | None = None,
+    daily_loss_pct: float | None = None,
 ) -> None:
     """Run scheduler loop and execute strategy at configured judgment times."""
+    _ = (consecutive_losses, daily_loss_pct)
     executed_today: set[str] = set()
     while True:
-        now = datetime.now()
-        current = now.strftime("%H:%M")
-        today = now.strftime("%Y-%m-%d")
+        now_local = datetime.now()
+        today = now_local.strftime("%Y-%m-%d")
 
-        if current in JUDGMENT_TIMES and f"{today}-{current}" not in executed_today:
-            run_once(
-                baseline_spread=baseline_spread,
-                consecutive_losses=consecutive_losses,
-                daily_loss_pct=daily_loss_pct,
-            )
-            executed_today.add(f"{today}-{current}")
-
-        # Keep set bounded per day.
+        # Keep executed keys bounded per day.
         executed_today = {x for x in executed_today if x.startswith(today)}
+
+        _run_scheduler_due_jobs(
+            now_local=now_local,
+            executed_today=executed_today,
+            baseline_spread=baseline_spread,
+        )
+
         time.sleep(20)
 
 

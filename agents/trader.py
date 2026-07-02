@@ -64,7 +64,11 @@ def decide_trade(
     payload = dict(result.payload)
     action = str(payload.get("action", "HOLD")).upper()
     confidence = float(payload.get("confidence", 0.0) or 0.0)
+    confidence = max(0.0, min(1.0, confidence))
     evidence_status = str(sentiment_report.get("evidence_status", "")).upper()
+    risk_level = str(payload.get("risk_level") or "HIGH").upper()
+    if risk_level not in {"LOW", "MID", "HIGH"}:
+        risk_level = "HIGH"
 
     if action not in {"BUY", "SELL", "HOLD"}:
         action = "HOLD"
@@ -77,6 +81,7 @@ def decide_trade(
     payload["action"] = action
     payload["symbol"] = str(payload.get("symbol") or SYMBOL)
     payload["confidence"] = confidence
+    payload["risk_level"] = risk_level
 
     payload["_meta"] = {
         "ok": result.ok,
