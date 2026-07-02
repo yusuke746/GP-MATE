@@ -77,8 +77,8 @@ def test_run_once_holds_when_spread_exceeds_multiplier(tmp_path: Path, monkeypat
     )
     monkeypatch.setattr(
         main,
-        "run_debate",
-        lambda t, s: {"_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}},
+        "run_debate_graph",
+        lambda t, s, m=None: {"_meta": {"ok": True, "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}},
     )
     monkeypatch.setattr(
         main,

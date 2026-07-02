@@ -42,10 +42,22 @@ def decide_trade(
     debate_report: dict[str, Any],
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
 ) -> dict[str, Any]:
+    raw_judge_summary = debate_report.get("judge_summary", {})
+    judge_summary: dict[str, Any]
+    if isinstance(raw_judge_summary, dict):
+        judge_summary = dict(raw_judge_summary)
+    else:
+        judge_summary = {
+            "agreements": [],
+            "conflicts": [str(raw_judge_summary)] if raw_judge_summary else [],
+            "confidence_shift": {"bull": [], "bear": []},
+            "stronger_side": "neutral",
+        }
     user_payload = {
         "technical": technical_report,
         "sentiment": sentiment_report,
         "debate": debate_report,
+        "judge_summary": judge_summary,
         "constraints": {
             "confidence_threshold": confidence_threshold,
             "symbol": SYMBOL,

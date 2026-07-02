@@ -8,7 +8,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from agents.debate import run_debate
+from agents.debate_graph import build_skipped_debate_report, run_debate_graph, should_execute_debate
+from agents.data.fred_client import get_macro_data
+from agents.macro_analyst import analyze_macro_environment
 from agents.sentiment import analyze_sentiment
 from agents.technical import analyze_technical
 from agents.trader import decide_trade
@@ -548,6 +550,7 @@ def run_once(
             _append_trade_log(result)
             return result
 
+        d1 = add_indicators(get_rates(SYMBOL, "D1", 300))
         h4 = add_indicators(get_rates(SYMBOL, "H4", 300))
         h1 = add_indicators(get_rates(SYMBOL, "H1", 300))
         if h4.empty or h1.empty:
@@ -581,15 +584,46 @@ def run_once(
 
         news_items = fetch_news(hours=24)
 
+        macro_data = get_macro_data(force_refresh=False)
+        macro_report = analyze_macro_environment(macro_data)
+
         technical_report = analyze_technical(
             {
+                "d1": _extract_latest_features(d1) if not d1.empty else {},
                 "h4": _extract_latest_features(h4),
                 "h1": _extract_latest_features(h1),
             }
         )
         sentiment_report = analyze_sentiment(news_items)
-        debate_report = run_debate(technical_report, sentiment_report)
-        trader_report = decide_trade(technical_report, sentiment_report, debate_report)
+        gate = should_execute_debate(technical_report, sentiment_report, macro_report)
+        if gate["should_debate"]:
+            debate_report = run_debate_graph(technical_report, sentiment_report, macro_report)
+            debate_meta = debate_report.get("_meta", {}) if isinstance(debate_report, dict) else {}
+            debate_ok = bool(debate_meta.get("ok", False)) if isinstance(debate_meta, dict) else False
+
+            if debate_ok:
+                trader_report = decide_trade(technical_report, sentiment_report, debate_report)
+            else:
+                trader_report = {
+                    "action": "HOLD",
+                    "symbol": SYMBOL,
+                    "confidence": 0.0,
+                    "reasoning": "議論エンジン失敗のためHOLD",
+                    "risk_level": "HIGH",
+                    "_meta": {
+                        "ok": False,
+                        "model": "",
+                        "error": "debate graph failed",
+                        "usage": {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                    },
+                }
+        else:
+            debate_report = build_skipped_debate_report(gate["reason"])
+            trader_report = decide_trade(technical_report, sentiment_report, debate_report)
 
         spread = get_spread(SYMBOL)
         filter_result = check_filters(

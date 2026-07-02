@@ -1,117 +1,48 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from agents.base import analysis_model, get_default_client
-
-BULL_SYSTEM_PROMPT = "あなたは強気リサーチャーです。事実ベースで買い根拠をJSONで返してください。"
-BEAR_SYSTEM_PROMPT = "あなたは弱気リサーチャーです。リスクと反証をJSONで返してください。"
-
-BULL_FALLBACK: dict[str, Any] = {
-    "bull_case": "分析失敗につき十分な買い根拠なし。",
-    "conviction": 0.0,
-}
-
-BEAR_FALLBACK: dict[str, Any] = {
-    "bear_case": "分析失敗につき見送りが妥当。",
-    "conviction": 1.0,
-}
+from agents.debate_graph import run_debate_graph
 
 
 def run_debate(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
 ) -> dict[str, Any]:
-    base_context = {
-        "technical": technical_report,
-        "sentiment": sentiment_report,
+    """Backward-compatible wrapper for legacy tests and call sites.
+
+    Internally delegates to the LangGraph-based debate engine.
+    """
+    report = run_debate_graph(technical_report, sentiment_report)
+
+    bull_args = list(report.get("bull_arguments", []))
+    bear_args = list(report.get("bear_arguments", []))
+
+    round1 = {
+        "bull": {
+            "bull_case": bull_args[0] if len(bull_args) >= 1 else "",
+            "conviction": float(report.get("bull_confidence", 0.0) or 0.0),
+        },
+        "bear": {
+            "bear_case": bear_args[0] if len(bear_args) >= 1 else "",
+            "conviction": float(report.get("bear_confidence", 0.0) or 0.0),
+        },
     }
 
-    bull_round_1 = get_default_client().call_json(
-        system_prompt=BULL_SYSTEM_PROMPT,
-        user_prompt=json.dumps(base_context, ensure_ascii=False),
-        model=analysis_model(),
-        fallback_payload=BULL_FALLBACK,
-    )
-
-    bear_round_1 = get_default_client().call_json(
-        system_prompt=BEAR_SYSTEM_PROMPT,
-        user_prompt=json.dumps(
-            {
-                **base_context,
-                "bull_case": bull_round_1.payload,
-            },
-            ensure_ascii=False,
-        ),
-        model=analysis_model(),
-        fallback_payload=BEAR_FALLBACK,
-    )
-
-    bull_round_2 = get_default_client().call_json(
-        system_prompt=BULL_SYSTEM_PROMPT,
-        user_prompt=json.dumps(
-            {
-                **base_context,
-                "bull_round_1": bull_round_1.payload,
-                "bear_round_1": bear_round_1.payload,
-            },
-            ensure_ascii=False,
-        ),
-        model=analysis_model(),
-        fallback_payload=BULL_FALLBACK,
-    )
-
-    bear_round_2 = get_default_client().call_json(
-        system_prompt=BEAR_SYSTEM_PROMPT,
-        user_prompt=json.dumps(
-            {
-                **base_context,
-                "bull_round_1": bull_round_1.payload,
-                "bear_round_1": bear_round_1.payload,
-                "bull_round_2": bull_round_2.payload,
-            },
-            ensure_ascii=False,
-        ),
-        model=analysis_model(),
-        fallback_payload=BEAR_FALLBACK,
-    )
-
-    total_prompt = (
-        bull_round_1.usage.prompt_tokens
-        + bear_round_1.usage.prompt_tokens
-        + bull_round_2.usage.prompt_tokens
-        + bear_round_2.usage.prompt_tokens
-    )
-    total_completion = (
-        bull_round_1.usage.completion_tokens
-        + bear_round_1.usage.completion_tokens
-        + bull_round_2.usage.completion_tokens
-        + bear_round_2.usage.completion_tokens
-    )
+    round2 = {
+        "bull": {
+            "bull_case": bull_args[1] if len(bull_args) >= 2 else round1["bull"]["bull_case"],
+            "conviction": float(report.get("bull_confidence", 0.0) or 0.0),
+        },
+        "bear": {
+            "bear_case": bear_args[1] if len(bear_args) >= 2 else round1["bear"]["bear_case"],
+            "conviction": float(report.get("bear_confidence", 0.0) or 0.0),
+        },
+    }
 
     return {
-        "round1": {
-            "bull": bull_round_1.payload,
-            "bear": bear_round_1.payload,
-        },
-        "round2": {
-            "bull": bull_round_2.payload,
-            "bear": bear_round_2.payload,
-        },
-        "_meta": {
-            "ok": all(
-                [
-                    bull_round_1.ok,
-                    bear_round_1.ok,
-                    bull_round_2.ok,
-                    bear_round_2.ok,
-                ]
-            ),
-            "usage": {
-                "prompt_tokens": total_prompt,
-                "completion_tokens": total_completion,
-                "total_tokens": total_prompt + total_completion,
-            },
-        },
+        "round1": round1,
+        "round2": round2,
+        "judge_summary": str(report.get("judge_summary", "") or ""),
+        "_meta": dict(report.get("_meta", {})),
     }
