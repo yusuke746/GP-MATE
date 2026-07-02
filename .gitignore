@@ -1,0 +1,27 @@
+# 機密情報（絶対公開禁止）
+.env
+*.env
+.env.*
+!.env.example
+
+# ログ・取引記録（口座番号・残高・履歴を含む）
+logs/
+*.csv
+*.log
+
+# 状態ファイル
+closed_deal_state.json
+*_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
