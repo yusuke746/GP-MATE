@@ -3,10 +3,20 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import sys
 import time
+import warnings
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+# Suppress known non-fatal warning from langchain_core on Python 3.14+.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Core Pydantic V1 functionality isn't compatible with Python 3\.14 or greater\.",
+    category=UserWarning,
+    module=r"langchain_core\.utils\.pydantic",
+)
 
 from agents.debate_graph import build_skipped_debate_report, run_debate_graph, should_execute_debate
 from agents.data.fred_client import get_macro_data
@@ -44,6 +54,16 @@ TRADE_LOG_PATH = LOG_DIR / "trade_log.csv"
 CLOSED_DEAL_STATE_PATH = LOG_DIR / "closed_deal_state.json"
 SCHEDULER_CATCHUP_WINDOW_SECONDS = 5 * 60
 SCHEDULER_REFERENCE_BALANCE_JPY = 500000.0
+
+
+def python_runtime_notice() -> str:
+    version = sys.version_info
+    if version >= (3, 14):
+        return (
+            "Python 3.14+ detected: LangChain may show compatibility warnings. "
+            "Recommended runtime is Python 3.12-3.13 for stable operation."
+        )
+    return ""
 
 TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "timestamp_utc",

@@ -30,6 +30,10 @@ def _confirm_order(action: str, symbol: str, lot: float, sl: float, tp: float) -
 
 
 def main() -> int:
+    runtime_notice = strategy_main.python_runtime_notice()
+    if runtime_notice:
+        print(f"[Runtime Notice] {runtime_notice}")
+
     info = get_account_info()
     if not info.get("success"):
         print("接続失敗。手動実行を中止します。", info.get("reason", ""))

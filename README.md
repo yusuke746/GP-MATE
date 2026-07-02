@@ -20,6 +20,9 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 
 ## Setup
 
+- Recommended Python: 3.12 or 3.13
+- Python 3.14+: supported with safe fallback, but some LangChain internals may emit compatibility warnings.
+
 1. Create and activate virtual environment (PowerShell):
    - `python -m venv .venv`
    - `.\.venv\Scripts\Activate.ps1`
