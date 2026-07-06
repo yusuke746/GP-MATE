@@ -87,10 +87,24 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
-        "analysis_model",
-        "decision_model",
+    "analysis_model",
+    "decision_model",
     "news_count",
     "error",
+    "debate_executed",
+    "skip_reason",
+    "stronger_side",
+    "conflicts",
+    "confidence_shift",
+    "debate_tokens",
+    "judge_parse_ok",
+    "judge_error",
+    "debate_gate_reason",
+    "technical_direction",
+    "sentiment_direction",
+    "macro_direction",
+    "alignment",
+    "estimated_confidence",
 )
 
 
@@ -259,6 +273,70 @@ def _sum_token_usage(*payloads: dict[str, Any]) -> dict[str, int]:
 def _extract_model_name(payload: dict[str, Any]) -> str:
     meta = payload.get("_meta", {}) if isinstance(payload, dict) else {}
     return str(meta.get("model", "")) if isinstance(meta, dict) else ""
+
+
+def _safe_json_dumps(value: Any, default: str) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return default
+
+
+def _default_debate_log_fields() -> dict[str, Any]:
+    return {
+        "debate_executed": "",
+        "skip_reason": "",
+        "stronger_side": "",
+        "conflicts": "[]",
+        "confidence_shift": "{}",
+        "debate_tokens": 0,
+        "judge_parse_ok": "",
+        "judge_error": "",
+        "debate_gate_reason": "",
+        "technical_direction": "",
+        "sentiment_direction": "",
+        "macro_direction": "",
+        "alignment": "",
+        "estimated_confidence": "",
+    }
+
+
+def _extract_debate_log_fields(gate: dict[str, Any], debate_report: dict[str, Any]) -> dict[str, Any]:
+    fields = _default_debate_log_fields()
+
+    should_debate = bool(gate.get("should_debate", False))
+    fields["debate_executed"] = should_debate
+    fields["debate_gate_reason"] = str(gate.get("reason", "") or "")
+    fields["technical_direction"] = str(gate.get("technical_direction", "") or "")
+    fields["sentiment_direction"] = str(gate.get("sentiment_direction", "") or "")
+    fields["macro_direction"] = str(gate.get("macro_direction", "") or "")
+    fields["alignment"] = str(gate.get("alignment", "") or "")
+    estimated_confidence = gate.get("estimated_confidence", "")
+    fields["estimated_confidence"] = estimated_confidence if estimated_confidence != "" else ""
+    if not should_debate:
+        fields["skip_reason"] = str(gate.get("reason", "") or "")
+
+    judge_summary = debate_report.get("judge_summary", {}) if isinstance(debate_report, dict) else {}
+    if isinstance(judge_summary, dict):
+        fields["stronger_side"] = str(judge_summary.get("stronger_side", "") or "")
+        fields["conflicts"] = _safe_json_dumps(judge_summary.get("conflicts", []), default="[]")
+        fields["confidence_shift"] = _safe_json_dumps(judge_summary.get("confidence_shift", {}), default="{}")
+
+    debate_meta = debate_report.get("_meta", {}) if isinstance(debate_report, dict) else {}
+    if isinstance(debate_meta, dict):
+        usage = debate_meta.get("usage", {})
+        if isinstance(usage, dict):
+            fields["debate_tokens"] = int(usage.get("total_tokens", 0) or 0)
+
+        if "debate_executed" in debate_meta:
+            fields["debate_executed"] = bool(debate_meta.get("debate_executed"))
+        if "skip_reason" in debate_meta and not should_debate:
+            fields["skip_reason"] = str(debate_meta.get("skip_reason", "") or "")
+        if "judge_ok" in debate_meta:
+            fields["judge_parse_ok"] = bool(debate_meta.get("judge_ok"))
+        fields["judge_error"] = str(debate_meta.get("judge_error", "") or "")
+
+    return fields
 
 
 def _parse_judgment_time(value: str) -> tuple[int, int] | None:
@@ -645,6 +723,12 @@ def run_once(
             debate_report = build_skipped_debate_report(gate["reason"])
             trader_report = decide_trade(technical_report, sentiment_report, debate_report)
 
+        try:
+            debate_log_fields = _extract_debate_log_fields(gate=gate, debate_report=debate_report)
+        except Exception as exc:
+            LOGGER.warning("Failed to extract debate log fields; defaults used: %s", exc)
+            debate_log_fields = _default_debate_log_fields()
+
         spread = get_spread(SYMBOL)
         filter_result = check_filters(
             confidence=float(trader_report.get("confidence", 0.0) or 0.0),
@@ -716,6 +800,7 @@ def run_once(
             "decision_model": _extract_model_name(trader_report),
             "news_count": len(news_items),
             "error": str(order_result.get("reason", "")),
+            **debate_log_fields,
         }
         _append_trade_log(result)
         return result

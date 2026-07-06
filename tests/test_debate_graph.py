@@ -968,3 +968,160 @@ def test_judge_valid_json_still_processed_normally(monkeypatch) -> None:
     assert judge["ok"] is True
     assert judge["error"] == ""
     assert "エントリー方向" in judge["judge_summary"]["conflicts"]
+
+
+def test_judge_parse_recovered_sets_ok_and_error_marker(monkeypatch) -> None:
+    class _FakeResponse:
+        def __init__(self, content: str) -> None:
+            self.content = content
+            self.usage_metadata = {
+                "input_tokens": 7,
+                "output_tokens": 5,
+                "total_tokens": 12,
+            }
+
+    class _FakeChatOpenAI:
+        def __init__(self, model: str, temperature: float) -> None:
+            _ = model, temperature
+
+        def invoke(self, messages: list[Any]) -> _FakeResponse:
+            _ = messages
+            # missing comma between agreements and conflicts
+            return _FakeResponse('{"agreements":["a"] "conflicts":["b"],"stronger_side":"bear"}')
+
+    monkeypatch.setattr(debate_graph, "ChatOpenAI", _FakeChatOpenAI)
+    monkeypatch.setattr(debate_graph.time, "sleep", lambda _: None)
+
+    state: debate_graph.DebateState = {
+        "technical_report": {"signal": "BUY", "trend": "UP"},
+        "sentiment_report": {"score": 0.0},
+        "macro_report": {},
+        "bull_arguments": ["bull argument"],
+        "bear_arguments": ["bear argument"],
+        "bull_conceded_points": [],
+        "round_count": 1,
+        "max_rounds": 3,
+        "bull_confidence": 0.62,
+        "bear_confidence": 0.58,
+        "prev_bull_confidence": 0.5,
+        "bull_confidence_history": [0.5, 0.62],
+        "bear_confidence_history": [0.5, 0.58],
+        "bull_ok_history": [True],
+        "bear_ok_history": [True],
+        "judge_summary": debate_graph._default_judge_summary(),
+        "bull_ok": True,
+        "bear_ok": True,
+        "judge_ok": True,
+        "bull_error": "",
+        "bear_error": "",
+        "judge_error": "",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    judge = debate_graph._invoke_judge_llm(state)
+
+    assert judge["ok"] is True
+    assert judge["error"] == "json parse recovered"
+    assert judge["judge_summary"]["conflicts"] == ["b"]
+
+
+def test_judge_total_failure_keeps_algorithmic_stronger_side_in_graph() -> None:
+    def fake_llm(role: str, state: dict[str, Any]) -> dict[str, Any]:
+        if role == "bull":
+            return {
+                "argument": "bull argument",
+                "confidence": 0.82,
+                "conceded_points": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "ok": True,
+                "error": "",
+            }
+        if role == "bear":
+            return {
+                "argument": "bear argument",
+                "confidence": 0.52,
+                "conceded_points": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "ok": True,
+                "error": "",
+            }
+        return {
+            "judge_summary": {
+                "agreements": [],
+                "conflicts": ["judge json parse error"],
+                "stronger_side": "neutral",
+            },
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "ok": False,
+            "error": "json parse error",
+        }
+
+    report = run_debate_graph(
+        technical_report={"signal": "BUY", "trend": "UP"},
+        sentiment_report={"score": 0.1},
+        max_rounds=2,
+        llm_override=fake_llm,
+    )
+
+    assert report["_meta"]["judge_ok"] is False
+    assert report["_meta"]["judge_error"] == "json parse error"
+    assert report["judge_summary"]["stronger_side"] == "bull"
+
+
+def test_judge_parse_failure_logs_raw_focus(monkeypatch, caplog) -> None:
+    class _FakeResponse:
+        def __init__(self, content: str) -> None:
+            self.content = content
+            self.usage_metadata = {
+                "input_tokens": 5,
+                "output_tokens": 4,
+                "total_tokens": 9,
+            }
+
+    class _FakeChatOpenAI:
+        def __init__(self, model: str, temperature: float) -> None:
+            _ = model, temperature
+
+        def invoke(self, messages: list[Any]) -> _FakeResponse:
+            _ = messages
+            return _FakeResponse("noise only, not json")
+
+    monkeypatch.setattr(debate_graph, "ChatOpenAI", _FakeChatOpenAI)
+    monkeypatch.setattr(debate_graph.time, "sleep", lambda _: None)
+
+    state: debate_graph.DebateState = {
+        "technical_report": {"signal": "BUY", "trend": "UP"},
+        "sentiment_report": {"score": 0.0},
+        "macro_report": {},
+        "bull_arguments": ["bull argument"],
+        "bear_arguments": ["bear argument"],
+        "bull_conceded_points": [],
+        "round_count": 1,
+        "max_rounds": 3,
+        "bull_confidence": 0.62,
+        "bear_confidence": 0.59,
+        "prev_bull_confidence": 0.5,
+        "bull_confidence_history": [0.5, 0.62],
+        "bear_confidence_history": [0.5, 0.59],
+        "bull_ok_history": [True],
+        "bear_ok_history": [True],
+        "judge_summary": debate_graph._default_judge_summary(),
+        "bull_ok": True,
+        "bear_ok": True,
+        "judge_ok": True,
+        "bull_error": "",
+        "bear_error": "",
+        "judge_error": "",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    with caplog.at_level("WARNING"):
+        judge = debate_graph._invoke_judge_llm(state)
+
+    assert judge["ok"] is False
+    assert "json parse error" in judge["error"]
+    assert any("raw_focus=" in rec.message for rec in caplog.records)

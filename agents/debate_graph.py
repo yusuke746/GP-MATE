@@ -430,32 +430,62 @@ def _safe_json_loads(raw_text: str) -> dict[str, Any] | None:
 def _extract_json_string_list(raw_text: str, key: str) -> list[str]:
     pattern = rf'"{re.escape(key)}"\s*:\s*(\[[\s\S]*?\])'
     match = re.search(pattern, raw_text)
-    if not match:
+    if match:
+        array_text = match.group(1)
+        try:
+            parsed = json.loads(array_text)
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, list):
+            values = [str(x).strip() for x in parsed if str(x).strip()]
+            return values
+
+        quoted = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', array_text)
+        values = [x.strip() for x in quoted if x.strip()]
+        if values:
+            return values
+
+    # Lenient fallback for malformed JSON (e.g., missing commas/brackets).
+    section_pattern = rf'"{re.escape(key)}"\s*:\s*(.*?)(?=,\s*"(?:agreements|conflicts|stronger_side)"\s*:|\}}\s*$)'
+    section_match = re.search(section_pattern, raw_text, flags=re.DOTALL)
+    if not section_match:
         return []
 
-    array_text = match.group(1)
-    try:
-        parsed = json.loads(array_text)
-    except Exception:
-        parsed = None
-
-    if isinstance(parsed, list):
-        values = [str(x).strip() for x in parsed if str(x).strip()]
-        return values
-
-    quoted = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', array_text)
+    section_text = section_match.group(1)
+    quoted = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', section_text)
     return [x.strip() for x in quoted if x.strip()]
 
 
 def _extract_json_enum(raw_text: str, key: str, allowed: set[str], default: str) -> str:
-    pattern = rf'"{re.escape(key)}"\s*:\s*"([^"]+)"'
-    match = re.search(pattern, raw_text)
+    pattern_double = rf'"{re.escape(key)}"\s*:\s*"([^"]+)"'
+    pattern_single = rf"'{re.escape(key)}'\s*:\s*'([^']+)'"
+    match = re.search(pattern_double, raw_text)
+    if not match:
+        match = re.search(pattern_single, raw_text)
     if not match:
         return default
     value = str(match.group(1) or "").strip().lower()
     if value in allowed:
         return value
     return default
+
+
+def _extract_judge_raw_focus(raw_text: str) -> str:
+    keys = ["\"agreements\"", "\"conflicts\"", "\"stronger_side\""]
+    lowered = raw_text.lower()
+    hit_index = -1
+    for key in keys:
+        idx = lowered.find(key)
+        if idx != -1 and (hit_index == -1 or idx < hit_index):
+            hit_index = idx
+
+    if hit_index == -1:
+        return _slice_log_text(raw_text, 320)
+
+    start = max(0, hit_index - 80)
+    end = min(len(raw_text), hit_index + 320)
+    return _slice_log_text(raw_text[start:end], 320)
 
 
 def _slice_log_text(raw_text: str, max_len: int = 500) -> str:
@@ -904,8 +934,9 @@ def _invoke_judge_llm(state: DebateState) -> _JudgeResponse:
             recovered = _recover_judge_summary_from_raw_text(text)
             if recovered is not None:
                 LOGGER.warning(
-                    "debate_graph judge json parse recovered from raw text: raw_head=%s",
+                    "debate_graph judge json parse recovered from raw text: raw_head=%s raw_focus=%s",
                     _slice_log_text(text, 260),
+                    _extract_judge_raw_focus(text),
                 )
                 return {
                     "judge_summary": recovered,
@@ -915,10 +946,11 @@ def _invoke_judge_llm(state: DebateState) -> _JudgeResponse:
                 }
 
             LOGGER.warning(
-                "debate_graph judge json parse failed(attempt=%s/%s): raw_head=%s",
+                "debate_graph judge json parse failed(attempt=%s/%s): raw_head=%s raw_focus=%s",
                 attempt + 1,
                 JUDGE_MAX_ATTEMPTS,
                 _slice_log_text(text, 260),
+                _extract_judge_raw_focus(text),
             )
             if attempt + 1 < JUDGE_MAX_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF_SECONDS * (2**attempt))
