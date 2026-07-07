@@ -14,6 +14,7 @@ from data.mt5_client import get_account_info
 from main import run_once
 
 LOGGER = logging.getLogger("gp_mate.scheduler")
+SCHEDULER_MISFIRE_GRACE_SECONDS = 30
 
 
 def _trade_mode_name(trade_mode: int) -> str:
@@ -104,10 +105,16 @@ def main() -> int:
             LOGGER.warning("Invalid JUDGMENT_TIMES value skipped: %s", time_str)
             continue
         hour, minute = parsed
-        scheduler.add_job(_job_wrapper, "cron", hour=hour, minute=minute)
+        scheduler.add_job(
+            _job_wrapper,
+            "cron",
+            hour=hour,
+            minute=minute,
+            misfire_grace_time=SCHEDULER_MISFIRE_GRACE_SECONDS,
+        )
         LOGGER.info("Scheduled run_once at %02d:%02d", hour, minute)
 
-    LOGGER.info("Scheduler started")
+    LOGGER.info("Scheduler started misfire_grace_time=%ss", SCHEDULER_MISFIRE_GRACE_SECONDS)
     try:
         scheduler.start()
     except KeyboardInterrupt:

@@ -13,6 +13,9 @@ from config import MT5_LOGIN, MT5_PASSWORD, MT5_PATH, MT5_SERVER
 
 LOGGER = logging.getLogger(__name__)
 
+ORDER_MAGIC = 20260702
+ORDER_DEVIATION = 20
+
 try:
     import MetaTrader5 as mt5  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover - environment dependent
@@ -30,6 +33,92 @@ class AccountInfo:
     free_margin: float
     margin_level: float
     currency: str
+
+
+def _position_type_name(position_type: Any) -> str:
+    try:
+        normalized = int(position_type)
+    except Exception:
+        return "UNKNOWN"
+
+    buy_value = getattr(mt5, "POSITION_TYPE_BUY", 0) if mt5 is not None else 0
+    sell_value = getattr(mt5, "POSITION_TYPE_SELL", 1) if mt5 is not None else 1
+    if normalized == buy_value:
+        return "BUY"
+    if normalized == sell_value:
+        return "SELL"
+    return f"OTHER({normalized})"
+
+
+def _normalize_position_dict(position: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ticket": int(position.get("ticket") or 0),
+        "symbol": str(position.get("symbol") or ""),
+        "type": _position_type_name(position.get("type")),
+        "volume": float(position.get("volume") or 0.0),
+        "price_open": float(position.get("price_open") or 0.0),
+        "price_current": float(position.get("price_current") or 0.0),
+        "sl": float(position.get("sl") or 0.0),
+        "tp": float(position.get("tp") or 0.0),
+        "profit": float(position.get("profit") or 0.0),
+        "raw": dict(position),
+    }
+
+
+def _done_codes() -> set[Any]:
+    if mt5 is None:
+        return set()
+    return {mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED}
+
+
+def _find_raw_position_by_ticket(ticket: int) -> dict[str, Any] | None:
+    if mt5 is None:
+        return None
+
+    positions = mt5.positions_get()
+    if positions is None:
+        LOGGER.error("positions_get failed: %s", mt5.last_error())
+        return None
+
+    for position in positions:
+        position_dict = position._asdict()
+        if int(position_dict.get("ticket") or 0) == ticket:
+            return position_dict
+
+    return None
+
+
+def _submit_mt5_request(request: dict[str, Any], action_label: str) -> dict[str, Any]:
+    if mt5 is None:
+        return {
+            "success": False,
+            "action": action_label,
+            "reason": "MetaTrader5 package unavailable",
+            "retcode": None,
+        }
+
+    result = mt5.order_send(request)
+    if result is None:
+        return {
+            "success": False,
+            "action": action_label,
+            "reason": f"order_send returned None: {mt5.last_error()}",
+            "retcode": None,
+            "request": request,
+        }
+
+    result_dict = result._asdict()
+    retcode = result_dict.get("retcode")
+    return {
+        "success": retcode in _done_codes(),
+        "action": action_label,
+        "retcode": retcode,
+        "order": result_dict.get("order"),
+        "deal": result_dict.get("deal"),
+        "request": request,
+        "raw": result_dict,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _timeframe_to_mt5_constant(timeframe: str) -> int | None:
@@ -223,6 +312,12 @@ def get_positions(symbol: str) -> list[dict[str, Any]]:
         disconnect()
 
 
+def get_position_details(symbol: str) -> list[dict[str, Any]]:
+    """Get normalized open position details for a symbol."""
+    raw_positions = get_positions(symbol)
+    return [_normalize_position_dict(position) for position in raw_positions]
+
+
 def get_closed_deals(symbol: str, since: datetime) -> list[dict[str, Any]]:
     """Get closed deals (realized PnL) since a given datetime.
 
@@ -397,46 +492,229 @@ def send_order(symbol: str, action: str, lot: float, sl: float, tp: float) -> di
             "price": float(price),
             "sl": float(sl),
             "tp": float(tp),
-            "deviation": 20,
-            "magic": 20260702,
+            "deviation": ORDER_DEVIATION,
+            "magic": ORDER_MAGIC,
             "comment": "GP-MATE",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
-        result = mt5.order_send(request)
-        if result is None:
-            return {
-                "success": False,
-                "action": normalized_action,
-                "reason": f"order_send returned None: {mt5.last_error()}",
-                "retcode": None,
-                "request": request,
+        response = _submit_mt5_request(request, normalized_action)
+        response.update(
+            {
+                "volume": lot,
+                "price": price,
+                "sl": sl,
+                "tp": tp,
             }
-
-        result_dict = result._asdict()
-        retcode = result_dict.get("retcode")
-        done_codes = {mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED}
-
-        return {
-            "success": retcode in done_codes,
-            "action": normalized_action,
-            "retcode": retcode,
-            "order": result_dict.get("order"),
-            "deal": result_dict.get("deal"),
-            "volume": lot,
-            "price": price,
-            "sl": sl,
-            "tp": tp,
-            "request": request,
-            "raw": result_dict,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        }
+        )
+        return response
     except Exception as exc:
         LOGGER.exception("send_order exception: %s", exc)
         return {
             "success": False,
             "action": normalized_action,
+            "reason": str(exc),
+            "retcode": None,
+        }
+    finally:
+        disconnect()
+
+
+def close_position(ticket: int) -> dict[str, Any]:
+    """Close an open position by ticket with an opposing market order."""
+    if ticket <= 0:
+        return {
+            "success": False,
+            "action": "CLOSE_POSITION",
+            "reason": "Ticket must be positive",
+            "retcode": None,
+        }
+
+    if not connect():
+        return {
+            "success": False,
+            "action": "CLOSE_POSITION",
+            "reason": "MT5 connection failed",
+            "retcode": None,
+        }
+
+    try:
+        if mt5 is None:
+            return {
+                "success": False,
+                "action": "CLOSE_POSITION",
+                "reason": "MetaTrader5 package unavailable",
+                "retcode": None,
+            }
+
+        position = _find_raw_position_by_ticket(ticket)
+        if position is None:
+            return {
+                "success": False,
+                "action": "CLOSE_POSITION",
+                "reason": f"Position not found: {ticket}",
+                "retcode": None,
+            }
+
+        symbol = str(position.get("symbol") or "")
+        if not symbol or not _ensure_symbol(symbol):
+            return {
+                "success": False,
+                "action": "CLOSE_POSITION",
+                "reason": f"Symbol unavailable: {symbol}",
+                "retcode": None,
+            }
+
+        current_type = _position_type_name(position.get("type"))
+        if current_type == "BUY":
+            close_action = "SELL"
+            order_type = mt5.ORDER_TYPE_SELL
+        elif current_type == "SELL":
+            close_action = "BUY"
+            order_type = mt5.ORDER_TYPE_BUY
+        else:
+            return {
+                "success": False,
+                "action": "CLOSE_POSITION",
+                "reason": f"Unsupported position type: {position.get('type')}",
+                "retcode": None,
+            }
+
+        tick_info = mt5.symbol_info_tick(symbol)
+        if tick_info is None:
+            return {
+                "success": False,
+                "action": "CLOSE_POSITION",
+                "reason": "Failed to get symbol tick",
+                "retcode": None,
+            }
+
+        price = float(tick_info.bid if current_type == "BUY" else tick_info.ask)
+        volume = float(position.get("volume") or 0.0)
+        if volume <= 0:
+            return {
+                "success": False,
+                "action": "CLOSE_POSITION",
+                "reason": "Position volume must be positive",
+                "retcode": None,
+            }
+
+        request: dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "position": int(ticket),
+            "price": price,
+            "deviation": ORDER_DEVIATION,
+            "magic": ORDER_MAGIC,
+            "comment": "GP-MATE close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        response = _submit_mt5_request(request, close_action)
+        response.update(
+            {
+                "position": int(ticket),
+                "symbol": symbol,
+                "volume": volume,
+                "price": price,
+            }
+        )
+        return response
+    except Exception as exc:
+        LOGGER.exception("close_position exception: %s", exc)
+        return {
+            "success": False,
+            "action": "CLOSE_POSITION",
+            "reason": str(exc),
+            "retcode": None,
+        }
+    finally:
+        disconnect()
+
+
+def modify_sl(ticket: int, new_sl: float) -> dict[str, Any]:
+    """Modify stop loss for an open position while preserving current TP."""
+    if ticket <= 0:
+        return {
+            "success": False,
+            "action": "MODIFY_SL",
+            "reason": "Ticket must be positive",
+            "retcode": None,
+        }
+
+    if new_sl <= 0:
+        return {
+            "success": False,
+            "action": "MODIFY_SL",
+            "reason": "new_sl must be positive",
+            "retcode": None,
+        }
+
+    if not connect():
+        return {
+            "success": False,
+            "action": "MODIFY_SL",
+            "reason": "MT5 connection failed",
+            "retcode": None,
+        }
+
+    try:
+        if mt5 is None:
+            return {
+                "success": False,
+                "action": "MODIFY_SL",
+                "reason": "MetaTrader5 package unavailable",
+                "retcode": None,
+            }
+
+        position = _find_raw_position_by_ticket(ticket)
+        if position is None:
+            return {
+                "success": False,
+                "action": "MODIFY_SL",
+                "reason": f"Position not found: {ticket}",
+                "retcode": None,
+            }
+
+        symbol = str(position.get("symbol") or "")
+        if not symbol or not _ensure_symbol(symbol):
+            return {
+                "success": False,
+                "action": "MODIFY_SL",
+                "reason": f"Symbol unavailable: {symbol}",
+                "retcode": None,
+            }
+
+        current_tp = float(position.get("tp") or 0.0)
+        request: dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": symbol,
+            "position": int(ticket),
+            "sl": float(new_sl),
+            "tp": current_tp,
+            "magic": ORDER_MAGIC,
+            "comment": "GP-MATE modify_sl",
+        }
+
+        response = _submit_mt5_request(request, "MODIFY_SL")
+        response.update(
+            {
+                "position": int(ticket),
+                "symbol": symbol,
+                "sl": float(new_sl),
+                "tp": current_tp,
+            }
+        )
+        return response
+    except Exception as exc:
+        LOGGER.exception("modify_sl exception: %s", exc)
+        return {
+            "success": False,
+            "action": "MODIFY_SL",
             "reason": str(exc),
             "retcode": None,
         }

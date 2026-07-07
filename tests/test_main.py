@@ -307,3 +307,267 @@ def test_run_once_continues_when_debate_log_serialization_fails(tmp_path: Path, 
     row = _read_single_row(log_path)
     assert row["conflicts"] == "[]"
     assert row["confidence_shift"] == "{}"
+
+
+def test_run_once_uses_evaluate_position_when_position_exists(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "get_positions", lambda symbol: [{"ticket": 123}])
+    monkeypatch.setattr(
+        main,
+        "get_position_details",
+        lambda symbol: [
+            {
+                "ticket": 123,
+                "symbol": symbol,
+                "type": "BUY",
+                "volume": 0.01,
+                "price_open": 100.0,
+                "price_current": 101.0,
+                "sl": 95.0,
+                "tp": 110.0,
+                "profit": 10.0,
+            }
+        ],
+    )
+    called = {"evaluate": 0, "close": 0, "decide": 0, "modify": 0}
+    def _fake_evaluate(**kwargs):
+        called["evaluate"] += 1
+        assert kwargs["confidence_threshold"] == main.CLOSE_CONFIDENCE_THRESHOLD
+        return {
+            "action": "HOLD",
+            "confidence": 0.7,
+            "reasoning": "keep",
+            "risk_level": "MID",
+            "_meta": {"model": "eval-test", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+
+    monkeypatch.setattr(main, "evaluate_position", _fake_evaluate)
+    monkeypatch.setattr(main, "close_position", lambda ticket: called.__setitem__("close", called["close"] + 1) or {"success": True, "retcode": 0})
+    monkeypatch.setattr(main, "modify_sl", lambda ticket, new_sl: called.__setitem__("modify", called["modify"] + 1) or {"success": True, "retcode": 0})
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report: called.__setitem__("decide", called["decide"] + 1) or {
+            "action": "BUY",
+            "confidence": 0.8,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "_meta": {"model": "decision-test", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert called["evaluate"] == 1
+    assert called["close"] == 0
+    assert called["decide"] == 0
+    assert called["modify"] == 0
+    row = _read_single_row(log_path)
+    assert row["decision_model"] == "eval-test"
+    assert row["breakeven_triggered"] == "False"
+    assert row["breakeven_ticket"] == "123"
+    assert row["breakeven_entry_price"] == "100.0"
+    assert row["breakeven_initial_sl"] == "95.0"
+    assert row["breakeven_current_price"] == "101.0"
+    assert row["breakeven_reason"] == "NOT_TRIGGERED_OR_ALREADY_MOVED"
+
+
+def test_run_once_moves_sl_to_breakeven_on_hold_at_1r(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "get_positions", lambda symbol: [{"ticket": 321}])
+    monkeypatch.setattr(
+        main,
+        "get_position_details",
+        lambda symbol: [
+            {
+                "ticket": 321,
+                "symbol": symbol,
+                "type": "BUY",
+                "volume": 0.01,
+                "price_open": 100.0,
+                "price_current": 105.0,
+                "sl": 95.0,
+                "tp": 110.0,
+                "profit": 50.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "evaluate_position",
+        lambda **kwargs: {
+            "action": "HOLD",
+            "confidence": 0.9,
+            "reasoning": "hold and protect",
+            "risk_level": "LOW",
+            "_meta": {"model": "eval-test", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+
+    modify_calls: list[tuple[int, float]] = []
+
+    def _fake_modify(ticket: int, new_sl: float) -> dict[str, object]:
+        modify_calls.append((ticket, new_sl))
+        return {"success": True, "retcode": 0}
+
+    monkeypatch.setattr(main, "modify_sl", _fake_modify)
+    monkeypatch.setattr(main, "close_position", lambda ticket: {"success": True, "retcode": 0})
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert modify_calls == [(321, 100.0 + main.BREAKEVEN_BUFFER)]
+    row = _read_single_row(log_path)
+    assert row["filter_reason"] == "Position hold + breakeven moved"
+    assert row["order_success"] == "True"
+    assert row["breakeven_triggered"] == "True"
+    assert row["breakeven_new_sl"] == str(100.0 + main.BREAKEVEN_BUFFER)
+    assert row["breakeven_time"] != ""
+    assert row["breakeven_ticket"] == "321"
+    assert row["breakeven_entry_price"] == "100.0"
+    assert row["breakeven_initial_sl"] == "95.0"
+    assert row["breakeven_trigger_price"] == "105.0"
+    assert row["breakeven_current_price"] == "105.0"
+    assert row["breakeven_modify_success"] == "True"
+    assert row["breakeven_reason"] == "MOVED"
+
+
+def test_run_once_closes_position_when_evaluate_position_returns_close(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "get_positions", lambda symbol: [{"ticket": 456}])
+    monkeypatch.setattr(
+        main,
+        "get_position_details",
+        lambda symbol: [
+            {
+                "ticket": 456,
+                "symbol": symbol,
+                "type": "SELL",
+                "volume": 0.02,
+                "price_open": 100.0,
+                "price_current": 99.0,
+                "sl": 105.0,
+                "tp": 95.0,
+                "profit": 20.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "evaluate_position",
+        lambda **kwargs: {
+            "action": "CLOSE",
+            "confidence": 0.82,
+            "reasoning": "reverse strong",
+            "risk_level": "MID",
+            "_meta": {"model": "eval-test", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+    close_calls: list[int] = []
+    modify_calls: list[tuple[int, float]] = []
+    monkeypatch.setattr(
+        main,
+        "close_position",
+        lambda ticket: close_calls.append(ticket) or {"success": True, "retcode": 0, "deal": 999},
+    )
+    monkeypatch.setattr(
+        main,
+        "modify_sl",
+        lambda ticket, new_sl: modify_calls.append((ticket, new_sl)) or {"success": True, "retcode": 0},
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "CLOSE"
+    assert close_calls == [456]
+    assert modify_calls == []
+    row = _read_single_row(log_path)
+    assert row["action"] == "CLOSE"
+    assert row["order_success"] == "True"
+    assert row["position_direction"] == "SELL"
+    assert row["technical_signal"] == "BUY"
+    assert row["evaluate_action"] == "CLOSE"
+    assert row["evaluate_confidence"] == "0.82"
+    assert row["evaluate_reasoning"] == "reverse strong"
+    assert row["evaluate_reasoning_len"] == str(len("reverse strong"))
+    assert row["breakeven_triggered"] == "False"
+    assert row["breakeven_reason"] == "NOT_HOLD_ACTION"
+
+
+def test_run_once_same_direction_position_holds_without_close(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "get_positions", lambda symbol: [{"ticket": 777}])
+    monkeypatch.setattr(
+        main,
+        "get_position_details",
+        lambda symbol: [
+            {
+                "ticket": 777,
+                "symbol": symbol,
+                "type": "BUY",
+                "volume": 0.03,
+                "price_open": 100.0,
+                "price_current": 102.0,
+                "sl": 96.0,
+                "tp": 108.0,
+                "profit": 35.0,
+            }
+        ],
+    )
+
+    called = {"close": 0}
+
+    def _fake_evaluate(**kwargs):
+        assert kwargs["position_context"]["type"] == "BUY"
+        assert kwargs["technical_report"]["signal"] == "BUY"
+        return {
+            "action": "HOLD",
+            "confidence": 0.9,
+            "reasoning": "同方向のため保持",
+            "risk_level": "LOW",
+            "_meta": {"model": "eval-test", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+
+    monkeypatch.setattr(main, "evaluate_position", _fake_evaluate)
+    monkeypatch.setattr(
+        main,
+        "close_position",
+        lambda ticket: called.__setitem__("close", called["close"] + 1) or {"success": True, "retcode": 0},
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert called["close"] == 0
+    row = _read_single_row(log_path)
+    assert row["action"] == "HOLD"
+
+
+def test_run_once_without_position_keeps_decide_trade_flow(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    called = {"evaluate": 0, "decide": 0}
+    monkeypatch.setattr(
+        main,
+        "evaluate_position",
+        lambda **kwargs: called.__setitem__("evaluate", called["evaluate"] + 1) or {"action": "HOLD"},
+    )
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report: called.__setitem__("decide", called["decide"] + 1) or {
+            "action": "BUY",
+            "confidence": 0.8,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "_meta": {"model": "decision-test", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "BUY"
+    assert called["evaluate"] == 0
+    assert called["decide"] == 1
+    row = _read_single_row(log_path)
+    assert row["action"] == "BUY"

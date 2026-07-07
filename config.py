@@ -29,11 +29,13 @@ class Settings:
     risk_percent: float
     max_positions: int
     confidence_threshold: float
+    close_confidence_threshold: float
     max_daily_loss_pct: float
     consecutive_loss_limit: int
 
     atr_multiplier_sl: float
     risk_reward_ratio: float
+    breakeven_buffer: float
 
     news_filter_minutes: int
     spread_multiplier_limit: float
@@ -182,10 +184,12 @@ def load_settings() -> Settings:
         risk_percent=_get_env_float("RISK_PERCENT", 0.01),
         max_positions=_get_env_int("MAX_POSITIONS", 1),
         confidence_threshold=_get_env_float("CONFIDENCE_THRESHOLD", 0.6),
+        close_confidence_threshold=_get_env_float("CLOSE_CONFIDENCE_THRESHOLD", 0.7),
         max_daily_loss_pct=_get_env_float("MAX_DAILY_LOSS_PCT", 0.03),
         consecutive_loss_limit=_get_env_int("CONSECUTIVE_LOSS_LIMIT", 3),
         atr_multiplier_sl=_get_env_float("ATR_MULTIPLIER_SL", 1.5),
         risk_reward_ratio=_get_env_float("RISK_REWARD_RATIO", 2.0),
+        breakeven_buffer=_get_env_float("BREAKEVEN_BUFFER", 0.1),
         news_filter_minutes=_get_env_int("NEWS_FILTER_MINUTES", 15),
         spread_multiplier_limit=2.0,
         spread_samples=20,
@@ -218,11 +222,13 @@ TIMEFRAME_ENTRY: Final[str] = settings.timeframe_entry
 RISK_PERCENT: Final[float] = settings.risk_percent
 MAX_POSITIONS: Final[int] = settings.max_positions
 CONFIDENCE_THRESHOLD: Final[float] = settings.confidence_threshold
+CLOSE_CONFIDENCE_THRESHOLD: Final[float] = settings.close_confidence_threshold
 MAX_DAILY_LOSS_PCT: Final[float] = settings.max_daily_loss_pct
 CONSECUTIVE_LOSS_LIMIT: Final[int] = settings.consecutive_loss_limit
 
 ATR_MULTIPLIER_SL: Final[float] = settings.atr_multiplier_sl
 RISK_REWARD_RATIO: Final[float] = settings.risk_reward_ratio
+BREAKEVEN_BUFFER: Final[float] = settings.breakeven_buffer
 
 NEWS_FILTER_MINUTES: Final[int] = settings.news_filter_minutes
 SPREAD_MULTIPLIER_LIMIT: Final[float] = settings.spread_multiplier_limit

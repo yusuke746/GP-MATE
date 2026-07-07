@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
 from datetime import UTC, datetime
 from pathlib import Path
 
 import main
 from risk.risk_manager import check_filters
+from scripts import run_scheduler
 
 
 def test_scheduler_runs_when_time_is_within_catchup_window(monkeypatch) -> None:
@@ -72,6 +74,41 @@ def test_scheduler_continues_when_run_once_raises(monkeypatch) -> None:
     main._run_scheduler_due_jobs(now_local=now_local, executed_today=executed_today, baseline_spread=10.0)
 
     assert calls["n"] == 2
+
+
+def test_run_scheduler_sets_misfire_grace_time(monkeypatch) -> None:
+    monkeypatch.setattr(run_scheduler, "JUDGMENT_TIMES", ("09:00",))
+    monkeypatch.setattr(run_scheduler, "STAGE", 1)
+    monkeypatch.setattr(
+        run_scheduler,
+        "get_account_info",
+        lambda: {
+            "success": True,
+            "data": type("A", (), {"login": 1, "server": "demo", "trade_mode": 0})(),
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    class FakeScheduler:
+        def add_job(self, func, trigger, **kwargs):
+            captured["func"] = func
+            captured["trigger"] = trigger
+            captured["kwargs"] = kwargs
+
+        def start(self):
+            raise KeyboardInterrupt()
+
+    blocking = importlib.import_module("apscheduler.schedulers.blocking")
+    monkeypatch.setattr(blocking, "BlockingScheduler", FakeScheduler)
+
+    assert run_scheduler.main() == 0
+    assert captured["trigger"] == "cron"
+    assert captured["kwargs"] == {
+        "hour": 9,
+        "minute": 0,
+        "misfire_grace_time": run_scheduler.SCHEDULER_MISFIRE_GRACE_SECONDS,
+    }
 
 
 def test_consecutive_loss_limit_blocks_after_five_losses(tmp_path: Path, monkeypatch) -> None:

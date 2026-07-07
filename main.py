@@ -20,11 +20,14 @@ warnings.filterwarnings(
 
 from agents.debate_graph import build_skipped_debate_report, run_debate_graph, should_execute_debate
 from agents.data.fred_client import get_macro_data
+from agents.evaluate_position import evaluate_position
 from agents.macro_analyst import analyze_macro_environment
 from agents.sentiment import analyze_sentiment
 from agents.technical import analyze_technical
 from agents.trader import decide_trade
 from config import (
+    BREAKEVEN_BUFFER,
+    CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
     JUDGMENT_TIMES,
     MAX_DAILY_LOSS_PCT,
@@ -35,17 +38,21 @@ from config import (
     SYMBOL,
 )
 from data.mt5_client import (
+    close_position,
     get_account_info,
     get_baseline_spread,
     get_closed_deals,
+    get_position_details,
     get_positions,
     get_rates,
     get_spread,
+    modify_sl,
     send_order,
 )
 from data.news_client import fetch_news, is_high_impact_soon
 from indicators.ta_calc import add_indicators
 from risk.risk_manager import build_risk_plan, check_filters
+from risk.breakeven import should_move_to_breakeven
 
 LOGGER = logging.getLogger(__name__)
 
@@ -105,6 +112,24 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "macro_direction",
     "alignment",
     "estimated_confidence",
+    "position_direction",
+    "technical_signal",
+    "debate_direction",
+    "evaluate_action",
+    "evaluate_confidence",
+    "evaluate_reasoning",
+    "evaluate_reasoning_len",
+    "breakeven_triggered",
+    "breakeven_new_sl",
+    "breakeven_time",
+    "breakeven_ticket",
+    "breakeven_entry_price",
+    "breakeven_initial_sl",
+    "breakeven_trigger_price",
+    "breakeven_current_price",
+    "breakeven_modify_success",
+    "breakeven_modify_retcode",
+    "breakeven_reason",
 )
 
 
@@ -298,7 +323,34 @@ def _default_debate_log_fields() -> dict[str, Any]:
         "macro_direction": "",
         "alignment": "",
         "estimated_confidence": "",
+        "position_direction": "",
+        "technical_signal": "",
+        "debate_direction": "",
+        "evaluate_action": "",
+        "evaluate_confidence": "",
+        "evaluate_reasoning": "",
+        "evaluate_reasoning_len": "",
+        "breakeven_triggered": False,
+        "breakeven_new_sl": "",
+        "breakeven_time": "",
+        "breakeven_ticket": "",
+        "breakeven_entry_price": "",
+        "breakeven_initial_sl": "",
+        "breakeven_trigger_price": "",
+        "breakeven_current_price": "",
+        "breakeven_modify_success": "",
+        "breakeven_modify_retcode": "",
+        "breakeven_reason": "",
     }
+
+
+def _debate_direction_from_stronger_side(stronger_side: str) -> str:
+    normalized = str(stronger_side or "").strip().lower()
+    if normalized == "bull":
+        return "BUY"
+    if normalized == "bear":
+        return "SELL"
+    return "NEUTRAL"
 
 
 def _extract_debate_log_fields(gate: dict[str, Any], debate_report: dict[str, Any]) -> dict[str, Any]:
@@ -337,6 +389,77 @@ def _extract_debate_log_fields(gate: dict[str, Any], debate_report: dict[str, An
         fields["judge_error"] = str(debate_meta.get("judge_error", "") or "")
 
     return fields
+
+
+def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    d1 = add_indicators(get_rates(SYMBOL, "D1", 300))
+    h4 = add_indicators(get_rates(SYMBOL, "H4", 300))
+    h1 = add_indicators(get_rates(SYMBOL, "H1", 300))
+    news_items = fetch_news(hours=24)
+    macro_data = get_macro_data(force_refresh=False)
+    macro_report = analyze_macro_environment(macro_data)
+    technical_report = analyze_technical(
+        {
+            "d1": _extract_latest_features(d1) if not d1.empty else {},
+            "h4": _extract_latest_features(h4),
+            "h1": _extract_latest_features(h1),
+        }
+    )
+    sentiment_report = analyze_sentiment(news_items)
+    return d1, h4, h1, news_items, macro_report, technical_report, sentiment_report
+
+
+def _build_debate_and_decision_reports(
+    technical_report: dict[str, Any],
+    sentiment_report: dict[str, Any],
+    macro_report: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    gate = should_execute_debate(technical_report, sentiment_report, macro_report)
+    if gate["should_debate"]:
+        debate_report = run_debate_graph(technical_report, sentiment_report, macro_report)
+        debate_meta = debate_report.get("_meta", {}) if isinstance(debate_report, dict) else {}
+        debate_ok = bool(debate_meta.get("ok", False)) if isinstance(debate_meta, dict) else False
+        if debate_ok:
+            return gate, debate_report, None
+        return (
+            gate,
+            debate_report,
+            {
+                "action": "HOLD",
+                "symbol": SYMBOL,
+                "confidence": 0.0,
+                "reasoning": "議論エンジン失敗のためHOLD",
+                "risk_level": "HIGH",
+                "_meta": {
+                    "ok": False,
+                    "model": "",
+                    "error": "debate graph failed",
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                },
+            },
+        )
+
+    debate_report = build_skipped_debate_report(gate["reason"])
+    return gate, debate_report, None
+
+
+def _position_context_from_details(details: dict[str, Any], position_count: int) -> dict[str, Any]:
+    return {
+        "ticket": int(details.get("ticket") or 0),
+        "symbol": str(details.get("symbol") or SYMBOL),
+        "type": str(details.get("type") or "UNKNOWN"),
+        "volume": float(details.get("volume") or 0.0),
+        "price_open": float(details.get("price_open") or 0.0),
+        "price_current": float(details.get("price_current") or 0.0),
+        "sl": float(details.get("sl") or 0.0),
+        "tp": float(details.get("tp") or 0.0),
+        "profit": float(details.get("profit") or 0.0),
+        "position_count": int(position_count),
+    }
 
 
 def _parse_judgment_time(value: str) -> tuple[int, int] | None:
@@ -619,38 +742,8 @@ def run_once(
             return result
 
         positions = get_positions(SYMBOL)
-        if len(positions) >= MAX_POSITIONS:
-            result = {
-                "timestamp_utc": now_iso,
-                "deal_id": "",
-                "symbol": SYMBOL,
-                "action": "HOLD",
-                "entry_price": "",
-                "exit_price": "",
-                "holding_seconds": "",
-                "pnl": "",
-                "confidence": 0.0,
-                "reasoning": "最大保有ポジション数に到達",
-                "risk_level": "MID",
-                "allowed": False,
-                "filter_reason": "Max positions reached",
-                "lot": 0.0,
-                "sl": 0.0,
-                "tp": 0.0,
-                "order_success": False,
-                "retcode": "",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "news_count": 0,
-                "error": "",
-            }
-            _append_trade_log(result)
-            return result
 
-        d1 = add_indicators(get_rates(SYMBOL, "D1", 300))
-        h4 = add_indicators(get_rates(SYMBOL, "H4", 300))
-        h1 = add_indicators(get_rates(SYMBOL, "H1", 300))
+        d1, h4, h1, news_items, macro_report, technical_report, sentiment_report = _build_market_reports()
         if h4.empty or h1.empty:
             result = {
                 "timestamp_utc": now_iso,
@@ -680,54 +773,175 @@ def run_once(
             _append_trade_log(result)
             return result
 
-        news_items = fetch_news(hours=24)
-
-        macro_data = get_macro_data(force_refresh=False)
-        macro_report = analyze_macro_environment(macro_data)
-
-        technical_report = analyze_technical(
-            {
-                "d1": _extract_latest_features(d1) if not d1.empty else {},
-                "h4": _extract_latest_features(h4),
-                "h1": _extract_latest_features(h1),
-            }
+        gate, debate_report, debate_fallback_report = _build_debate_and_decision_reports(
+            technical_report,
+            sentiment_report,
+            macro_report,
         )
-        sentiment_report = analyze_sentiment(news_items)
-        gate = should_execute_debate(technical_report, sentiment_report, macro_report)
-        if gate["should_debate"]:
-            debate_report = run_debate_graph(technical_report, sentiment_report, macro_report)
-            debate_meta = debate_report.get("_meta", {}) if isinstance(debate_report, dict) else {}
-            debate_ok = bool(debate_meta.get("ok", False)) if isinstance(debate_meta, dict) else False
-
-            if debate_ok:
-                trader_report = decide_trade(technical_report, sentiment_report, debate_report)
-            else:
-                trader_report = {
-                    "action": "HOLD",
-                    "symbol": SYMBOL,
-                    "confidence": 0.0,
-                    "reasoning": "議論エンジン失敗のためHOLD",
-                    "risk_level": "HIGH",
-                    "_meta": {
-                        "ok": False,
-                        "model": "",
-                        "error": "debate graph failed",
-                        "usage": {
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0,
-                        },
-                    },
-                }
-        else:
-            debate_report = build_skipped_debate_report(gate["reason"])
-            trader_report = decide_trade(technical_report, sentiment_report, debate_report)
 
         try:
             debate_log_fields = _extract_debate_log_fields(gate=gate, debate_report=debate_report)
         except Exception as exc:
             LOGGER.warning("Failed to extract debate log fields; defaults used: %s", exc)
             debate_log_fields = _default_debate_log_fields()
+
+        if len(positions) >= 1:
+            position_details = get_position_details(SYMBOL)
+            if not position_details:
+                result = {
+                    "timestamp_utc": now_iso,
+                    "deal_id": "",
+                    "symbol": SYMBOL,
+                    "action": "HOLD",
+                    "entry_price": "",
+                    "exit_price": "",
+                    "holding_seconds": "",
+                    "pnl": "",
+                    "confidence": 0.0,
+                    "reasoning": "保有詳細取得に失敗したためHOLD",
+                    "risk_level": "HIGH",
+                    "allowed": False,
+                    "filter_reason": "Position details unavailable",
+                    "lot": 0.0,
+                    "sl": 0.0,
+                    "tp": 0.0,
+                    "order_success": False,
+                    "retcode": "",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "analysis_model": _extract_model_name(technical_report),
+                    "decision_model": "",
+                    "news_count": len(news_items),
+                    "error": "",
+                    **debate_log_fields,
+                }
+                _append_trade_log(result)
+                return result
+
+            position_context = _position_context_from_details(position_details[0], len(position_details))
+            evaluation_report = debate_fallback_report or evaluate_position(
+                position_context=position_context,
+                technical_report=technical_report,
+                sentiment_report=sentiment_report,
+                debate_report=debate_report,
+                confidence_threshold=CLOSE_CONFIDENCE_THRESHOLD,
+            )
+
+            close_result: dict[str, Any] = {
+                "success": False,
+                "retcode": None,
+            }
+            breakeven_result: dict[str, Any] = {
+                "success": False,
+                "retcode": None,
+            }
+            breakeven_log: dict[str, Any] = {
+                "breakeven_triggered": False,
+                "breakeven_new_sl": "",
+                "breakeven_time": "",
+                "breakeven_ticket": int(position_context.get("ticket", 0) or 0),
+                "breakeven_entry_price": float(position_context.get("price_open", 0.0) or 0.0),
+                "breakeven_initial_sl": float(position_context.get("sl", 0.0) or 0.0),
+                "breakeven_trigger_price": "",
+                "breakeven_current_price": float(position_context.get("price_current", 0.0) or 0.0),
+                "breakeven_modify_success": "",
+                "breakeven_modify_retcode": "",
+                "breakeven_reason": "",
+            }
+            evaluation_action = str(evaluation_report.get("action", "HOLD"))
+            evaluation_confidence = float(evaluation_report.get("confidence", 0.0) or 0.0)
+            evaluation_reasoning = str(evaluation_report.get("reasoning", "") or "")
+            position_direction = str(position_context.get("type", "") or "")
+            technical_signal = str(technical_report.get("signal", "") or "")
+            debate_direction = _debate_direction_from_stronger_side(str(debate_log_fields.get("stronger_side", "")))
+            filter_reason = "Position hold"
+            allowed = True
+            if evaluation_action == "CLOSE":
+                close_result = close_position(int(position_context["ticket"]))
+                filter_reason = "Position close signal"
+                allowed = bool(close_result.get("success", False))
+                breakeven_log["breakeven_reason"] = "NOT_HOLD_ACTION"
+                if not allowed:
+                    filter_reason = "Position close failed"
+            elif evaluation_action == "HOLD":
+                entry_price = float(position_context.get("price_open", 0.0) or 0.0)
+                initial_sl = float(position_context.get("sl", 0.0) or 0.0)
+                current_price = float(position_context.get("price_current", 0.0) or 0.0)
+                side = str(position_context.get("type", "") or "")
+                risk_r = abs(entry_price - initial_sl)
+                if side == "BUY":
+                    breakeven_log["breakeven_trigger_price"] = round(entry_price + risk_r, 5)
+                elif side == "SELL":
+                    breakeven_log["breakeven_trigger_price"] = round(entry_price - risk_r, 5)
+
+                should_move, new_sl = should_move_to_breakeven(
+                    entry=entry_price,
+                    initial_sl=initial_sl,
+                    current_price=current_price,
+                    current_sl=initial_sl,
+                    side=side,
+                    buffer=BREAKEVEN_BUFFER,
+                )
+                if should_move and new_sl is not None:
+                    breakeven_log["breakeven_triggered"] = True
+                    breakeven_log["breakeven_new_sl"] = float(new_sl)
+                    breakeven_log["breakeven_time"] = now_iso
+                    breakeven_result = modify_sl(int(position_context["ticket"]), float(new_sl))
+                    breakeven_log["breakeven_modify_success"] = bool(breakeven_result.get("success", False))
+                    breakeven_log["breakeven_modify_retcode"] = breakeven_result.get("retcode", "")
+                    if bool(breakeven_result.get("success", False)):
+                        filter_reason = "Position hold + breakeven moved"
+                        breakeven_log["breakeven_reason"] = "MOVED"
+                    else:
+                        filter_reason = "Breakeven move failed"
+                        breakeven_log["breakeven_reason"] = "MOVE_FAILED"
+                        allowed = False
+                else:
+                    breakeven_log["breakeven_reason"] = "NOT_TRIGGERED_OR_ALREADY_MOVED"
+
+            usage = _sum_token_usage(technical_report, sentiment_report, debate_report, evaluation_report)
+            execution_result = close_result if evaluation_action == "CLOSE" else breakeven_result
+            result = {
+                "timestamp_utc": now_iso,
+                "deal_id": str(close_result.get("deal", "") or ""),
+                "symbol": SYMBOL,
+                "action": evaluation_action,
+                "entry_price": float(position_context.get("price_open", 0.0) or 0.0),
+                "exit_price": float(position_context.get("price_current", 0.0) or 0.0) if evaluation_action == "CLOSE" else "",
+                "holding_seconds": "",
+                "pnl": float(position_context.get("profit", 0.0) or 0.0),
+                "confidence": evaluation_confidence,
+                "reasoning": evaluation_reasoning,
+                "risk_level": str(evaluation_report.get("risk_level", "MID")),
+                "allowed": allowed,
+                "filter_reason": filter_reason,
+                "lot": float(position_context.get("volume", 0.0) or 0.0),
+                "sl": float(position_context.get("sl", 0.0) or 0.0),
+                "tp": float(position_context.get("tp", 0.0) or 0.0),
+                "order_success": bool(execution_result.get("success", False)),
+                "retcode": execution_result.get("retcode", ""),
+                "prompt_tokens": usage["prompt_tokens"],
+                "completion_tokens": usage["completion_tokens"],
+                "total_tokens": usage["total_tokens"],
+                "analysis_model": _extract_model_name(technical_report),
+                "decision_model": _extract_model_name(evaluation_report),
+                "news_count": len(news_items),
+                "error": str(execution_result.get("reason", "")),
+                **debate_log_fields,
+                "position_direction": position_direction,
+                "technical_signal": technical_signal,
+                "debate_direction": debate_direction,
+                "evaluate_action": evaluation_action,
+                "evaluate_confidence": evaluation_confidence,
+                "evaluate_reasoning": evaluation_reasoning,
+                "evaluate_reasoning_len": len(evaluation_reasoning),
+                **breakeven_log,
+            }
+            _append_trade_log(result)
+            return result
+
+        trader_report = debate_fallback_report or decide_trade(technical_report, sentiment_report, debate_report)
 
         spread = get_spread(SYMBOL)
         filter_result = check_filters(
