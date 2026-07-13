@@ -370,7 +370,7 @@ def test_run_once_uses_evaluate_position_when_position_exists(tmp_path: Path, mo
     assert row["breakeven_entry_price"] == "100.0"
     assert row["breakeven_initial_sl"] == "95.0"
     assert row["breakeven_current_price"] == "101.0"
-    assert row["breakeven_reason"] == "NOT_TRIGGERED_OR_ALREADY_MOVED"
+    assert row["breakeven_reason"] == "DELEGATED_TO_MONITOR"
 
 
 def test_run_once_moves_sl_to_breakeven_on_hold_at_1r(tmp_path: Path, monkeypatch) -> None:
@@ -417,20 +417,20 @@ def test_run_once_moves_sl_to_breakeven_on_hold_at_1r(tmp_path: Path, monkeypatc
     result = main.run_once(baseline_spread=10.0)
 
     assert result["action"] == "HOLD"
-    assert modify_calls == [(321, 100.0 + main.BREAKEVEN_BUFFER)]
+    assert modify_calls == []
     row = _read_single_row(log_path)
-    assert row["filter_reason"] == "Position hold + breakeven moved"
-    assert row["order_success"] == "True"
-    assert row["breakeven_triggered"] == "True"
-    assert row["breakeven_new_sl"] == str(100.0 + main.BREAKEVEN_BUFFER)
-    assert row["breakeven_time"] != ""
+    assert row["filter_reason"] == "Position hold"
+    assert row["order_success"] == "False"
+    assert row["breakeven_triggered"] == "False"
+    assert row["breakeven_new_sl"] == ""
+    assert row["breakeven_time"] == ""
     assert row["breakeven_ticket"] == "321"
     assert row["breakeven_entry_price"] == "100.0"
     assert row["breakeven_initial_sl"] == "95.0"
-    assert row["breakeven_trigger_price"] == "105.0"
+    assert row["breakeven_trigger_price"] == ""
     assert row["breakeven_current_price"] == "105.0"
-    assert row["breakeven_modify_success"] == "True"
-    assert row["breakeven_reason"] == "MOVED"
+    assert row["breakeven_modify_success"] == ""
+    assert row["breakeven_reason"] == "DELEGATED_TO_MONITOR"
 
 
 def test_run_once_closes_position_when_evaluate_position_returns_close(tmp_path: Path, monkeypatch) -> None:

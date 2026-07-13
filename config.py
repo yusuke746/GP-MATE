@@ -36,6 +36,7 @@ class Settings:
     atr_multiplier_sl: float
     risk_reward_ratio: float
     breakeven_buffer: float
+    breakeven_monitor_times: tuple[str, ...]
 
     news_filter_minutes: int
     spread_multiplier_limit: float
@@ -84,6 +85,13 @@ def _parse_judgment_times(value: str) -> tuple[str, ...]:
     times = [item.strip() for item in value.split(",") if item.strip()]
     if not times:
         return ("09:00", "16:00", "21:00", "23:30")
+    return tuple(times)
+
+
+def _parse_breakeven_monitor_times(value: str) -> tuple[str, ...]:
+    times = [item.strip() for item in value.split(",") if item.strip()]
+    if not times:
+        return ("07", "22", "37", "52")
     return tuple(times)
 
 
@@ -190,6 +198,9 @@ def load_settings() -> Settings:
         atr_multiplier_sl=_get_env_float("ATR_MULTIPLIER_SL", 1.5),
         risk_reward_ratio=_get_env_float("RISK_REWARD_RATIO", 2.0),
         breakeven_buffer=_get_env_float("BREAKEVEN_BUFFER", 0.1),
+        breakeven_monitor_times=_parse_breakeven_monitor_times(
+            _get_env_str("BREAKEVEN_MONITOR_TIMES", "07,22,37,52")
+        ),
         news_filter_minutes=_get_env_int("NEWS_FILTER_MINUTES", 15),
         spread_multiplier_limit=2.0,
         spread_samples=20,
@@ -229,6 +240,7 @@ CONSECUTIVE_LOSS_LIMIT: Final[int] = settings.consecutive_loss_limit
 ATR_MULTIPLIER_SL: Final[float] = settings.atr_multiplier_sl
 RISK_REWARD_RATIO: Final[float] = settings.risk_reward_ratio
 BREAKEVEN_BUFFER: Final[float] = settings.breakeven_buffer
+BREAKEVEN_MONITOR_TIMES: Final[tuple[str, ...]] = settings.breakeven_monitor_times
 
 NEWS_FILTER_MINUTES: Final[int] = settings.news_filter_minutes
 SPREAD_MULTIPLIER_LIMIT: Final[float] = settings.spread_multiplier_limit

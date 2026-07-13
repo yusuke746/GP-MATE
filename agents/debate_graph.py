@@ -719,9 +719,96 @@ def _build_incomplete_marker(state: DebateState) -> str:
     return f"議論不完全（{', '.join(failed_roles)}）"
 
 
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _normalize_horizontal_entries(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        price = _as_float(item.get("price", 0.0), 0.0)
+        if price <= 0:
+            continue
+        normalized.append(
+            {
+                "price": round(price, 5),
+                "score": _as_float(item.get("score", 0.0), 0.0),
+                "source": str(item.get("source", "") or ""),
+                "timeframe": str(item.get("timeframe", "") or ""),
+                "touch_count": int(item.get("touch_count", 0) or 0),
+            }
+        )
+    return normalized
+
+
+def _build_horizontal_levels_context(technical_report: dict[str, Any]) -> dict[str, Any]:
+    key_levels = technical_report.get("key_levels", {}) if isinstance(technical_report, dict) else {}
+    if not isinstance(key_levels, dict):
+        return {
+            "available": False,
+            "current_price": "",
+            "nearest_resistances": [],
+            "nearest_supports": [],
+            "summary": "horizontal_levels unavailable",
+        }
+
+    frames = key_levels.get("frames", {}) if isinstance(key_levels.get("frames", {}), dict) else {}
+    h1 = frames.get("h1", {}) if isinstance(frames.get("h1", {}), dict) else {}
+    d1 = key_levels.get("d1", {}) if isinstance(key_levels.get("d1", {}), dict) else {}
+    d1_snapshot = d1.get("snapshot", {}) if isinstance(d1.get("snapshot", {}), dict) else {}
+
+    current_price = _as_float(h1.get("close", d1_snapshot.get("close", 0.0)), 0.0)
+
+    horizontal_levels = key_levels.get("horizontal_levels", {})
+    if not isinstance(horizontal_levels, dict):
+        return {
+            "available": False,
+            "current_price": round(current_price, 5) if current_price > 0 else "",
+            "nearest_resistances": [],
+            "nearest_supports": [],
+            "summary": "horizontal_levels unavailable",
+        }
+
+    resistances = _normalize_horizontal_entries(horizontal_levels.get("resistances", []))
+    supports = _normalize_horizontal_entries(horizontal_levels.get("supports", []))
+
+    if current_price > 0:
+        resistances = [item for item in resistances if float(item["price"]) > current_price]
+        supports = [item for item in supports if float(item["price"]) < current_price]
+
+        resistances.sort(key=lambda item: abs(float(item["price"]) - current_price))
+        supports.sort(key=lambda item: abs(float(item["price"]) - current_price))
+
+    nearest_res = resistances[:3]
+    nearest_sup = supports[:3]
+    available = bool(nearest_res or nearest_sup)
+
+    if available:
+        summary = f"current={round(current_price, 5)} res={len(nearest_res)} sup={len(nearest_sup)}"
+    else:
+        summary = "horizontal_levels empty"
+
+    return {
+        "available": available,
+        "current_price": round(current_price, 5) if current_price > 0 else "",
+        "nearest_resistances": nearest_res,
+        "nearest_supports": nearest_sup,
+        "summary": summary,
+    }
+
+
 def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
     latest_bear = state["bear_arguments"][-1] if state["bear_arguments"] else "初回ラウンド。"
     latest_bull = state["bull_arguments"][-1] if state["bull_arguments"] else "初回ラウンド。"
+    horizontal_levels_context = _build_horizontal_levels_context(state["technical_report"])
 
     if role == "bull":
         system_prompt = BULL_SYSTEM_PROMPT
@@ -729,6 +816,7 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
             "technical_report": state["technical_report"],
             "sentiment_report": state["sentiment_report"],
             "macro_report": state.get("macro_report", {}),
+            "horizontal_levels_context": horizontal_levels_context,
             "multi_timeframe": {
                 "d1_trend": state["technical_report"].get("d1_trend", "RANGE"),
                 "execution_trend": state["technical_report"].get("execution_trend", state["technical_report"].get("trend", "RANGE")),
@@ -743,6 +831,7 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
             "technical_report": state["technical_report"],
             "sentiment_report": state["sentiment_report"],
             "macro_report": state.get("macro_report", {}),
+            "horizontal_levels_context": horizontal_levels_context,
             "multi_timeframe": {
                 "d1_trend": state["technical_report"].get("d1_trend", "RANGE"),
                 "execution_trend": state["technical_report"].get("execution_trend", state["technical_report"].get("trend", "RANGE")),

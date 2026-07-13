@@ -51,6 +51,7 @@ from data.mt5_client import (
 )
 from data.news_client import fetch_news, is_high_impact_soon
 from indicators.ta_calc import add_indicators
+from indicators.horizontal_levels import build_horizontal_levels
 from risk.risk_manager import build_risk_plan, check_filters
 from risk.breakeven import should_move_to_breakeven
 
@@ -164,6 +165,67 @@ def _append_trade_log(row: dict[str, Any]) -> None:
     with TRADE_LOG_PATH.open("a", newline="", encoding="utf-8") as fp:
         writer = csv.DictWriter(fp, fieldnames=list(TRADE_LOG_COLUMNS))
         writer.writerow(payload)
+
+
+def manage_breakeven_for_position(
+    position_context: dict[str, Any],
+    now_iso: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], str, bool]:
+    if now_iso is None:
+        now_iso = datetime.now(UTC).isoformat()
+
+    breakeven_result: dict[str, Any] = {
+        "success": False,
+        "retcode": None,
+    }
+    breakeven_log: dict[str, Any] = {
+        "breakeven_triggered": False,
+        "breakeven_new_sl": "",
+        "breakeven_time": "",
+        "breakeven_ticket": int(position_context.get("ticket", 0) or 0),
+        "breakeven_entry_price": float(position_context.get("price_open", 0.0) or 0.0),
+        "breakeven_initial_sl": float(position_context.get("sl", 0.0) or 0.0),
+        "breakeven_trigger_price": "",
+        "breakeven_current_price": float(position_context.get("price_current", 0.0) or 0.0),
+        "breakeven_modify_success": "",
+        "breakeven_modify_retcode": "",
+        "breakeven_reason": "",
+    }
+
+    entry_price = float(position_context.get("price_open", 0.0) or 0.0)
+    initial_sl = float(position_context.get("sl", 0.0) or 0.0)
+    current_price = float(position_context.get("price_current", 0.0) or 0.0)
+    side = str(position_context.get("type", "") or "")
+    risk_r = abs(entry_price - initial_sl)
+    if side == "BUY":
+        breakeven_log["breakeven_trigger_price"] = round(entry_price + risk_r, 5)
+    elif side == "SELL":
+        breakeven_log["breakeven_trigger_price"] = round(entry_price - risk_r, 5)
+
+    should_move, new_sl = should_move_to_breakeven(
+        entry=entry_price,
+        initial_sl=initial_sl,
+        current_price=current_price,
+        current_sl=initial_sl,
+        side=side,
+        buffer=BREAKEVEN_BUFFER,
+    )
+    if should_move and new_sl is not None:
+        breakeven_log["breakeven_triggered"] = True
+        breakeven_log["breakeven_new_sl"] = float(new_sl)
+        breakeven_log["breakeven_time"] = now_iso
+        breakeven_result = modify_sl(int(position_context["ticket"]), float(new_sl))
+        breakeven_log["breakeven_modify_success"] = bool(breakeven_result.get("success", False))
+        breakeven_log["breakeven_modify_retcode"] = breakeven_result.get("retcode", "")
+        if bool(breakeven_result.get("success", False)):
+            breakeven_log["breakeven_reason"] = "MOVED"
+            return breakeven_result, breakeven_log, "Position hold + breakeven moved", True
+
+        breakeven_log["breakeven_reason"] = "MOVE_FAILED"
+        return breakeven_result, breakeven_log, "Breakeven move failed", False
+
+    breakeven_log["breakeven_reason"] = "NOT_TRIGGERED_OR_ALREADY_MOVED"
+    return breakeven_result, breakeven_log, "Position hold", True
 
 
 def _load_closed_deal_state() -> dict[str, Any]:
@@ -395,6 +457,16 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
     d1 = add_indicators(get_rates(SYMBOL, "D1", 300))
     h4 = add_indicators(get_rates(SYMBOL, "H4", 300))
     h1 = add_indicators(get_rates(SYMBOL, "H1", 300))
+
+    h1_latest = _extract_latest_features(h1) if not h1.empty else {}
+    horizontal_levels = build_horizontal_levels(
+        d1_frame=d1,
+        h4_frame=h4,
+        h1_frame=h1,
+        current_price=float(h1_latest.get("close", 0.0) or 0.0),
+        current_atr=float(h1_latest.get("atr_14", 0.0) or 0.0),
+    )
+
     news_items = fetch_news(hours=24)
     macro_data = get_macro_data(force_refresh=False)
     macro_report = analyze_macro_environment(macro_data)
@@ -403,6 +475,7 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
             "d1": _extract_latest_features(d1) if not d1.empty else {},
             "h4": _extract_latest_features(h4),
             "h1": _extract_latest_features(h1),
+            "horizontal_levels": horizontal_levels,
         }
     )
     sentiment_report = analyze_sentiment(news_items)
@@ -865,40 +938,8 @@ def run_once(
                 if not allowed:
                     filter_reason = "Position close failed"
             elif evaluation_action == "HOLD":
-                entry_price = float(position_context.get("price_open", 0.0) or 0.0)
-                initial_sl = float(position_context.get("sl", 0.0) or 0.0)
-                current_price = float(position_context.get("price_current", 0.0) or 0.0)
-                side = str(position_context.get("type", "") or "")
-                risk_r = abs(entry_price - initial_sl)
-                if side == "BUY":
-                    breakeven_log["breakeven_trigger_price"] = round(entry_price + risk_r, 5)
-                elif side == "SELL":
-                    breakeven_log["breakeven_trigger_price"] = round(entry_price - risk_r, 5)
-
-                should_move, new_sl = should_move_to_breakeven(
-                    entry=entry_price,
-                    initial_sl=initial_sl,
-                    current_price=current_price,
-                    current_sl=initial_sl,
-                    side=side,
-                    buffer=BREAKEVEN_BUFFER,
-                )
-                if should_move and new_sl is not None:
-                    breakeven_log["breakeven_triggered"] = True
-                    breakeven_log["breakeven_new_sl"] = float(new_sl)
-                    breakeven_log["breakeven_time"] = now_iso
-                    breakeven_result = modify_sl(int(position_context["ticket"]), float(new_sl))
-                    breakeven_log["breakeven_modify_success"] = bool(breakeven_result.get("success", False))
-                    breakeven_log["breakeven_modify_retcode"] = breakeven_result.get("retcode", "")
-                    if bool(breakeven_result.get("success", False)):
-                        filter_reason = "Position hold + breakeven moved"
-                        breakeven_log["breakeven_reason"] = "MOVED"
-                    else:
-                        filter_reason = "Breakeven move failed"
-                        breakeven_log["breakeven_reason"] = "MOVE_FAILED"
-                        allowed = False
-                else:
-                    breakeven_log["breakeven_reason"] = "NOT_TRIGGERED_OR_ALREADY_MOVED"
+                breakeven_log["breakeven_reason"] = "DELEGATED_TO_MONITOR"
+                filter_reason = "Position hold"
 
             usage = _sum_token_usage(technical_report, sentiment_report, debate_report, evaluation_report)
             execution_result = close_result if evaluation_action == "CLOSE" else breakeven_result

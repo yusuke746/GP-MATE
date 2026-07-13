@@ -1,11 +1,49 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import main
 import agents.debate_graph as debate_graph
 from agents.debate_graph import run_debate_graph
+from agents.technical import analyze_technical
+from unittest.mock import Mock, patch
+
+
+def _fake_llm_result() -> Mock:
+    result = Mock()
+    result.ok = True
+    result.payload = {
+        "trend": "RANGE",
+        "signal": "NEUTRAL",
+        "key_levels": {},
+        "reasoning": "LLM reasoning",
+    }
+    result.model = "gpt-5.4-mini"
+    result.error = ""
+    result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    return result
+
+
+def _patch_client() -> Mock:
+    fake_client = Mock()
+    fake_client.call_json.return_value = _fake_llm_result()
+    return fake_client
+
+
+def _frame_with_rsi(rsi_14: float) -> dict[str, float]:
+    return {
+        "close": 100.0,
+        "rsi_14": rsi_14,
+        "macd_hist": 0.4,
+        "bb_upper": 101.0,
+        "bb_mid": 98.0,
+        "bb_lower": 95.0,
+        "atr_14": 2.0,
+        "recent_high_20": 100.5,
+        "recent_low_20": 96.0,
+    }
 
 
 def test_confidence_changes_with_opposed_arguments() -> None:
@@ -467,6 +505,125 @@ def test_role_prompts_require_named_weakness_structure() -> None:
     assert "confidenceは必ず0.3以上" in debate_graph.BEAR_SYSTEM_PROMPT
 
 
+def _base_debate_state_with_levels(horizontal_levels: dict[str, Any]) -> debate_graph.DebateState:
+    return {
+        "technical_report": {
+            "signal": "BUY",
+            "trend": "UP",
+            "alignment": "ALIGNED",
+            "d1_trend": "UP",
+            "execution_trend": "UP",
+            "key_levels": {
+                "d1": {"snapshot": {"close": 2300.0}},
+                "frames": {"h1": {"close": 2300.0}},
+                "horizontal_levels": horizontal_levels,
+            },
+        },
+        "sentiment_report": {"score": 0.1},
+        "macro_report": {"macro_bias": "NEUTRAL"},
+        "bull_arguments": [],
+        "bear_arguments": [],
+        "bull_conceded_points": [],
+        "round_count": 0,
+        "max_rounds": 3,
+        "bull_confidence": 0.5,
+        "bear_confidence": 0.5,
+        "prev_bull_confidence": 0.5,
+        "bull_confidence_history": [0.5],
+        "bear_confidence_history": [0.5],
+        "bull_ok_history": [],
+        "bear_ok_history": [],
+        "judge_summary": debate_graph._default_judge_summary(),
+        "bull_ok": True,
+        "bear_ok": True,
+        "judge_ok": True,
+        "bull_error": "",
+        "bear_error": "",
+        "judge_error": "",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def test_role_payload_includes_horizontal_levels_for_bull_and_bear(monkeypatch) -> None:
+    captured: dict[str, dict[str, Any]] = {}
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.content = '{"argument":"ok","confidence":0.6,"conceded_points":[]}'
+            self.usage_metadata = {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            }
+
+    class _FakeChatOpenAI:
+        def __init__(self, model: str, temperature: float) -> None:
+            _ = model
+            _ = temperature
+
+        def invoke(self, messages: list[Any]) -> _FakeResponse:
+            payload = json.loads(str(getattr(messages[1], "content", "{}") or "{}"))
+            role = "bull" if "latest_bear_argument" in payload else "bear"
+            captured[role] = payload
+            return _FakeResponse()
+
+    monkeypatch.setattr(debate_graph, "ChatOpenAI", _FakeChatOpenAI)
+
+    horizontal_levels = {
+        "resistances": [
+            {"price": 2310.0, "score": 4.0, "source": "cluster", "timeframe": "H4", "touch_count": 3}
+        ],
+        "supports": [
+            {"price": 2290.0, "score": 3.0, "source": "swing", "timeframe": "D1", "touch_count": 2}
+        ],
+    }
+    state = _base_debate_state_with_levels(horizontal_levels)
+
+    debate_graph._invoke_role_llm("bull", state)
+    debate_graph._invoke_role_llm("bear", state)
+
+    assert "horizontal_levels_context" in captured["bull"]
+    assert "horizontal_levels_context" in captured["bear"]
+    assert captured["bull"]["horizontal_levels_context"] == captured["bear"]["horizontal_levels_context"]
+    assert captured["bull"]["horizontal_levels_context"]["nearest_resistances"][0]["price"] == 2310.0
+    assert captured["bull"]["horizontal_levels_context"]["nearest_supports"][0]["price"] == 2290.0
+
+
+def test_role_payload_fallback_when_horizontal_levels_empty(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.content = '{"argument":"ok","confidence":0.6,"conceded_points":[]}'
+            self.usage_metadata = {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            }
+
+    class _FakeChatOpenAI:
+        def __init__(self, model: str, temperature: float) -> None:
+            _ = model
+            _ = temperature
+
+        def invoke(self, messages: list[Any]) -> _FakeResponse:
+            payload = json.loads(str(getattr(messages[1], "content", "{}") or "{}"))
+            captured.update(payload)
+            return _FakeResponse()
+
+    monkeypatch.setattr(debate_graph, "ChatOpenAI", _FakeChatOpenAI)
+
+    state = _base_debate_state_with_levels({"resistances": [], "supports": []})
+    _ = debate_graph._invoke_role_llm("bull", state)
+
+    assert "horizontal_levels_context" in captured
+    assert captured["horizontal_levels_context"]["available"] is False
+    assert captured["horizontal_levels_context"]["nearest_resistances"] == []
+    assert captured["horizontal_levels_context"]["nearest_supports"] == []
+
+
 def test_confidence_shift_uses_state_history_not_judge_generated_values() -> None:
     def fake_llm(role: str, state: dict[str, Any]) -> dict[str, Any]:
         if role == "bull":
@@ -697,6 +854,70 @@ def test_gate_executes_debate_on_divergent_alignment() -> None:
     )
     assert decision["should_debate"] is True
     assert "DIVERGENT" in decision["reason"]
+
+
+def test_gate_uses_multitimeframe_top_level_rsi_for_overheated_buy() -> None:
+    with patch("agents.technical.get_default_client", return_value=_patch_client()):
+        technical_report = analyze_technical(
+            {
+                "d1": _frame_with_rsi(68.0),
+                "h4": _frame_with_rsi(66.0),
+                "h1": _frame_with_rsi(76.0),
+            }
+        )
+
+    technical_report["trend"] = "STRONG_UP"
+    decision = debate_graph.should_execute_debate(
+        technical_report=technical_report,
+        sentiment_report={"score": 0.2, "sentiment": "BULLISH"},
+    )
+
+    assert technical_report["rsi_14"] == 76.0
+    assert decision["should_debate"] is True
+    assert "強トレンドかつ過熱" in decision["reason"]
+
+
+def test_gate_uses_multitimeframe_top_level_rsi_for_overheated_sell() -> None:
+    with patch("agents.technical.get_default_client", return_value=_patch_client()):
+        technical_report = analyze_technical(
+            {
+                "d1": _frame_with_rsi(34.0),
+                "h4": _frame_with_rsi(32.0),
+                "h1": _frame_with_rsi(24.0),
+            }
+        )
+
+    technical_report["trend"] = "STRONG_DOWN"
+    technical_report["signal"] = "SELL"
+    decision = debate_graph.should_execute_debate(
+        technical_report=technical_report,
+        sentiment_report={"score": -0.2, "sentiment": "BEARISH"},
+    )
+
+    assert technical_report["rsi_14"] == 24.0
+    assert decision["should_debate"] is True
+    assert "強トレンドかつ過熱" in decision["reason"]
+
+
+def test_gate_uses_multitimeframe_top_level_rsi_for_non_overheated_case() -> None:
+    with patch("agents.technical.get_default_client", return_value=_patch_client()):
+        technical_report = analyze_technical(
+            {
+                "d1": _frame_with_rsi(63.0),
+                "h4": _frame_with_rsi(61.0),
+                "h1": _frame_with_rsi(55.0),
+            }
+        )
+
+    technical_report["trend"] = "STRONG_UP"
+    decision = debate_graph.should_execute_debate(
+        technical_report=technical_report,
+        sentiment_report={"score": 0.2, "sentiment": "BULLISH"},
+    )
+
+    assert technical_report["rsi_14"] == 55.0
+    assert decision["should_debate"] is False
+    assert "明確なトレンドのため" in decision["reason"]
 
 
 def test_debate_llm_input_includes_macro_and_multitimeframe() -> None:

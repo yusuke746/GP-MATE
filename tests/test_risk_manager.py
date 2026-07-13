@@ -128,3 +128,12 @@ def test_build_risk_plan_success_buy() -> None:
     assert plan["action"] == "BUY"
     assert float(plan["lot"]) > 0
     assert float(plan["tp"]) > float(plan["sl"])
+
+
+def test_build_risk_plan_uses_default_2r_take_profit() -> None:
+    plan = build_risk_plan(action="BUY", entry_price=2300.0, atr=10.0, balance_jpy=500_000)
+    assert plan["ok"]
+    sl_distance = 2300.0 - float(plan["sl"])
+    tp_distance = float(plan["tp"]) - 2300.0
+    assert sl_distance == 15.0
+    assert tp_distance == 30.0

@@ -77,6 +77,19 @@ def test_multitimeframe_alignment_is_aligned_when_d1_and_execution_match() -> No
     assert result["alignment"] == "ALIGNED"
     assert result["trend"] == "UP"
     assert result["signal"] == "BUY"
+    assert result["rsi_14"] == 68.0
+
+
+def test_multitimeframe_top_level_rsi_uses_h1_value() -> None:
+    h4 = _bullish_frame()
+    h1 = _bullish_frame()
+    h1["rsi_14"] = 76.0
+
+    with patch("agents.technical.get_default_client", return_value=_patch_client()):
+        result = analyze_technical({"d1": _bullish_frame(), "h4": h4, "h1": h1})
+
+    assert result["rsi_14"] == 76.0
+    assert result["key_levels"]["frames"]["h1"]["rsi_14"] == 76.0
 
 
 def test_multitimeframe_alignment_is_divergent_when_d1_and_execution_conflict() -> None:
@@ -105,3 +118,38 @@ def test_multitimeframe_analysis_works_without_d1_data() -> None:
     assert result["execution_trend"] == "UP"
     assert result["alignment"] == "MIXED"
     assert result["signal"] == "BUY"
+
+
+def test_multitimeframe_keeps_horizontal_levels_in_key_levels() -> None:
+    payload = {
+        "d1": _bullish_frame(),
+        "h4": _bullish_frame(),
+        "h1": _bullish_frame(),
+        "horizontal_levels": {
+            "resistances": [
+                {
+                    "price": 101.5,
+                    "score": 4.2,
+                    "source": "cluster",
+                    "timeframe": "H4",
+                    "touch_count": 3,
+                }
+            ],
+            "supports": [
+                {
+                    "price": 96.5,
+                    "score": 3.8,
+                    "source": "swing",
+                    "timeframe": "D1",
+                    "touch_count": 2,
+                }
+            ],
+        },
+    }
+
+    with patch("agents.technical.get_default_client", return_value=_patch_client()):
+        result = analyze_technical(payload)
+
+    assert "horizontal_levels" in result["key_levels"]
+    assert result["key_levels"]["horizontal_levels"]["resistances"][0]["price"] == 101.5
+    assert result["key_levels"]["horizontal_levels"]["supports"][0]["price"] == 96.5

@@ -41,6 +41,7 @@ class TechnicalAnalysisMeta(TypedDict):
 class TechnicalAnalysisResult(TypedDict, total=False):
     trend: Literal["UP", "DOWN", "RANGE"]
     signal: Literal["BUY", "SELL", "NEUTRAL"]
+    rsi_14: float
     key_levels: dict[str, Any]
     reasoning: str
     d1_trend: Literal["UP", "DOWN", "RANGE"]
@@ -228,6 +229,11 @@ def _build_multitimeframe_baseline(indicator_payload: dict[str, Any]) -> Technic
         f"H4の根拠: {h4['reason']}。H1の根拠: {h1['reason']}。D1の根拠: {d1['reason']}。"
     )
 
+    raw_horizontal_levels = indicator_payload.get("horizontal_levels", {})
+    horizontal_levels = raw_horizontal_levels if isinstance(raw_horizontal_levels, dict) else {}
+    resistances_raw = horizontal_levels.get("resistances", []) if isinstance(horizontal_levels, dict) else []
+    supports_raw = horizontal_levels.get("supports", []) if isinstance(horizontal_levels, dict) else []
+
     key_levels = {
         "d1": {"trend": d1["trend"], "score": d1["score"], "snapshot": d1["snapshot"]},
         "execution": {
@@ -241,11 +247,16 @@ def _build_multitimeframe_baseline(indicator_payload: dict[str, Any]) -> Technic
             "h4": h4["snapshot"],
             "h1": h1["snapshot"],
         },
+        "horizontal_levels": {
+            "resistances": list(resistances_raw) if isinstance(resistances_raw, list) else [],
+            "supports": list(supports_raw) if isinstance(supports_raw, list) else [],
+        },
     }
 
     result: TechnicalAnalysisResult = {
         "trend": execution_trend,
         "signal": _direction_to_signal(execution_trend),
+        "rsi_14": _as_float(h1["snapshot"].get("rsi_14", 50.0), 50.0),
         "key_levels": key_levels,
         "reasoning": reasoning,
         "d1_trend": d1["trend"],
@@ -264,10 +275,26 @@ def _build_legacy_baseline(indicator_payload: dict[str, Any]) -> TechnicalAnalys
     if trend not in {"UP", "DOWN", "RANGE"}:
         trend = "RANGE"
 
+    raw_horizontal_levels = indicator_payload.get("horizontal_levels", {})
+    horizontal_levels = raw_horizontal_levels if isinstance(raw_horizontal_levels, dict) else {}
+    resistances_raw = horizontal_levels.get("resistances", []) if isinstance(horizontal_levels, dict) else []
+    supports_raw = horizontal_levels.get("supports", []) if isinstance(horizontal_levels, dict) else []
+
     result: TechnicalAnalysisResult = {
         "trend": cast(Literal["UP", "DOWN", "RANGE"], trend if trend in {"UP", "DOWN", "RANGE"} else "RANGE"),
         "signal": cast(Literal["BUY", "SELL", "NEUTRAL"], signal),
-        "key_levels": dict(indicator_payload.get("key_levels", {})) if isinstance(indicator_payload.get("key_levels", {}), dict) else {},
+        "rsi_14": _as_float(indicator_payload.get("rsi_14", 50.0), 50.0),
+        "key_levels": {
+            **(
+                dict(indicator_payload.get("key_levels", {}))
+                if isinstance(indicator_payload.get("key_levels", {}), dict)
+                else {}
+            ),
+            "horizontal_levels": {
+                "resistances": list(resistances_raw) if isinstance(resistances_raw, list) else [],
+                "supports": list(supports_raw) if isinstance(supports_raw, list) else [],
+            },
+        },
         "reasoning": str(indicator_payload.get("reasoning", "テクニカル分析に失敗したため保守的にNEUTRAL。") or "テクニカル分析に失敗したため保守的にNEUTRAL."),
         "d1_trend": "RANGE",
         "execution_trend": cast(Literal["UP", "DOWN", "RANGE"], trend if trend in {"UP", "DOWN", "RANGE"} else "RANGE"),
@@ -308,6 +335,7 @@ def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
 
     merged["trend"] = baseline["trend"]
     merged["signal"] = baseline["signal"]
+    merged["rsi_14"] = baseline["rsi_14"]
     merged["key_levels"] = baseline["key_levels"]
     merged["reasoning"] = str(payload.get("reasoning", baseline["reasoning"]))
     merged["d1_trend"] = baseline["d1_trend"]
