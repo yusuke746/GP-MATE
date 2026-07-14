@@ -498,11 +498,80 @@ def test_failed_bear_round_keeps_previous_confidence_not_zero() -> None:
 
 
 def test_role_prompts_require_named_weakness_structure() -> None:
+    assert "あなたは必ず【Bull】の立場" in debate_graph.BULL_SYSTEM_PROMPT
+    assert "自分がBullであることを絶対に見失わない" in debate_graph.BULL_SYSTEM_PROMPT
+    assert "あなたは必ず【Bear】の立場" in debate_graph.BEAR_SYSTEM_PROMPT
+    assert "自分がBearであることを絶対に見失わない" in debate_graph.BEAR_SYSTEM_PROMPT
     assert "相手は" in debate_graph.BULL_SYSTEM_PROMPT
     assert "見落としている" in debate_graph.BULL_SYSTEM_PROMPT
     assert "相手は" in debate_graph.BEAR_SYSTEM_PROMPT
     assert "見落としている" in debate_graph.BEAR_SYSTEM_PROMPT
     assert "confidenceは必ず0.3以上" in debate_graph.BEAR_SYSTEM_PROMPT
+
+
+def test_role_payload_has_clear_opponent_delimiter_and_self_role(monkeypatch) -> None:
+    captured: dict[str, dict[str, Any]] = {}
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.content = '{"argument":"ok","confidence":0.6,"conceded_points":[]}'
+            self.usage_metadata = {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            }
+
+    class _FakeChatOpenAI:
+        def __init__(self, model: str, temperature: float) -> None:
+            _ = model
+            _ = temperature
+
+        def invoke(self, messages: list[Any]) -> _FakeResponse:
+            payload = json.loads(str(getattr(messages[1], "content", "{}") or "{}"))
+            role = "bull" if payload.get("self_role") == "Bull" else "bear"
+            captured[role] = payload
+            return _FakeResponse()
+
+    monkeypatch.setattr(debate_graph, "ChatOpenAI", _FakeChatOpenAI)
+
+    state: debate_graph.DebateState = {
+        "technical_report": {"signal": "BUY", "trend": "UP"},
+        "sentiment_report": {"score": 0.1},
+        "macro_report": {},
+        "bull_arguments": ["Bull側の主張サンプル"],
+        "bear_arguments": ["Bear側の主張サンプル"],
+        "bull_conceded_points": [],
+        "round_count": 1,
+        "max_rounds": 3,
+        "bull_confidence": 0.62,
+        "bear_confidence": 0.58,
+        "prev_bull_confidence": 0.5,
+        "bull_confidence_history": [0.5, 0.62],
+        "bear_confidence_history": [0.5, 0.58],
+        "bull_ok_history": [True],
+        "bear_ok_history": [True],
+        "judge_summary": debate_graph._default_judge_summary(),
+        "bull_ok": True,
+        "bear_ok": True,
+        "judge_ok": True,
+        "bull_error": "",
+        "bear_error": "",
+        "judge_error": "",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    _ = debate_graph._invoke_role_llm("bull", state)
+    _ = debate_graph._invoke_role_llm("bear", state)
+
+    assert captured["bull"]["self_role"] == "Bull"
+    assert "--- 相手(Bear)の主張ここから ---" in captured["bull"]["opponent_argument_context"]
+    assert "--- 相手(Bear)の主張ここまで ---" in captured["bull"]["opponent_argument_context"]
+
+    assert captured["bear"]["self_role"] == "Bear"
+    assert "--- 相手(Bull)の主張ここから ---" in captured["bear"]["opponent_argument_context"]
+    assert "--- 相手(Bull)の主張ここまで ---" in captured["bear"]["opponent_argument_context"]
 
 
 def _base_debate_state_with_levels(horizontal_levels: dict[str, Any]) -> debate_graph.DebateState:

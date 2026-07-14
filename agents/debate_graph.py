@@ -34,6 +34,8 @@ JUDGE_TEMPERATURE = 0.2
 
 BULL_SYSTEM_PROMPT = (
     "あなたはBullアナリストです。必ず買いの立場を明確に主張し、HOLD寄りに逃げないこと。"
+    "あなたは必ず【Bull】の立場です。相手の主張を引用・反論する際、相手の文章を冒頭からそのまま書き写さないこと。"
+    "相手の論点を要約して引用し、それに対するBullの立場からの反論を述べること。自分がBullであることを絶対に見失わないこと。"
     "相手(Bear)の主張を名指しで引用し、必ず『相手は○○と言うが、△△を見落としている』形式で反論すること。"
     "マクロと多時間軸も強気材料として解釈し、マクロがBEARISHでも『織り込み済み』や『逆風は過剰評価』として反論してよい。"
     "D1が下でもH4/H1が上向きなら、押し目からの反発や短期優位として主張してよい。"
@@ -43,6 +45,8 @@ BULL_SYSTEM_PROMPT = (
 
 BEAR_SYSTEM_PROMPT = (
     "あなたはBearアナリストです。必ず最も弱気な視点を提示する義務がある。"
+    "あなたは必ず【Bear】の立場です。相手の主張を引用・反論する際、相手の文章を冒頭からそのまま書き写さないこと。"
+    "相手の論点を要約して引用し、それに対するBearの立場からの反論を述べること。自分がBearであることを絶対に見失わないこと。"
     "材料が乏しくても、下落リスクまたは反対材料を最低1つは挙げること。"
     "confidenceは必ず0.3以上で答え、0.0や極端な棄権は禁止。"
     "相手(Bull)の主張の弱点を必ず1つ以上、名指しで突くこと。"
@@ -809,10 +813,21 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
     latest_bear = state["bear_arguments"][-1] if state["bear_arguments"] else "初回ラウンド。"
     latest_bull = state["bull_arguments"][-1] if state["bull_arguments"] else "初回ラウンド。"
     horizontal_levels_context = _build_horizontal_levels_context(state["technical_report"])
+    bear_opponent_context = (
+        "--- 相手(Bear)の主張ここから ---\n"
+        f"{latest_bear}\n"
+        "--- 相手(Bear)の主張ここまで ---"
+    )
+    bull_opponent_context = (
+        "--- 相手(Bull)の主張ここから ---\n"
+        f"{latest_bull}\n"
+        "--- 相手(Bull)の主張ここまで ---"
+    )
 
     if role == "bull":
         system_prompt = BULL_SYSTEM_PROMPT
         user_payload = {
+            "self_role": "Bull",
             "technical_report": state["technical_report"],
             "sentiment_report": state["sentiment_report"],
             "macro_report": state.get("macro_report", {}),
@@ -823,11 +838,13 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
                 "alignment": state["technical_report"].get("alignment", "MIXED"),
             },
             "latest_bear_argument": latest_bear,
+            "opponent_argument_context": bear_opponent_context,
             "prev_bull_confidence": state["bull_confidence"],
         }
     else:
         system_prompt = BEAR_SYSTEM_PROMPT
         user_payload = {
+            "self_role": "Bear",
             "technical_report": state["technical_report"],
             "sentiment_report": state["sentiment_report"],
             "macro_report": state.get("macro_report", {}),
@@ -838,6 +855,7 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
                 "alignment": state["technical_report"].get("alignment", "MIXED"),
             },
             "latest_bull_argument": latest_bull,
+            "opponent_argument_context": bull_opponent_context,
             "prev_bear_confidence": state["bear_confidence"],
         }
 
