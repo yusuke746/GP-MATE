@@ -104,9 +104,11 @@ def decide_trade(
     if directional_bias not in {"BULLISH", "BEARISH", "NEUTRAL"}:
         directional_bias = "NEUTRAL"
     if directional_bias == "NEUTRAL" and isinstance(macro_report, dict):
+        _macro_meta = macro_report.get("_meta", {})
+        _macro_ok = bool(_macro_meta.get("ok", False)) if isinstance(_macro_meta, dict) else False
         m_bias = str(macro_report.get("macro_bias", "NEUTRAL") or "NEUTRAL").upper()
         m_conf = float(macro_report.get("confidence", 0.0) or 0.0)
-        if m_bias in {"BULLISH", "BEARISH"} and m_conf >= MACRO_BIAS_CARRY_THRESHOLD:
+        if _macro_ok and m_bias in {"BULLISH", "BEARISH"} and m_conf >= MACRO_BIAS_CARRY_THRESHOLD:
             directional_bias = m_bias
     payload["directional_bias"] = directional_bias
     payload["bias_strength"] = max(0.0, min(1.0, float(payload.get("bias_strength", 0.0) or 0.0)))

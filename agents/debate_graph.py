@@ -224,6 +224,15 @@ def _estimate_uncertainty_confidence(
     return max(0.0, min(1.0, score))
 
 
+def _macro_is_reliable(macro_report: dict[str, Any] | None) -> bool:
+    if not isinstance(macro_report, dict):
+        return False
+    meta = macro_report.get("_meta", {})
+    if not isinstance(meta, dict):
+        return False
+    return bool(meta.get("ok", False))
+
+
 def should_execute_debate(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
@@ -276,7 +285,11 @@ def should_execute_debate(
         }
 
     macro_conf = float((macro_report or {}).get("confidence", 0.0) or 0.0)
-    if macro_dir in {"BULLISH", "BEARISH"} and macro_conf >= macro_conf_threshold:
+    if (
+        _macro_is_reliable(macro_report)
+        and macro_dir in {"BULLISH", "BEARISH"}
+        and macro_conf >= macro_conf_threshold
+    ):
         return {
             "should_debate": True,
             "reason": f"議論実行（マクロが強い方向性: {macro_dir} conf={macro_conf:.2f}）",

@@ -77,6 +77,7 @@ def evaluate_position(
         "position_side": position_side,
         "macro_vs_position": macro_vs_position,
         "against_close_threshold": MACRO_AGAINST_CLOSE_THRESHOLD,
+        "macro_reliable": bool((macro_report or {}).get("_meta", {}).get("ok", False)),
     }
 
     user_payload = {

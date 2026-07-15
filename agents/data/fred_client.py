@@ -16,6 +16,7 @@ FRED_BASE_URL: Final[str] = "https://api.stlouisfed.org/fred/series/observations
 ALPHA_VANTAGE_BASE_URL: Final[str] = "https://www.alphavantage.co/query"
 REQUEST_TIMEOUT_SECONDS: Final[float] = 10.0
 REQUEST_MAX_RETRIES: Final[int] = 2
+STALE_CACHE_MAX_AGE_DAYS: Final[int] = 5
 CACHE_LOCK = Lock()
 
 SERIES_MAP: Final[dict[str, str]] = {
@@ -60,6 +61,7 @@ class AlphaVantageFxResult(TypedDict):
 
 
 _DAILY_CACHE: dict[str, MacroData] = {}
+_LAST_GOOD_CACHE: dict[str, Any] = {"data": None, "fetched_date": None}
 
 
 def _today_key(now: datetime | None = None) -> str:
@@ -243,9 +245,39 @@ def get_macro_data(force_refresh: bool = False, api_key: str | None = None) -> M
     result = _build_macro_data(resolved_key)
 
     with CACHE_LOCK:
-        _DAILY_CACHE[today] = copy.deepcopy(result)
+        if result["_meta"]["ok"]:
+            # Successful fetches refresh both daily cache and last-good snapshot.
+            _DAILY_CACHE[today] = copy.deepcopy(result)
+            _LAST_GOOD_CACHE["data"] = copy.deepcopy(result)
+            _LAST_GOOD_CACHE["fetched_date"] = date.fromisoformat(today)
+            return result
 
-    return result
+        # On failure, return a stale last-good snapshot if it is still within TTL.
+        last_good = _LAST_GOOD_CACHE.get("data")
+        last_date = _LAST_GOOD_CACHE.get("fetched_date")
+        if last_good is not None and isinstance(last_date, date):
+            age_days = (date.fromisoformat(today) - last_date).days
+            if 0 <= age_days <= STALE_CACHE_MAX_AGE_DAYS:
+                stale = copy.deepcopy(last_good)
+                stale["_meta"]["cached"] = True
+                stale["_meta"]["ok"] = True
+                stale["_meta"]["error"] = (
+                    f"stale fallback age={age_days}d "
+                    f"(fetch failed: {result['_meta']['error']})"
+                )
+                LOGGER.warning(
+                    "get_macro_data: using stale last-good cache (age=%sd) due to fetch failure",
+                    age_days,
+                )
+                return stale
+            LOGGER.warning(
+                "get_macro_data: last-good cache too old (age=%sd > %sd); returning neutral failure",
+                age_days,
+                STALE_CACHE_MAX_AGE_DAYS,
+            )
+
+        # If no valid last-good exists, return the neutral failure result without caching it.
+        return result
 
 
 def get_alpha_vantage_fx_rate(
