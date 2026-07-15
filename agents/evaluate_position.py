@@ -4,14 +4,17 @@ import json
 from typing import Any
 
 from agents.base import decision_model, get_default_client
-from config import CLOSE_CONFIDENCE_THRESHOLD, SYMBOL
+from config import CLOSE_CONFIDENCE_THRESHOLD, SYMBOL, MACRO_AGAINST_CLOSE_THRESHOLD
 
 SYSTEM_PROMPT = (
     "あなたは保有ポジションを評価するトレーダーです。"
-    "保有情報、分析結果、議論結果を踏まえて、そのポジションを保持(HOLD)するか決済(CLOSE)するか判断してください。"
+    "保有情報、分析結果、議論結果、マクロ環境を踏まえて、保持(HOLD)か決済(CLOSE)を判断してください。"
     "明確に逆方向の根拠が強い場合のみCLOSEを選び、それ以外はHOLDを優先してください。"
     "逆方向でも確信が弱い場合は慌てて決済せずHOLDにしてください。"
     "同方向または中立ならHOLDにしてください。"
+    "macro_context.macro_vs_position が AGAINST かつ macro_confidence が高い場合は、"
+    "保有方向にマクロの逆風が強いことを意味するため、CLOSE寄りの検討材料として重視してください。"
+    "ただし逆風が単一材料のみで確信が弱い場合はHOLDを維持してください。"
     "confidenceが閾値未満なら必ずHOLDにしてください。"
     "必ず evaluate_position_action 関数を呼び出して返答してください。"
 )
@@ -45,6 +48,7 @@ def evaluate_position(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
     debate_report: dict[str, Any],
+    macro_report: dict[str, Any] | None = None,
     confidence_threshold: float = CLOSE_CONFIDENCE_THRESHOLD,
 ) -> dict[str, Any]:
     raw_judge_summary = debate_report.get("judge_summary", {})
@@ -59,10 +63,28 @@ def evaluate_position(
             "stronger_side": "neutral",
         }
 
+    position_side = str(position_context.get("type", "") or "").upper()
+    macro_bias = str((macro_report or {}).get("macro_bias", "NEUTRAL") or "NEUTRAL").upper()
+    macro_conf = float((macro_report or {}).get("confidence", 0.0) or 0.0)
+    macro_vs_position = "NEUTRAL"
+    if macro_bias == "BULLISH":
+        macro_vs_position = "ALIGNED" if position_side == "BUY" else ("AGAINST" if position_side == "SELL" else "NEUTRAL")
+    elif macro_bias == "BEARISH":
+        macro_vs_position = "ALIGNED" if position_side == "SELL" else ("AGAINST" if position_side == "BUY" else "NEUTRAL")
+    macro_context = {
+        "macro_bias": macro_bias,
+        "macro_confidence": macro_conf,
+        "position_side": position_side,
+        "macro_vs_position": macro_vs_position,
+        "against_close_threshold": MACRO_AGAINST_CLOSE_THRESHOLD,
+    }
+
     user_payload = {
         "position": position_context,
         "technical": technical_report,
         "sentiment": sentiment_report,
+        "macro": macro_report or {},
+        "macro_context": macro_context,
         "debate": debate_report,
         "judge_summary": judge_summary,
         "constraints": {

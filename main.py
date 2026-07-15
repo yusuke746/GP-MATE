@@ -131,6 +131,9 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "breakeven_modify_success",
     "breakeven_modify_retcode",
     "breakeven_reason",
+    "directional_bias",
+    "bias_strength",
+    "trigger_conditions",
 )
 
 
@@ -898,6 +901,7 @@ def run_once(
                 technical_report=technical_report,
                 sentiment_report=sentiment_report,
                 debate_report=debate_report,
+                macro_report=macro_report,
                 confidence_threshold=CLOSE_CONFIDENCE_THRESHOLD,
             )
 
@@ -982,7 +986,12 @@ def run_once(
             _append_trade_log(result)
             return result
 
-        trader_report = debate_fallback_report or decide_trade(technical_report, sentiment_report, debate_report)
+        trader_report = debate_fallback_report or decide_trade(
+            technical_report,
+            sentiment_report,
+            debate_report,
+            macro_report=macro_report,
+        )
 
         spread = get_spread(SYMBOL)
         filter_result = check_filters(
@@ -1055,6 +1064,9 @@ def run_once(
             "decision_model": _extract_model_name(trader_report),
             "news_count": len(news_items),
             "error": str(order_result.get("reason", "")),
+            "directional_bias": str(trader_report.get("directional_bias", "") or ""),
+            "bias_strength": trader_report.get("bias_strength", ""),
+            "trigger_conditions": _safe_json_dumps(trader_report.get("trigger_conditions", []), default="[]"),
             **debate_log_fields,
         }
         _append_trade_log(result)

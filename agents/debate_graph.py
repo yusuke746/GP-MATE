@@ -7,6 +7,8 @@ import time
 from operator import add
 from typing import Any, Callable, Literal, TypedDict, cast
 
+from config import MACRO_DEBATE_CONF_THRESHOLD
+
 try:
     from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_openai import ChatOpenAI
@@ -226,6 +228,7 @@ def should_execute_debate(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
     macro_report: dict[str, Any] | None = None,
+    macro_conf_threshold: float = MACRO_DEBATE_CONF_THRESHOLD,
 ) -> DebateGateDecision:
     technical_dir = _technical_direction(technical_report)
     sentiment_dir = _sentiment_direction(sentiment_report)
@@ -265,6 +268,18 @@ def should_execute_debate(
         return {
             "should_debate": True,
             "reason": "議論実行（technicalとmacroが矛盾）",
+            "technical_direction": technical_dir,
+            "sentiment_direction": sentiment_dir,
+            "macro_direction": macro_dir,
+            "alignment": alignment,
+            "estimated_confidence": estimated,
+        }
+
+    macro_conf = float((macro_report or {}).get("confidence", 0.0) or 0.0)
+    if macro_dir in {"BULLISH", "BEARISH"} and macro_conf >= macro_conf_threshold:
+        return {
+            "should_debate": True,
+            "reason": f"議論実行（マクロが強い方向性: {macro_dir} conf={macro_conf:.2f}）",
             "technical_direction": technical_dir,
             "sentiment_direction": sentiment_dir,
             "macro_direction": macro_dir,
