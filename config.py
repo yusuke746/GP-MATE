@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Final
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -18,6 +20,17 @@ DEFAULT_RSS_FEEDS: Final[tuple[str, ...]] = (
 )
 
 load_dotenv(ENV_PATH)
+
+MARKET_TIMEZONE_NAME: Final[str] = "America/New_York"
+JST_TIMEZONE_NAME: Final[str] = "Asia/Tokyo"
+NY_RUN_TIMES: Final[tuple[tuple[int, int], ...]] = (
+    (3, 0),
+    (8, 0),
+    (9, 30),
+    (10, 30),
+)
+MARKET_TZ: Final[ZoneInfo] = ZoneInfo(MARKET_TIMEZONE_NAME)
+JST_TZ: Final[ZoneInfo] = ZoneInfo(JST_TIMEZONE_NAME)
 
 
 @dataclass(frozen=True)
@@ -45,7 +58,6 @@ class Settings:
     spread_multiplier_limit: float
     spread_samples: int
     spread_sample_interval: float
-    judgment_times: tuple[str, ...]
 
     model_analysis: str
     model_decision: str
@@ -84,18 +96,27 @@ def _get_env_float(name: str, default: float) -> float:
     return float(value)
 
 
-def _parse_judgment_times(value: str) -> tuple[str, ...]:
-    times = [item.strip() for item in value.split(",") if item.strip()]
-    if not times:
-        return ("09:00", "16:00", "21:00", "23:30")
-    return tuple(times)
-
-
 def _parse_breakeven_monitor_times(value: str) -> tuple[str, ...]:
     times = [item.strip() for item in value.split(",") if item.strip()]
     if not times:
         return ("07", "22", "37", "52")
     return tuple(times)
+
+
+def current_judgment_times_jst(reference: datetime | None = None) -> tuple[str, ...]:
+    current_ny = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    judgment_times: list[str] = []
+    for hour, minute in NY_RUN_TIMES:
+        scheduled_ny = datetime(
+            current_ny.year,
+            current_ny.month,
+            current_ny.day,
+            hour,
+            minute,
+            tzinfo=MARKET_TZ,
+        )
+        judgment_times.append(scheduled_ny.astimezone(JST_TZ).strftime("%H:%M"))
+    return tuple(judgment_times)
 
 
 def _normalize_symbol_name(symbol: str) -> str:
@@ -211,9 +232,6 @@ def load_settings() -> Settings:
         spread_multiplier_limit=2.0,
         spread_samples=20,
         spread_sample_interval=0.5,
-        judgment_times=_parse_judgment_times(
-            _get_env_str("JUDGMENT_TIMES", "09:00,16:00,21:00,23:30")
-        ),
         model_analysis=_get_env_str("MODEL_ANALYSIS", "gpt-5.4-mini-2026-03-17"),
         model_decision=_get_env_str("MODEL_DECISION", "gpt-5.5-2026-04-23"),
         max_news_items=_get_env_int("MAX_NEWS_ITEMS", 15),
@@ -255,7 +273,6 @@ NEWS_FILTER_MINUTES: Final[int] = settings.news_filter_minutes
 SPREAD_MULTIPLIER_LIMIT: Final[float] = settings.spread_multiplier_limit
 SPREAD_SAMPLES: Final[int] = settings.spread_samples
 SPREAD_SAMPLE_INTERVAL: Final[float] = settings.spread_sample_interval
-JUDGMENT_TIMES: Final[tuple[str, ...]] = settings.judgment_times
 
 MODEL_ANALYSIS: Final[str] = settings.model_analysis
 MODEL_DECISION: Final[str] = settings.model_decision

@@ -9,6 +9,7 @@ import warnings
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # Suppress known non-fatal warning from langchain_core on Python 3.14+.
 warnings.filterwarnings(
@@ -29,10 +30,11 @@ from config import (
     BREAKEVEN_BUFFER,
     CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
-    JUDGMENT_TIMES,
+    MARKET_TZ,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
     NEWS_FILTER_MINUTES,
+    NY_RUN_TIMES,
     SPREAD_SAMPLE_INTERVAL,
     SPREAD_SAMPLES,
     SYMBOL,
@@ -538,18 +540,6 @@ def _position_context_from_details(details: dict[str, Any], position_count: int)
     }
 
 
-def _parse_judgment_time(value: str) -> tuple[int, int] | None:
-    try:
-        hh_str, mm_str = value.split(":", 1)
-        hh = int(hh_str)
-        mm = int(mm_str)
-        if not (0 <= hh <= 23 and 0 <= mm <= 59):
-            return None
-        return hh, mm
-    except Exception:
-        return None
-
-
 def calc_today_risk_stats() -> tuple[int, float]:
     """Calculate today's consecutive losses and daily loss percentage from trade log.
 
@@ -656,18 +646,15 @@ def _run_scheduler_due_jobs(
     executed_today: set[str],
     baseline_spread: float | None,
 ) -> None:
-    now_utc = now_local.astimezone(UTC) if now_local.tzinfo is not None else now_local.replace(tzinfo=UTC)
+    local_tz = now_local.tzinfo or datetime.now().astimezone().tzinfo or ZoneInfo("UTC")
+    current_local = now_local if now_local.tzinfo is not None else now_local.replace(tzinfo=local_tz)
+    current_market = current_local.astimezone(MARKET_TZ)
 
-    for value in JUDGMENT_TIMES:
-        parsed = _parse_judgment_time(value)
-        if parsed is None:
-            LOGGER.warning("Invalid JUDGMENT_TIMES entry skipped: %s", value)
-            continue
-
-        hour, minute = parsed
-        target = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        delta = (now_local - target).total_seconds()
-        execution_key = target.strftime("%Y-%m-%d-%H:%M")
+    for hour, minute in NY_RUN_TIMES:
+        target_market = current_market.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        target_local = target_market.astimezone(local_tz)
+        delta = (current_local - target_local).total_seconds()
+        execution_key = target_market.strftime("%Y-%m-%d-%H:%M")
 
         if execution_key in executed_today:
             continue

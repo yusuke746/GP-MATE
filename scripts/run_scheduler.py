@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import logging
 import sys
 import time
@@ -9,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from config import JUDGMENT_TIMES, STAGE
+from config import JST_TZ, MARKET_TIMEZONE_NAME, MARKET_TZ, NY_RUN_TIMES, STAGE
 from data.mt5_client import get_account_info
 from main import run_once
 
@@ -25,16 +26,22 @@ def _trade_mode_name(trade_mode: int) -> str:
     return f"OTHER({trade_mode})"
 
 
-def _parse_judgment_time(value: str) -> tuple[int, int] | None:
-    try:
-        hh_str, mm_str = value.split(":", 1)
-        hh = int(hh_str)
-        mm = int(mm_str)
-        if not (0 <= hh <= 23 and 0 <= mm <= 59):
-            return None
-        return hh, mm
-    except Exception:
-        return None
+def _format_schedule_log(hour: int, minute: int, reference: datetime | None = None) -> str:
+    current_ny = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    scheduled_ny = datetime(
+        current_ny.year,
+        current_ny.month,
+        current_ny.day,
+        hour,
+        minute,
+        tzinfo=MARKET_TZ,
+    )
+    scheduled_jst = scheduled_ny.astimezone(JST_TZ)
+    return (
+        "Scheduled run_once at "
+        f"{hour:02d}:{minute:02d} {MARKET_TIMEZONE_NAME} "
+        f"(={scheduled_jst:%H:%M} JST current conversion)"
+    )
 
 
 def _job_wrapper() -> None:
@@ -99,20 +106,16 @@ def main() -> int:
         return 1
 
     scheduler = BlockingScheduler()
-    for time_str in JUDGMENT_TIMES:
-        parsed = _parse_judgment_time(time_str)
-        if parsed is None:
-            LOGGER.warning("Invalid JUDGMENT_TIMES value skipped: %s", time_str)
-            continue
-        hour, minute = parsed
+    for hour, minute in NY_RUN_TIMES:
         scheduler.add_job(
             _job_wrapper,
             "cron",
             hour=hour,
             minute=minute,
+            timezone=MARKET_TIMEZONE_NAME,
             misfire_grace_time=SCHEDULER_MISFIRE_GRACE_SECONDS,
         )
-        LOGGER.info("Scheduled run_once at %02d:%02d", hour, minute)
+        LOGGER.info(_format_schedule_log(hour, minute))
 
     LOGGER.info("Scheduler started misfire_grace_time=%ss", SCHEDULER_MISFIRE_GRACE_SECONDS)
     try:

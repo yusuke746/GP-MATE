@@ -131,7 +131,7 @@ RISK_REWARD_RATIO = 2.0      # TP = SL × 2.0
 
 # 実行制御
 NEWS_FILTER_MINUTES = 15     # 重要指標±15分は新規禁止
-JUDGMENT_TIMES = ["09:00", "16:00", "21:00", "23:30"]  # 1日4回
+NY_RUN_TIMES = [(3, 0), (8, 0), (9, 30), (10, 30)]  # America/New_York 基準の1日4回
 
 # LLMモデル（単価確定後に設定）
 MODEL_ANALYSIS = "gpt-5.4-mini"   # 分析・議論用

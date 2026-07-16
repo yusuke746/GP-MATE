@@ -33,6 +33,7 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 4. Fill required values in `.env`:
    - MT5 credentials (`MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_PATH`)
    - API keys (`OPENAI_API_KEY`, optional `NEWS_API_KEY`, `FRED_API_KEY`)
+   - Judgment schedule is fixed in code as `America/New_York` 03:00 / 08:00 / 09:30 / 10:30 and follows DST automatically.
 
 ## Run Flow (Safe 3-Step)
 
