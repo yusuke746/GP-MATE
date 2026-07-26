@@ -137,3 +137,109 @@ def test_build_risk_plan_uses_default_2r_take_profit() -> None:
     tp_distance = float(plan["tp"]) - 2300.0
     assert sl_distance == 15.0
     assert tp_distance == 30.0
+
+
+def test_build_risk_plan_suggested_tp_none_falls_back_to_2r() -> None:
+    plan = build_risk_plan(
+        action="BUY",
+        entry_price=2300.0,
+        atr=10.0,
+        balance_jpy=500_000,
+        suggested_tp=None,
+    )
+    assert plan["ok"]
+    assert float(plan["tp"]) == float(plan["tp_2r"])
+    assert plan["tp_source"] == "fallback_2r"
+
+
+def test_build_risk_plan_buy_uses_suggested_when_inside_2r() -> None:
+    plan = build_risk_plan(
+        action="BUY",
+        entry_price=2300.0,
+        atr=10.0,
+        balance_jpy=500_000,
+        suggested_tp=2320.0,
+    )
+    assert plan["ok"]
+    assert float(plan["tp"]) == 2320.0
+    assert plan["tp_source"] == "suggested"
+
+
+def test_build_risk_plan_buy_caps_suggested_when_beyond_2r() -> None:
+    plan = build_risk_plan(
+        action="BUY",
+        entry_price=2300.0,
+        atr=10.0,
+        balance_jpy=500_000,
+        suggested_tp=2350.0,
+    )
+    assert plan["ok"]
+    assert float(plan["tp"]) == float(plan["tp_2r"])
+    assert float(plan["tp"]) == 2330.0
+    assert plan["tp_source"] == "suggested_capped_2r"
+
+
+def test_build_risk_plan_sell_uses_suggested_when_inside_2r() -> None:
+    plan = build_risk_plan(
+        action="SELL",
+        entry_price=2300.0,
+        atr=10.0,
+        balance_jpy=500_000,
+        suggested_tp=2280.0,
+    )
+    assert plan["ok"]
+    assert float(plan["tp"]) == 2280.0
+    assert plan["tp_source"] == "suggested"
+
+
+def test_build_risk_plan_sell_caps_suggested_when_beyond_2r() -> None:
+    plan = build_risk_plan(
+        action="SELL",
+        entry_price=2300.0,
+        atr=10.0,
+        balance_jpy=500_000,
+        suggested_tp=2240.0,
+    )
+    assert plan["ok"]
+    assert float(plan["tp"]) == float(plan["tp_2r"])
+    assert float(plan["tp"]) == 2270.0
+    assert plan["tp_source"] == "suggested_capped_2r"
+
+
+def test_build_risk_plan_buy_rejects_wrong_direction_suggested_tp() -> None:
+    plan = build_risk_plan(
+        action="BUY",
+        entry_price=2300.0,
+        atr=10.0,
+        balance_jpy=500_000,
+        suggested_tp=2299.0,
+    )
+    assert plan["ok"]
+    assert float(plan["tp"]) == float(plan["tp_2r"])
+    assert plan["tp_source"] == "fallback_2r"
+
+
+def test_build_risk_plan_sell_rejects_wrong_direction_suggested_tp() -> None:
+    plan = build_risk_plan(
+        action="SELL",
+        entry_price=2300.0,
+        atr=10.0,
+        balance_jpy=500_000,
+        suggested_tp=2301.0,
+    )
+    assert plan["ok"]
+    assert float(plan["tp"]) == float(plan["tp_2r"])
+    assert plan["tp_source"] == "fallback_2r"
+
+
+def test_build_risk_plan_sl_is_unchanged_with_suggested_tp() -> None:
+    baseline = build_risk_plan(action="BUY", entry_price=2300.0, atr=10.0, balance_jpy=500_000)
+    adjusted = build_risk_plan(
+        action="BUY",
+        entry_price=2300.0,
+        atr=10.0,
+        balance_jpy=500_000,
+        suggested_tp=2320.0,
+    )
+    assert baseline["ok"] and adjusted["ok"]
+    assert float(baseline["sl"]) == float(adjusted["sl"])

@@ -43,6 +43,7 @@ def test_add_indicators_adds_all_expected_columns() -> None:
         "bb_mid",
         "bb_lower",
         "atr_14",
+        "adx_14",
         "recent_high_20",
         "recent_low_20",
     }
@@ -86,3 +87,13 @@ def test_macd_hist_equals_macd_minus_signal() -> None:
 
     diff = (out["macd"] - out["macd_signal"] - out["macd_hist"]).abs().dropna()
     assert (diff < 1e-9).all()
+
+
+def test_adx_is_within_range() -> None:
+    df = _sample_ohlc(120)
+    out = add_indicators(df)
+
+    adx = out["adx_14"].dropna()
+    assert not adx.empty
+    assert (adx >= 0).all()
+    assert (adx <= 100).all()

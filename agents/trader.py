@@ -15,6 +15,16 @@ SYSTEM_PROMPT = (
     "(key_levelsに基づく発動価格条件)を必ず設定すること。"
     "特にmacroのmacro_biasとconfidenceは、テクニカルがレンジでも"
     "directional_biasに反映すること。"
+    "action(BUY/SELL/HOLD)の方向判断はtechnical/macro/sentiment/debateに基づき、"
+    "technical_report内のtp_reference_onlyを方向判断に使ってはならない。"
+    "tp_reference_onlyはsuggested_tpの算出にのみ使用する。"
+    "actionがBUY/SELLの場合、tp_reference_onlyのlevels/round_numbers/prev_day/moving_averagesを参照し、"
+    "反発が予想される強レベルの手前にsuggested_tpを数値で設定すること。"
+    "複数根拠が重なるほど強いのでconfluence_noteを重視すること。"
+    "direction_context.technical.adxが強いトレンドを示す場合は、"
+    "手前のサポレジで反発しにくいためsuggested_tpを伸ばしてよい。"
+    "HOLDの場合や算出根拠が不十分な場合、suggested_tpはnullにすること。"
+    "suggested_tp_basisには、その価格にした根拠を簡潔な日本語で記すこと。"
 )
 
 PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
@@ -30,6 +40,14 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
             "directional_bias": {"type": "string", "enum": ["BULLISH", "BEARISH", "NEUTRAL"]},
             "bias_strength": {"type": "number", "description": "方向性バイアスの強さ0-1"},
             "trigger_conditions": {"type": "array", "items": {"type": "string"}, "description": "バイアス発動の価格条件"},
+            "suggested_tp": {
+                "type": ["number", "null"],
+                "description": "利確目標価格。反発が予想される強レベルの手前に置く。算出できなければnull",
+            },
+            "suggested_tp_basis": {
+                "type": "string",
+                "description": "suggested_tpの根拠(例: キリ番4000と前日安値が重なる4023の手前)",
+            },
         },
         "required": ["action", "symbol", "confidence", "reasoning"],
     },
@@ -42,6 +60,37 @@ FALLBACK_RESPONSE: dict[str, Any] = {
     "reasoning": "最終判断に失敗したためHOLD。",
     "risk_level": "HIGH",
 }
+
+
+def _safe_float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_current_price_for_tp_sanity(technical_report: dict[str, Any]) -> float | None:
+    try:
+        direction_context = technical_report.get("direction_context", {})
+        if isinstance(direction_context, dict):
+            h1 = direction_context.get("h1", {})
+            if isinstance(h1, dict):
+                close_1 = _safe_float_or_none(h1.get("close"))
+                if close_1 is not None:
+                    return close_1
+
+        key_levels = technical_report.get("key_levels", {})
+        if isinstance(key_levels, dict):
+            frames = key_levels.get("frames", {})
+            if isinstance(frames, dict):
+                h1_frame = frames.get("h1", {})
+                if isinstance(h1_frame, dict):
+                    close_2 = _safe_float_or_none(h1_frame.get("close"))
+                    if close_2 is not None:
+                        return close_2
+    except Exception:
+        return None
+    return None
 
 
 def decide_trade(
@@ -119,6 +168,20 @@ def decide_trade(
     payload["symbol"] = str(payload.get("symbol") or SYMBOL)
     payload["confidence"] = confidence
     payload["risk_level"] = risk_level
+
+    current_price = _extract_current_price_for_tp_sanity(technical_report)
+    suggested_tp = _safe_float_or_none(payload.get("suggested_tp"))
+    if action == "HOLD":
+        suggested_tp = None
+    elif suggested_tp is not None and current_price is not None:
+        if action == "BUY" and suggested_tp <= current_price:
+            suggested_tp = None
+        elif action == "SELL" and suggested_tp >= current_price:
+            suggested_tp = None
+
+    suggested_tp_basis = str(payload.get("suggested_tp_basis", "") or "")
+    payload["suggested_tp"] = suggested_tp
+    payload["suggested_tp_basis"] = suggested_tp_basis
 
     payload["_meta"] = {
         "ok": result.ok,

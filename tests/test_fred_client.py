@@ -25,6 +25,8 @@ def _fred_series_payload(values: list[tuple[str, str]]) -> dict[str, object]:
 def test_get_macro_data_returns_safe_failure_without_api_key(monkeypatch) -> None:
     monkeypatch.delenv("FRED_API_KEY", raising=False)
     fred_client._DAILY_CACHE.clear()
+    fred_client._LAST_GOOD_CACHE["data"] = None
+    fred_client._LAST_GOOD_CACHE["fetched_date"] = None
 
     with patch("agents.data.fred_client.requests.get") as mock_get:
         result = get_macro_data(force_refresh=True)

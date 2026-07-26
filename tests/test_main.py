@@ -86,7 +86,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None: {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -108,7 +108,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None: {
             "ok": True,
             "action": "BUY",
             "lot": 0.01,
@@ -222,6 +222,7 @@ def test_run_once_logs_skip_reason_when_debate_skipped(tmp_path: Path, monkeypat
     assert row["stronger_side"] == "neutral"
     assert json.loads(row["conflicts"]) == ["議論スキップ（明確なトレンドのため）"]
     assert row["debate_tokens"] == "0"
+
     assert row["judge_parse_ok"] == ""
 
 
@@ -347,7 +348,7 @@ def test_run_once_uses_evaluate_position_when_position_exists(tmp_path: Path, mo
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report: called.__setitem__("decide", called["decide"] + 1) or {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None: called.__setitem__("decide", called["decide"] + 1) or {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -555,7 +556,7 @@ def test_run_once_without_position_keeps_decide_trade_flow(tmp_path: Path, monke
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report: called.__setitem__("decide", called["decide"] + 1) or {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None: called.__setitem__("decide", called["decide"] + 1) or {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -571,3 +572,155 @@ def test_run_once_without_position_keeps_decide_trade_flow(tmp_path: Path, monke
     assert called["decide"] == 1
     row = _read_single_row(log_path)
     assert row["action"] == "BUY"
+
+
+def test_build_market_reports_generates_tp_reference_only_and_adx(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    d1 = pd.DataFrame(
+        [
+            {
+                "open": 3992.0,
+                "high": 4010.0,
+                "low": 3988.0,
+                "close": 4000.0,
+                "rsi_14": 50.0,
+                "macd": 0.0,
+                "macd_signal": 0.0,
+                "macd_hist": 0.0,
+                "bb_upper": 0.0,
+                "bb_mid": 0.0,
+                "bb_lower": 0.0,
+                "atr_14": 20.0,
+                "adx_14": 22.0,
+                "recent_high_20": 4020.0,
+                "recent_low_20": 3980.0,
+            },
+            {
+                "open": 4010.0,
+                "high": 4055.0,
+                "low": 4002.0,
+                "close": 4045.0,
+                "rsi_14": 56.0,
+                "macd": 0.2,
+                "macd_signal": 0.1,
+                "macd_hist": 0.1,
+                "bb_upper": 0.0,
+                "bb_mid": 0.0,
+                "bb_lower": 0.0,
+                "atr_14": 22.0,
+                "adx_14": 24.0,
+                "recent_high_20": 4060.0,
+                "recent_low_20": 3985.0,
+            },
+        ]
+    )
+    h4 = pd.DataFrame(
+        [
+            {
+                "open": 4040.0,
+                "high": 4050.0,
+                "low": 4030.0,
+                "close": 4048.0,
+                "rsi_14": 59.0,
+                "macd": 0.3,
+                "macd_signal": 0.2,
+                "macd_hist": 0.1,
+                "bb_upper": 0.0,
+                "bb_mid": 0.0,
+                "bb_lower": 0.0,
+                "atr_14": 19.0,
+                "adx_14": 31.0,
+                "recent_high_20": 4065.0,
+                "recent_low_20": 4010.0,
+            }
+        ]
+    )
+    h1 = pd.DataFrame(
+        [
+            {
+                "open": 4050.0,
+                "high": 4060.0,
+                "low": 4040.0,
+                "close": 4052.0,
+                "rsi_14": 60.0,
+                "macd": 0.4,
+                "macd_signal": 0.3,
+                "macd_hist": 0.1,
+                "bb_upper": 0.0,
+                "bb_mid": 0.0,
+                "bb_lower": 0.0,
+                "atr_14": 18.0,
+                "adx_14": 29.0,
+                "recent_high_20": 4068.0,
+                "recent_low_20": 4035.0,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        main,
+        "get_rates",
+        lambda symbol, tf, bars: d1 if tf == "D1" else (h4 if tf == "H4" else h1),
+    )
+    monkeypatch.setattr(main, "add_indicators", lambda df: df)
+    monkeypatch.setattr(
+        main,
+        "build_horizontal_levels",
+        lambda **kwargs: {
+            "supports": [{"price": 4000.0, "score": 5.0, "source": "cluster", "timeframe": "H4", "touch_count": 11}],
+            "resistances": [{"price": 4100.0, "score": 4.0, "source": "cluster", "timeframe": "H4", "touch_count": 6}],
+        },
+    )
+    monkeypatch.setattr(main, "fetch_news", lambda hours=24: [])
+    monkeypatch.setattr(main, "get_macro_data", lambda force_refresh=False: {})
+    monkeypatch.setattr(main, "analyze_macro_environment", lambda macro_data: {"macro_bias": "NEUTRAL", "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}})
+    monkeypatch.setattr(main, "analyze_sentiment", lambda news: {"sentiment": "NEUTRAL", "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}})
+
+    def _capture(payload: dict[str, Any]) -> dict[str, Any]:
+        captured["payload"] = payload
+        return {
+            "trend": "UP",
+            "signal": "BUY",
+            "alignment": "ALIGNED",
+            "rsi_14": 60.0,
+            "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
+        }
+
+    monkeypatch.setattr(main, "analyze_technical", _capture)
+
+    _ = main._build_market_reports()
+    payload = captured["payload"]
+
+    assert "direction_context" in payload
+    assert "tp_reference_only" in payload
+
+    direction_context = payload["direction_context"]
+    tp_reference_only = payload["tp_reference_only"]
+
+    assert direction_context["technical"]["adx"]["value"] == 31.0
+    assert "強" in direction_context["technical"]["adx"]["note"]
+    assert "adx" not in tp_reference_only
+    assert tp_reference_only["_note"] == "利確ターゲット選定専用。方向判断には使用しないこと"
+    assert isinstance(tp_reference_only["levels"]["supports"][0]["confluence"], list)
+    assert isinstance(tp_reference_only["levels"]["supports"][0]["confluence_note"], str)
+
+
+def test_tp_reference_only_safe_on_missing_data() -> None:
+    empty = pd.DataFrame()
+    output = main._build_tp_reference_only(
+        horizontal_levels={},
+        d1_frame=empty,
+        h4_frame=empty,
+        current_price=0.0,
+    )
+
+    assert output["_note"] == "利確ターゲット選定専用。方向判断には使用しないこと"
+    assert output["round_numbers"] == []
+    assert output["prev_day"] == {"high": None, "low": None}
+    assert output["moving_averages"] == {
+        "h4_ma20": None,
+        "h4_ma50": None,
+        "d1_ma50": None,
+        "d1_ma200": None,
+    }

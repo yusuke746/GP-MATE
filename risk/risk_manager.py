@@ -132,6 +132,7 @@ def build_risk_plan(
     entry_price: float,
     atr: float,
     balance_jpy: float,
+    suggested_tp: float | None = None,
     risk_pct: float = RISK_PERCENT,
     atr_mult: float = ATR_MULTIPLIER_SL,
     rr: float = RISK_REWARD_RATIO,
@@ -152,13 +153,39 @@ def build_risk_plan(
         }
 
     try:
-        sl, tp = calc_sl_tp(
+        sl, tp_2r = calc_sl_tp(
             entry_price=entry_price,
             atr=atr,
             action=normalized_action,
             atr_mult=atr_mult,
             rr=rr,
         )
+
+        # Default to legacy 2R TP when AI suggestion is unavailable/invalid.
+        final_tp = tp_2r
+        tp_source = "fallback_2r"
+
+        suggested_tp_value: float | None
+        try:
+            suggested_tp_value = float(suggested_tp) if suggested_tp is not None else None
+        except Exception:
+            suggested_tp_value = None
+
+        if suggested_tp_value is not None:
+            is_direction_valid = True
+            if normalized_action == "BUY" and suggested_tp_value <= entry_price:
+                is_direction_valid = False
+            elif normalized_action == "SELL" and suggested_tp_value >= entry_price:
+                is_direction_valid = False
+
+            if is_direction_valid:
+                if normalized_action == "BUY":
+                    capped_tp = min(suggested_tp_value, tp_2r)
+                else:
+                    capped_tp = max(suggested_tp_value, tp_2r)
+
+                final_tp = round(capped_tp, 5)
+                tp_source = "suggested" if final_tp == round(suggested_tp_value, 5) else "suggested_capped_2r"
 
         sl_distance = abs(entry_price - sl)
         lot = calc_lot(
@@ -174,6 +201,8 @@ def build_risk_plan(
                 "lot": 0.0,
                 "sl": 0.0,
                 "tp": 0.0,
+                "tp_2r": 0.0,
+                "tp_source": "fallback_2r",
                 "reason": "Lot calculation failed",
             }
 
@@ -182,7 +211,9 @@ def build_risk_plan(
             "action": normalized_action,
             "lot": lot,
             "sl": sl,
-            "tp": tp,
+            "tp": final_tp,
+            "tp_2r": tp_2r,
+            "tp_source": tp_source,
             "reason": "OK",
         }
     except Exception as exc:
@@ -192,5 +223,7 @@ def build_risk_plan(
             "lot": 0.0,
             "sl": 0.0,
             "tp": 0.0,
+            "tp_2r": 0.0,
+            "tp_source": "fallback_2r",
             "reason": str(exc),
         }

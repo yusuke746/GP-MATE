@@ -203,7 +203,38 @@ def _alignment_from_trends(
     return "DIVERGENT"
 
 
-def _build_multitimeframe_baseline(indicator_payload: dict[str, Any]) -> TechnicalAnalysisResult:
+def _extract_direction_context(indicator_payload: dict[str, Any]) -> dict[str, Any]:
+    direction_context = indicator_payload.get("direction_context")
+    if isinstance(direction_context, dict):
+        return direction_context
+    return indicator_payload
+
+
+def _extract_tp_reference_only(indicator_payload: dict[str, Any]) -> dict[str, Any]:
+    tp_reference_only = indicator_payload.get("tp_reference_only")
+    if isinstance(tp_reference_only, dict):
+        return tp_reference_only
+    return {}
+
+
+def _extract_horizontal_levels(
+    direction_payload: dict[str, Any],
+    tp_reference_only: dict[str, Any],
+) -> dict[str, Any]:
+    levels = tp_reference_only.get("levels") if isinstance(tp_reference_only, dict) else None
+    if isinstance(levels, dict):
+        return levels
+
+    raw_horizontal_levels = direction_payload.get("horizontal_levels", {})
+    if isinstance(raw_horizontal_levels, dict):
+        return raw_horizontal_levels
+    return {}
+
+
+def _build_multitimeframe_baseline(
+    indicator_payload: dict[str, Any],
+    horizontal_levels: dict[str, Any],
+) -> TechnicalAnalysisResult:
     h4_raw = indicator_payload.get("h4", indicator_payload.get("execution", {}))
     h1_raw = indicator_payload.get("h1", indicator_payload.get("execution", {}))
     d1_raw = indicator_payload.get("d1", {})
@@ -229,8 +260,6 @@ def _build_multitimeframe_baseline(indicator_payload: dict[str, Any]) -> Technic
         f"H4の根拠: {h4['reason']}。H1の根拠: {h1['reason']}。D1の根拠: {d1['reason']}。"
     )
 
-    raw_horizontal_levels = indicator_payload.get("horizontal_levels", {})
-    horizontal_levels = raw_horizontal_levels if isinstance(raw_horizontal_levels, dict) else {}
     resistances_raw = horizontal_levels.get("resistances", []) if isinstance(horizontal_levels, dict) else []
     supports_raw = horizontal_levels.get("supports", []) if isinstance(horizontal_levels, dict) else []
 
@@ -266,7 +295,7 @@ def _build_multitimeframe_baseline(indicator_payload: dict[str, Any]) -> Technic
     return result
 
 
-def _build_legacy_baseline(indicator_payload: dict[str, Any]) -> TechnicalAnalysisResult:
+def _build_legacy_baseline(indicator_payload: dict[str, Any], horizontal_levels: dict[str, Any]) -> TechnicalAnalysisResult:
     signal = str(indicator_payload.get("signal", "NEUTRAL") or "NEUTRAL").upper()
     if signal not in {"BUY", "SELL", "NEUTRAL"}:
         signal = "NEUTRAL"
@@ -275,8 +304,6 @@ def _build_legacy_baseline(indicator_payload: dict[str, Any]) -> TechnicalAnalys
     if trend not in {"UP", "DOWN", "RANGE"}:
         trend = "RANGE"
 
-    raw_horizontal_levels = indicator_payload.get("horizontal_levels", {})
-    horizontal_levels = raw_horizontal_levels if isinstance(raw_horizontal_levels, dict) else {}
     resistances_raw = horizontal_levels.get("resistances", []) if isinstance(horizontal_levels, dict) else []
     supports_raw = horizontal_levels.get("supports", []) if isinstance(horizontal_levels, dict) else []
 
@@ -304,20 +331,30 @@ def _build_legacy_baseline(indicator_payload: dict[str, Any]) -> TechnicalAnalys
 
 
 def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
-    has_multi_timeframe = any(key in indicator_payload for key in ("h4", "h1", "d1", "execution"))
-    baseline = _build_multitimeframe_baseline(indicator_payload) if has_multi_timeframe else _build_legacy_baseline(indicator_payload)
+    direction_payload = _extract_direction_context(indicator_payload)
+    tp_reference_only = _extract_tp_reference_only(indicator_payload)
+    horizontal_levels = _extract_horizontal_levels(direction_payload, tp_reference_only)
+
+    has_multi_timeframe = any(key in direction_payload for key in ("h4", "h1", "d1", "execution"))
+    baseline = (
+        _build_multitimeframe_baseline(direction_payload, horizontal_levels)
+        if has_multi_timeframe
+        else _build_legacy_baseline(direction_payload, horizontal_levels)
+    )
 
     if has_multi_timeframe:
         user_prompt = (
             "以下の多時間軸インジケータ情報から、D1と執行足(H4/H1)の整合性を説明してください。\n"
             "重要: D1は大局、H4/H1は執行足として扱い、alignmentをALIGNED/DIVERGENT/MIXEDで要約してください。\n"
             "D1が無い/壊れている場合は、執行足のみで安全側に判断してください。\n"
-            f"{json.dumps(indicator_payload, ensure_ascii=False)}"
+            "注意: tp_reference_only は利確ターゲット専用であり、方向判断には使わないでください。\n"
+            f"{json.dumps(direction_payload, ensure_ascii=False)}"
         )
     else:
         user_prompt = (
             "以下のインジケータ情報から、trend/signal/key_levels/reasoningをJSONで返してください。\n"
-            f"{json.dumps(indicator_payload, ensure_ascii=False)}"
+            "注意: tp_reference_only は利確ターゲット専用であり、方向判断には使わないでください。\n"
+            f"{json.dumps(direction_payload, ensure_ascii=False)}"
         )
 
     result = get_default_client().call_json(
@@ -341,6 +378,10 @@ def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
     merged["d1_trend"] = baseline["d1_trend"]
     merged["execution_trend"] = baseline["execution_trend"]
     merged["alignment"] = baseline["alignment"]
+    if isinstance(indicator_payload.get("direction_context"), dict):
+        merged["direction_context"] = dict(direction_payload)
+    if isinstance(indicator_payload.get("tp_reference_only"), dict):
+        merged["tp_reference_only"] = dict(tp_reference_only)
     merged["_meta"] = {
         "ok": result.ok,
         "model": result.model,

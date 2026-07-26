@@ -83,7 +83,7 @@ def test_run_once_holds_when_spread_exceeds_multiplier(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda t, s, d: {
+        lambda t, s, d, macro_report=None: {
             "action": "BUY",
             "confidence": 0.9,
             "reasoning": "test",
@@ -99,7 +99,7 @@ def test_run_once_holds_when_spread_exceeds_multiplier(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None: {
             "ok": True,
             "action": "BUY",
             "lot": 0.1,

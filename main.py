@@ -65,6 +65,19 @@ CLOSED_DEAL_STATE_PATH = LOG_DIR / "closed_deal_state.json"
 SCHEDULER_CATCHUP_WINDOW_SECONDS = 5 * 60
 SCHEDULER_REFERENCE_BALANCE_JPY = 500000.0
 
+# TP reference proximity in USD. Used only for TP-target confluence labels.
+TP_PROXIMITY_ROUND_NUMBER = 5.0
+TP_PROXIMITY_PREV_DAY = 8.0
+TP_PROXIMITY_MOVING_AVERAGE = 8.0
+TP_ROUND_SCAN_RANGE = 300.0
+TP_ROUND_STEP_MINOR = 50.0
+TP_ROUND_STEP_MAJOR = 100.0
+TP_CONFLUENCE_TOUCH_COUNT_MIN = 1
+
+# ADX strength thresholds for direction-context note.
+ADX_STRONG_THRESHOLD = 25.0
+ADX_MEDIUM_THRESHOLD = 18.0
+
 
 def python_runtime_notice() -> str:
     version = sys.version_info
@@ -340,8 +353,152 @@ def _extract_latest_features(tf_df: Any) -> dict[str, Any]:
         "bb_mid": float(latest.get("bb_mid", 0.0)),
         "bb_lower": float(latest.get("bb_lower", 0.0)),
         "atr_14": float(latest.get("atr_14", 0.0)),
+        "adx_14": float(latest.get("adx_14", 0.0)),
         "recent_high_20": float(latest.get("recent_high_20", 0.0)),
         "recent_low_20": float(latest.get("recent_low_20", 0.0)),
+    }
+
+
+def _safe_float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _adx_strength_note(adx_value: float | None) -> str:
+    if adx_value is None:
+        return "トレンド強度: 不明"
+    if adx_value >= ADX_STRONG_THRESHOLD:
+        return "トレンド強度: 強"
+    if adx_value >= ADX_MEDIUM_THRESHOLD:
+        return "トレンド強度: 中"
+    return "トレンド強度: 弱"
+
+
+def _calc_latest_ma(frame: Any, period: int) -> float | None:
+    try:
+        if frame is None or frame.empty or "close" not in frame.columns:
+            return None
+        series = frame["close"].rolling(window=period, min_periods=period).mean()
+        if series.empty:
+            return None
+        value = series.iloc[-1]
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _build_round_numbers(current_price: float, scan_range: float = TP_ROUND_SCAN_RANGE) -> list[float]:
+    if current_price <= 0 or scan_range <= 0:
+        return []
+
+    lower = max(current_price - scan_range, 0.0)
+    upper = current_price + scan_range
+    levels: set[float] = set()
+
+    for step in (TP_ROUND_STEP_MINOR, TP_ROUND_STEP_MAJOR):
+        if step <= 0:
+            continue
+        start = int(lower // step)
+        end = int(upper // step)
+        for idx in range(start, end + 1):
+            level = round(idx * step, 5)
+            if lower <= level <= upper:
+                levels.add(level)
+
+    return sorted(levels)
+
+
+def _is_near(value: float, reference: float | None, threshold: float) -> bool:
+    if reference is None or threshold <= 0:
+        return False
+    return abs(value - reference) <= threshold
+
+
+def _build_tp_reference_only(
+    horizontal_levels: dict[str, Any],
+    d1_frame: Any,
+    h4_frame: Any,
+    current_price: float,
+) -> dict[str, Any]:
+    prev_day = {"high": None, "low": None}
+    try:
+        if d1_frame is not None and not d1_frame.empty and len(d1_frame.index) >= 2:
+            prev_bar = d1_frame.iloc[-2]
+            prev_day = {
+                "high": _safe_float_or_none(prev_bar.get("high")),
+                "low": _safe_float_or_none(prev_bar.get("low")),
+            }
+    except Exception:
+        prev_day = {"high": None, "low": None}
+
+    moving_averages: dict[str, float | None] = {
+        "h4_ma20": _calc_latest_ma(h4_frame, 20),
+        "h4_ma50": _calc_latest_ma(h4_frame, 50),
+        "d1_ma50": _calc_latest_ma(d1_frame, 50),
+        "d1_ma200": _calc_latest_ma(d1_frame, 200),
+    }
+
+    round_numbers = _build_round_numbers(current_price)
+
+    safe_levels = horizontal_levels if isinstance(horizontal_levels, dict) else {}
+    supports_raw = safe_levels.get("supports", []) if isinstance(safe_levels.get("supports", []), list) else []
+    resistances_raw = safe_levels.get("resistances", []) if isinstance(safe_levels.get("resistances", []), list) else []
+
+    def _annotate_level(level: dict[str, Any]) -> dict[str, Any]:
+        price = _safe_float_or_none(level.get("price"))
+        if price is None:
+            return {**level, "confluence": [], "confluence_note": "根拠重なりなし"}
+
+        confluence: list[str] = []
+        touch_count = int(level.get("touch_count", 0) or 0)
+        if touch_count >= TP_CONFLUENCE_TOUCH_COUNT_MIN:
+            confluence.append(f"タッチ{touch_count}回")
+
+        near_rounds = [lv for lv in round_numbers if _is_near(price, lv, TP_PROXIMITY_ROUND_NUMBER)]
+        if near_rounds:
+            nearest_round = min(near_rounds, key=lambda lv: abs(lv - price))
+            label = int(nearest_round) if float(nearest_round).is_integer() else nearest_round
+            confluence.append(f"キリ番{label}近接")
+
+        prev_high = _safe_float_or_none(prev_day.get("high"))
+        prev_low = _safe_float_or_none(prev_day.get("low"))
+        if _is_near(price, prev_high, TP_PROXIMITY_PREV_DAY):
+            confluence.append("前日高値付近")
+        if _is_near(price, prev_low, TP_PROXIMITY_PREV_DAY):
+            confluence.append("前日安値付近")
+
+        ma_labels = {
+            "h4_ma20": "H4 MA20",
+            "h4_ma50": "H4 MA50",
+            "d1_ma50": "D1 MA50",
+            "d1_ma200": "D1 MA200",
+        }
+        for key, label in ma_labels.items():
+            if _is_near(price, _safe_float_or_none(moving_averages.get(key)), TP_PROXIMITY_MOVING_AVERAGE):
+                confluence.append(f"{label}近接")
+
+        note = "、".join(confluence) if confluence else "根拠重なりなし"
+        return {
+            **level,
+            "confluence": confluence,
+            "confluence_note": note,
+        }
+
+    levels = {
+        "supports": [_annotate_level(level) for level in supports_raw if isinstance(level, dict)],
+        "resistances": [_annotate_level(level) for level in resistances_raw if isinstance(level, dict)],
+    }
+
+    return {
+        "levels": levels,
+        "round_numbers": round_numbers,
+        "prev_day": prev_day,
+        "moving_averages": moving_averages,
+        "_note": "利確ターゲット選定専用。方向判断には使用しないこと",
     }
 
 
@@ -464,6 +621,8 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
     h1 = add_indicators(get_rates(SYMBOL, "H1", 300))
 
     h1_latest = _extract_latest_features(h1) if not h1.empty else {}
+    h4_latest = _extract_latest_features(h4) if not h4.empty else {}
+    d1_latest = _extract_latest_features(d1) if not d1.empty else {}
     horizontal_levels = build_horizontal_levels(
         d1_frame=d1,
         h4_frame=h4,
@@ -472,15 +631,32 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
         current_atr=float(h1_latest.get("atr_14", 0.0) or 0.0),
     )
 
+    adx_value = _safe_float_or_none(h4_latest.get("adx_14"))
+    direction_context = {
+        "d1": d1_latest,
+        "h4": h4_latest,
+        "h1": h1_latest,
+        "technical": {
+            "adx": {
+                "value": adx_value,
+                "note": _adx_strength_note(adx_value),
+            }
+        },
+    }
+    tp_reference_only = _build_tp_reference_only(
+        horizontal_levels=horizontal_levels,
+        d1_frame=d1,
+        h4_frame=h4,
+        current_price=float(h1_latest.get("close", 0.0) or 0.0),
+    )
+
     news_items = fetch_news(hours=24)
     macro_data = get_macro_data(force_refresh=False)
     macro_report = analyze_macro_environment(macro_data)
     technical_report = analyze_technical(
         {
-            "d1": _extract_latest_features(d1) if not d1.empty else {},
-            "h4": _extract_latest_features(h4),
-            "h1": _extract_latest_features(h1),
-            "horizontal_levels": horizontal_levels,
+            "direction_context": direction_context,
+            "tp_reference_only": tp_reference_only,
         }
     )
     sentiment_report = analyze_sentiment(news_items)
@@ -1004,6 +1180,7 @@ def run_once(
             entry_price=entry_price,
             atr=atr,
             balance_jpy=balance,
+            suggested_tp=trader_report.get("suggested_tp"),
         )
 
         order_result: dict[str, Any] = {
