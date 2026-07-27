@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,6 +10,34 @@ from typing import Any
 import main
 import pandas as pd
 import pytest
+
+
+def test_is_trading_session_allowed_blocks_monday() -> None:
+    allowed, reason = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 6, 12, 0, tzinfo=main.MARKET_TZ)
+    )
+    assert not allowed
+    assert reason == "Monday trading paused"
+
+
+def test_is_trading_session_allowed_blocks_weekend_close_window() -> None:
+    friday_close, _ = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 10, 17, 0, tzinfo=main.MARKET_TZ)
+    )
+    saturday, _ = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 11, 12, 0, tzinfo=main.MARKET_TZ)
+    )
+    sunday_pre_open, _ = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 12, 16, 59, tzinfo=main.MARKET_TZ)
+    )
+    sunday_open, _ = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 12, 17, 0, tzinfo=main.MARKET_TZ)
+    )
+
+    assert not friday_close
+    assert not saturday
+    assert not sunday_pre_open
+    assert sunday_open
 
 
 def test_run_once_with_missing_baseline_logs_hold(tmp_path: Path, monkeypatch) -> None:
@@ -27,11 +56,36 @@ def test_run_once_with_missing_baseline_logs_hold(tmp_path: Path, monkeypatch) -
     assert rows[0]["action"] == "HOLD"
 
 
+def test_run_once_stops_trading_when_session_blocked(tmp_path: Path, monkeypatch) -> None:
+    log_path = tmp_path / "trade_log.csv"
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+    monkeypatch.setattr(main, "sync_closed_trades", lambda: 0)
+    monkeypatch.setattr(
+        main,
+        "_is_trading_session_allowed",
+        lambda reference=None: (False, "Monday trading paused"),
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert result["allowed"] is False
+    assert result["filter_reason"] == "NY trading window blocked"
+    assert "Monday trading paused" in result["reasoning"]
+
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert len(rows) == 1
+    assert rows[0]["action"] == "HOLD"
+    assert rows[0]["filter_reason"] == "NY trading window blocked"
+
+
 def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     log_path = tmp_path / "trade_log.csv"
     monkeypatch.setattr(main, "LOG_DIR", tmp_path)
     monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
     monkeypatch.setattr(main, "sync_closed_trades", lambda: 0)
+    monkeypatch.setattr(main, "_is_trading_session_allowed", lambda reference=None: (True, ""))
     monkeypatch.setattr(main, "calc_today_risk_stats", lambda: (0, 0.0))
     monkeypatch.setattr(main, "is_high_impact_soon", lambda minutes: False)
     monkeypatch.setattr(main, "get_positions", lambda symbol: [])

@@ -77,6 +77,7 @@ TP_CONFLUENCE_TOUCH_COUNT_MIN = 1
 # ADX strength thresholds for direction-context note.
 ADX_STRONG_THRESHOLD = 25.0
 ADX_MEDIUM_THRESHOLD = 18.0
+NY_MARKET_CLOSE_HOUR = 17
 
 
 def python_runtime_notice() -> str:
@@ -389,6 +390,31 @@ def _calc_latest_ma(frame: Any, period: int) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _is_trading_session_allowed(reference: datetime | None = None) -> tuple[bool, str]:
+    """Return whether trading is allowed under NY-time session policy.
+
+    Policy:
+    - Block all Monday (weekday=0) trades.
+    - Block NY market close window: Fri 17:00 -> Sun 16:59 (America/New_York).
+    """
+    now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    weekday = now_market.weekday()
+
+    if weekday == 0:
+        return False, "Monday trading paused"
+
+    if weekday == 4 and now_market.hour >= NY_MARKET_CLOSE_HOUR:
+        return False, "NY market closed (Friday close)"
+
+    if weekday == 5:
+        return False, "NY market closed (Saturday)"
+
+    if weekday == 6 and now_market.hour < NY_MARKET_CLOSE_HOUR:
+        return False, "NY market closed (Sunday pre-open)"
+
+    return True, ""
 
 
 def _build_round_numbers(current_price: float, scan_range: float = TP_ROUND_SCAN_RANGE) -> list[float]:
@@ -873,6 +899,38 @@ def run_once(
             sync_closed_trades()
         except Exception as sync_exc:
             LOGGER.warning("sync_closed_trades failed and was skipped: %s", sync_exc)
+
+        trading_allowed, trading_block_reason = _is_trading_session_allowed()
+        if not trading_allowed:
+            result = {
+                "timestamp_utc": now_iso,
+                "deal_id": "",
+                "symbol": SYMBOL,
+                "action": "HOLD",
+                "entry_price": "",
+                "exit_price": "",
+                "holding_seconds": "",
+                "pnl": "",
+                "confidence": 0.0,
+                "reasoning": f"取引停止: {trading_block_reason}",
+                "risk_level": "HIGH",
+                "allowed": False,
+                "filter_reason": "NY trading window blocked",
+                "lot": 0.0,
+                "sl": 0.0,
+                "tp": 0.0,
+                "order_success": False,
+                "retcode": "",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "analysis_model": "",
+                "decision_model": "",
+                "news_count": 0,
+                "error": "",
+            }
+            _append_trade_log(result)
+            return result
 
         calibrated_baseline = baseline_spread
         if calibrated_baseline is None:
