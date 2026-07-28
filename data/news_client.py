@@ -1,18 +1,32 @@
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 import requests
 
-from config import FRED_API_KEY, MAX_NEWS_ITEMS, NEWS_FILTER_MINUTES, RSS_FEEDS
+from config import CALENDAR_TIMEZONE_NAME, MAX_NEWS_ITEMS, NEWS_FILTER_MINUTES, RSS_FEEDS
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _resolve_calendar_tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(CALENDAR_TIMEZONE_NAME)
+    except Exception:
+        LOGGER.warning(
+            "Invalid CALENDAR_TIMEZONE %r; falling back to UTC", CALENDAR_TIMEZONE_NAME
+        )
+        return ZoneInfo("UTC")
+
+
+# Timezone the economic-calendar feed timestamps are expressed in.
+# Configurable because feed providers differ; default UTC.
+CALENDAR_TZ = _resolve_calendar_tz()
 
 GOLD_KEYWORDS: tuple[str, ...] = (
     "gold",
@@ -32,7 +46,6 @@ GOLD_KEYWORDS: tuple[str, ...] = (
 )
 
 CALENDAR_XML_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-CACHE_PATH = Path(__file__).resolve().parent / "macro_cache.json"
 REQUEST_TIMEOUT = 10
 
 
@@ -211,12 +224,12 @@ def _parse_calendar_event_datetime(date_text: str, time_text: str) -> datetime |
         "%m-%d-%Y %I:%M%p",
         "%Y-%m-%d %H:%M",
     )
-    candidate = f"{date_text} {time_text}".replace(" ", "") if ":" in time_text and "-" in date_text else f"{date_text} {time_text}"
+    candidate = f"{date_text} {time_text}"
 
     for fmt in formats:
         try:
             dt = datetime.strptime(candidate, fmt)
-            return dt.replace(tzinfo=UTC)
+            return dt.replace(tzinfo=CALENDAR_TZ).astimezone(UTC)
         except Exception:
             continue
     return None
@@ -267,74 +280,3 @@ def is_high_impact_soon(minutes: int = NEWS_FILTER_MINUTES) -> bool:
         return True
 
 
-def _load_macro_cache() -> dict[str, Any]:
-    if not CACHE_PATH.exists():
-        return {}
-    try:
-        return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_macro_cache(payload: dict[str, Any]) -> None:
-    try:
-        CACHE_PATH.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
-    except Exception as exc:
-        LOGGER.warning("Failed to save macro cache: %s", exc)
-
-
-def _fred_latest_value(series_id: str) -> float | None:
-    if not FRED_API_KEY:
-        return None
-
-    params = {
-        "series_id": series_id,
-        "api_key": FRED_API_KEY,
-        "file_type": "json",
-        "sort_order": "desc",
-        "limit": 1,
-    }
-    response = _safe_get("https://api.stlouisfed.org/fred/series/observations", params=params)
-    if response is None:
-        return None
-
-    try:
-        body = response.json()
-        observations = body.get("observations", [])
-        if not observations:
-            return None
-        raw_value = observations[0].get("value")
-        return float(raw_value)
-    except Exception:
-        return None
-
-
-def get_macro_data() -> dict[str, Any]:
-    """Fetch key macro data from FRED with daily cache.
-
-    Returns cached data if fetched today. Returns success=False on hard failure.
-    """
-    today = datetime.now(UTC).date().isoformat()
-    cache = _load_macro_cache()
-
-    if cache.get("date") == today and isinstance(cache.get("data"), dict):
-        return {"success": True, "data": cache["data"], "source": "cache"}
-
-    fed_funds = _fred_latest_value("FEDFUNDS")
-    cpi = _fred_latest_value("CPIAUCSL")
-    us10y = _fred_latest_value("DGS10")
-
-    if fed_funds is None and cpi is None and us10y is None:
-        if isinstance(cache.get("data"), dict):
-            return {"success": True, "data": cache["data"], "source": "stale_cache"}
-        return {"success": False, "reason": "FRED fetch failed"}
-
-    data = {
-        "fed_funds": fed_funds,
-        "cpi": cpi,
-        "us10y": us10y,
-        "timestamp_utc": datetime.now(UTC).isoformat(),
-    }
-    _save_macro_cache({"date": today, "data": data})
-
-    return {"success": True, "data": data, "source": "fred"}

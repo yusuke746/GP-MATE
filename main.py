@@ -4,12 +4,10 @@ import csv
 import json
 import logging
 import sys
-import time
 import warnings
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 # Suppress known non-fatal warning from langchain_core on Python 3.14+.
 warnings.filterwarnings(
@@ -30,11 +28,11 @@ from config import (
     BREAKEVEN_BUFFER,
     CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
+    JPY_USD_RATE_FALLBACK,
     MARKET_TZ,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
     NEWS_FILTER_MINUTES,
-    NY_RUN_TIMES,
     SPREAD_SAMPLE_INTERVAL,
     SPREAD_SAMPLES,
     SYMBOL,
@@ -48,6 +46,7 @@ from data.mt5_client import (
     get_positions,
     get_rates,
     get_spread,
+    get_usd_jpy_rate,
     modify_sl,
     send_order,
 )
@@ -62,8 +61,6 @@ LOGGER = logging.getLogger(__name__)
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 TRADE_LOG_PATH = LOG_DIR / "trade_log.csv"
 CLOSED_DEAL_STATE_PATH = LOG_DIR / "closed_deal_state.json"
-SCHEDULER_CATCHUP_WINDOW_SECONDS = 5 * 60
-SCHEDULER_REFERENCE_BALANCE_JPY = 500000.0
 
 # TP reference proximity in USD. Used only for TP-target confluence labels.
 TP_PROXIMITY_ROUND_NUMBER = 5.0
@@ -165,10 +162,9 @@ def _ensure_trade_log_header() -> None:
     with TRADE_LOG_PATH.open("r", newline="", encoding="utf-8") as fp:
         reader = csv.DictReader(fp)
         existing_fields = list(reader.fieldnames or [])
+        if existing_fields == list(TRADE_LOG_COLUMNS):
+            return
         rows = list(reader)
-
-    if existing_fields == list(TRADE_LOG_COLUMNS):
-        return
 
     with TRADE_LOG_PATH.open("w", newline="", encoding="utf-8") as fp:
         writer = csv.DictWriter(fp, fieldnames=list(TRADE_LOG_COLUMNS))
@@ -727,6 +723,50 @@ def _build_debate_and_decision_reports(
     return gate, debate_report, None
 
 
+def _blocked_hold_result(
+    now_iso: str,
+    reasoning: str,
+    filter_reason: str,
+    *,
+    error: str = "",
+    news_count: int = 0,
+    analysis_model: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build, log, and return a fail-safe HOLD row for blocked/aborted cycles."""
+    result: dict[str, Any] = {
+        "timestamp_utc": now_iso,
+        "deal_id": "",
+        "symbol": SYMBOL,
+        "action": "HOLD",
+        "entry_price": "",
+        "exit_price": "",
+        "holding_seconds": "",
+        "pnl": "",
+        "confidence": 0.0,
+        "reasoning": reasoning,
+        "risk_level": "HIGH",
+        "allowed": False,
+        "filter_reason": filter_reason,
+        "lot": 0.0,
+        "sl": 0.0,
+        "tp": 0.0,
+        "order_success": False,
+        "retcode": "",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "analysis_model": analysis_model,
+        "decision_model": "",
+        "news_count": news_count,
+        "error": error,
+    }
+    if extra:
+        result.update(extra)
+    _append_trade_log(result)
+    return result
+
+
 def _position_context_from_details(details: dict[str, Any], position_count: int) -> dict[str, Any]:
     return {
         "ticket": int(details.get("ticket") or 0),
@@ -760,26 +800,32 @@ def calc_today_risk_stats() -> tuple[int, float]:
         with TRADE_LOG_PATH.open("r", newline="", encoding="utf-8") as fp:
             reader = csv.DictReader(fp)
             for row in reader:
-                ts_raw = str(row.get("timestamp_utc", "") or "").strip()
-                if not ts_raw:
+                # A single corrupt row (partial write etc.) must not disable
+                # trading for the whole day; skip it and keep aggregating.
+                try:
+                    ts_raw = str(row.get("timestamp_utc", "") or "").strip()
+                    if not ts_raw:
+                        continue
+
+                    ts = datetime.fromisoformat(ts_raw)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=UTC)
+                    else:
+                        ts = ts.astimezone(UTC)
+
+                    if ts.date() != today:
+                        continue
+
+                    action = str(row.get("action", "") or "").strip().upper()
+                    reasoning = str(row.get("reasoning", "") or "").strip()
+
+                    pnl_value: float | None = None
+                    pnl_raw = str(row.get("pnl", "") or "").strip()
+                    if pnl_raw:
+                        pnl_value = float(pnl_raw)
+                except Exception as row_exc:
+                    LOGGER.warning("calc_today_risk_stats: skipping malformed row: %s", row_exc)
                     continue
-
-                ts = datetime.fromisoformat(ts_raw)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=UTC)
-                else:
-                    ts = ts.astimezone(UTC)
-
-                if ts.date() != today:
-                    continue
-
-                action = str(row.get("action", "") or "").strip().upper()
-                reasoning = str(row.get("reasoning", "") or "").strip()
-
-                pnl_value: float | None = None
-                pnl_raw = str(row.get("pnl", "") or "").strip()
-                if pnl_raw:
-                    pnl_value = float(pnl_raw)
 
                 today_rows.append(
                     {
@@ -843,45 +889,6 @@ def calc_today_risk_stats() -> tuple[int, float]:
         return CONSECUTIVE_LOSS_LIMIT, MAX_DAILY_LOSS_PCT
 
 
-def _run_scheduler_due_jobs(
-    now_local: datetime,
-    executed_today: set[str],
-    baseline_spread: float | None,
-) -> None:
-    local_tz = now_local.tzinfo or datetime.now().astimezone().tzinfo or ZoneInfo("UTC")
-    current_local = now_local if now_local.tzinfo is not None else now_local.replace(tzinfo=local_tz)
-    current_market = current_local.astimezone(MARKET_TZ)
-
-    for hour, minute in NY_RUN_TIMES:
-        target_market = current_market.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        target_local = target_market.astimezone(local_tz)
-        delta = (current_local - target_local).total_seconds()
-        execution_key = target_market.strftime("%Y-%m-%d-%H:%M")
-
-        if execution_key in executed_today:
-            continue
-        if not (0 <= delta <= SCHEDULER_CATCHUP_WINDOW_SECONDS):
-            continue
-
-        try:
-            consecutive_losses, daily_loss_pct = calc_today_risk_stats()
-        except Exception as exc:
-            LOGGER.exception("Risk aggregation failed; using safe fallback: %s", exc)
-            consecutive_losses = CONSECUTIVE_LOSS_LIMIT
-            daily_loss_pct = MAX_DAILY_LOSS_PCT
-
-        try:
-            run_once(
-                baseline_spread=baseline_spread,
-                consecutive_losses=consecutive_losses,
-                daily_loss_pct=daily_loss_pct,
-            )
-        except Exception as exc:
-            LOGGER.exception("run_once failed in scheduler loop (continuing): %s", exc)
-        finally:
-            executed_today.add(execution_key)
-
-
 def run_once(
     baseline_spread: float | None = None,
     consecutive_losses: int | None = None,
@@ -902,35 +909,11 @@ def run_once(
 
         trading_allowed, trading_block_reason = _is_trading_session_allowed()
         if not trading_allowed:
-            result = {
-                "timestamp_utc": now_iso,
-                "deal_id": "",
-                "symbol": SYMBOL,
-                "action": "HOLD",
-                "entry_price": "",
-                "exit_price": "",
-                "holding_seconds": "",
-                "pnl": "",
-                "confidence": 0.0,
-                "reasoning": f"取引停止: {trading_block_reason}",
-                "risk_level": "HIGH",
-                "allowed": False,
-                "filter_reason": "NY trading window blocked",
-                "lot": 0.0,
-                "sl": 0.0,
-                "tp": 0.0,
-                "order_success": False,
-                "retcode": "",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "analysis_model": "",
-                "decision_model": "",
-                "news_count": 0,
-                "error": "",
-            }
-            _append_trade_log(result)
-            return result
+            return _blocked_hold_result(
+                now_iso,
+                reasoning=f"取引停止: {trading_block_reason}",
+                filter_reason="NY trading window blocked",
+            )
 
         calibrated_baseline = baseline_spread
         if calibrated_baseline is None:
@@ -950,125 +933,35 @@ def run_once(
             effective_daily_loss_pct = max(daily_loss_pct, dynamic_daily_loss_pct)
 
         if calibrated_baseline is None:
-            result = {
-                "timestamp_utc": now_iso,
-                "deal_id": "",
-                "symbol": SYMBOL,
-                "action": "HOLD",
-                "entry_price": "",
-                "exit_price": "",
-                "holding_seconds": "",
-                "pnl": "",
-                "confidence": 0.0,
-                "reasoning": "baseline_spread自動算出に失敗したためHOLD",
-                "risk_level": "HIGH",
-                "allowed": False,
-                "filter_reason": "Baseline spread calibration failed",
-                "lot": 0.0,
-                "sl": 0.0,
-                "tp": 0.0,
-                "order_success": False,
-                "retcode": "",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "analysis_model": "",
-                "decision_model": "",
-                "news_count": 0,
-                "error": "",
-            }
-            _append_trade_log(result)
-            return result
+            return _blocked_hold_result(
+                now_iso,
+                reasoning="baseline_spread自動算出に失敗したためHOLD",
+                filter_reason="Baseline spread calibration failed",
+            )
 
         if calibrated_baseline <= 0:
-            result = {
-                "timestamp_utc": now_iso,
-                "deal_id": "",
-                "symbol": SYMBOL,
-                "action": "HOLD",
-                "entry_price": "",
-                "exit_price": "",
-                "holding_seconds": "",
-                "pnl": "",
-                "confidence": 0.0,
-                "reasoning": "baseline_spread未設定のためHOLD",
-                "risk_level": "HIGH",
-                "allowed": False,
-                "filter_reason": "Missing baseline spread",
-                "lot": 0.0,
-                "sl": 0.0,
-                "tp": 0.0,
-                "order_success": False,
-                "retcode": "",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "news_count": 0,
-                "error": "",
-            }
-            _append_trade_log(result)
-            return result
+            return _blocked_hold_result(
+                now_iso,
+                reasoning="baseline_spread未設定のためHOLD",
+                filter_reason="Missing baseline spread",
+            )
 
         if is_high_impact_soon(minutes=NEWS_FILTER_MINUTES):
-            result = {
-                "timestamp_utc": now_iso,
-                "deal_id": "",
-                "symbol": SYMBOL,
-                "action": "HOLD",
-                "entry_price": "",
-                "exit_price": "",
-                "holding_seconds": "",
-                "pnl": "",
-                "confidence": 0.0,
-                "reasoning": "重要指標前後のため新規取引を停止",
-                "risk_level": "HIGH",
-                "allowed": False,
-                "filter_reason": "High impact news window",
-                "lot": 0.0,
-                "sl": 0.0,
-                "tp": 0.0,
-                "order_success": False,
-                "retcode": "",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "news_count": 0,
-                "error": "",
-            }
-            _append_trade_log(result)
-            return result
+            return _blocked_hold_result(
+                now_iso,
+                reasoning="重要指標前後のため新規取引を停止",
+                filter_reason="High impact news window",
+            )
 
         positions = get_positions(SYMBOL)
 
         d1, h4, h1, news_items, macro_report, technical_report, sentiment_report = _build_market_reports()
         if h4.empty or h1.empty:
-            result = {
-                "timestamp_utc": now_iso,
-                "deal_id": "",
-                "symbol": SYMBOL,
-                "action": "HOLD",
-                "entry_price": "",
-                "exit_price": "",
-                "holding_seconds": "",
-                "pnl": "",
-                "confidence": 0.0,
-                "reasoning": "価格データ取得に失敗",
-                "risk_level": "HIGH",
-                "allowed": False,
-                "filter_reason": "Price data unavailable",
-                "lot": 0.0,
-                "sl": 0.0,
-                "tp": 0.0,
-                "order_success": False,
-                "retcode": "",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "news_count": 0,
-                "error": "",
-            }
-            _append_trade_log(result)
-            return result
+            return _blocked_hold_result(
+                now_iso,
+                reasoning="価格データ取得に失敗",
+                filter_reason="Price data unavailable",
+            )
 
         gate, debate_report, debate_fallback_report = _build_debate_and_decision_reports(
             technical_report,
@@ -1082,39 +975,17 @@ def run_once(
             LOGGER.warning("Failed to extract debate log fields; defaults used: %s", exc)
             debate_log_fields = _default_debate_log_fields()
 
-        if len(positions) >= 1:
+        if len(positions) >= MAX_POSITIONS:
             position_details = get_position_details(SYMBOL)
             if not position_details:
-                result = {
-                    "timestamp_utc": now_iso,
-                    "deal_id": "",
-                    "symbol": SYMBOL,
-                    "action": "HOLD",
-                    "entry_price": "",
-                    "exit_price": "",
-                    "holding_seconds": "",
-                    "pnl": "",
-                    "confidence": 0.0,
-                    "reasoning": "保有詳細取得に失敗したためHOLD",
-                    "risk_level": "HIGH",
-                    "allowed": False,
-                    "filter_reason": "Position details unavailable",
-                    "lot": 0.0,
-                    "sl": 0.0,
-                    "tp": 0.0,
-                    "order_success": False,
-                    "retcode": "",
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                    "analysis_model": _extract_model_name(technical_report),
-                    "decision_model": "",
-                    "news_count": len(news_items),
-                    "error": "",
-                    **debate_log_fields,
-                }
-                _append_trade_log(result)
-                return result
+                return _blocked_hold_result(
+                    now_iso,
+                    reasoning="保有詳細取得に失敗したためHOLD",
+                    filter_reason="Position details unavailable",
+                    news_count=len(news_items),
+                    analysis_model=_extract_model_name(technical_report),
+                    extra=debate_log_fields,
+                )
 
             position_context = _position_context_from_details(position_details[0], len(position_details))
             evaluation_report = debate_fallback_report or evaluate_position(
@@ -1233,12 +1104,23 @@ def run_once(
         entry_price = float(h1.iloc[-1].get("close", 0.0))
         atr = float(h1.iloc[-1].get("atr_14", 0.0))
 
+        jpy_usd_rate: float | None = None
+        if action in {"BUY", "SELL"}:
+            jpy_usd_rate = get_usd_jpy_rate()
+            if jpy_usd_rate is None:
+                LOGGER.warning(
+                    "USDJPY rate unavailable from MT5; using configured fallback %.2f",
+                    JPY_USD_RATE_FALLBACK,
+                )
+                jpy_usd_rate = JPY_USD_RATE_FALLBACK
+
         risk_plan = build_risk_plan(
             action=action,
             entry_price=entry_price,
             atr=atr,
             balance_jpy=balance,
             suggested_tp=trader_report.get("suggested_tp"),
+            jpy_usd_rate=jpy_usd_rate,
         )
 
         order_result: dict[str, Any] = {
@@ -1295,57 +1177,12 @@ def run_once(
         return result
     except Exception as exc:
         LOGGER.exception("run_once failed: %s", exc)
-        fallback = {
-            "timestamp_utc": now_iso,
-            "deal_id": "",
-            "symbol": SYMBOL,
-            "action": "HOLD",
-            "entry_price": "",
-            "exit_price": "",
-            "holding_seconds": "",
-            "pnl": "",
-            "confidence": 0.0,
-            "reasoning": "例外発生のためHOLD",
-            "risk_level": "HIGH",
-            "allowed": False,
-            "filter_reason": "Exception",
-            "lot": 0.0,
-            "sl": 0.0,
-            "tp": 0.0,
-            "order_success": False,
-            "retcode": "",
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "news_count": 0,
-            "error": str(exc),
-        }
-        _append_trade_log(fallback)
-        return fallback
-
-
-def run_scheduler(
-    baseline_spread: float | None = None,
-    consecutive_losses: int | None = None,
-    daily_loss_pct: float | None = None,
-) -> None:
-    """Run scheduler loop and execute strategy at configured judgment times."""
-    _ = (consecutive_losses, daily_loss_pct)
-    executed_today: set[str] = set()
-    while True:
-        now_local = datetime.now()
-        today = now_local.strftime("%Y-%m-%d")
-
-        # Keep executed keys bounded per day.
-        executed_today = {x for x in executed_today if x.startswith(today)}
-
-        _run_scheduler_due_jobs(
-            now_local=now_local,
-            executed_today=executed_today,
-            baseline_spread=baseline_spread,
+        return _blocked_hold_result(
+            now_iso,
+            reasoning="例外発生のためHOLD",
+            filter_reason="Exception",
+            error=str(exc),
         )
-
-        time.sleep(20)
 
 
 if __name__ == "__main__":

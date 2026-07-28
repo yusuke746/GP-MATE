@@ -245,3 +245,64 @@ def test_modify_sl_fails_safely_when_ticket_missing(monkeypatch) -> None:
     assert result["success"] is False
     assert result["reason"] == "Position not found: 999"
     assert fake_mt5.sent_requests == []
+
+class _FakeFxMt5:
+    def __init__(self, tick_map: dict[str, object], symbols: list[str] | None = None) -> None:
+        self._tick_map = tick_map
+        self._symbols = symbols or list(tick_map.keys())
+
+    def symbol_info(self, symbol: str):
+        if symbol in self._tick_map:
+            return SimpleNamespace(visible=True)
+        return None
+
+    def symbol_select(self, symbol: str, visible: bool):
+        return True
+
+    def symbol_info_tick(self, symbol: str):
+        return self._tick_map.get(symbol)
+
+    def symbols_get(self):
+        return [SimpleNamespace(name=name) for name in self._symbols]
+
+    def last_error(self):
+        return (1, "fake error")
+
+
+def test_get_usd_jpy_rate_returns_mid_price(monkeypatch) -> None:
+    fake = _FakeFxMt5({"USDJPY": SimpleNamespace(bid=154.0, ask=154.2)})
+    monkeypatch.setattr(mt5_client, "mt5", fake)
+    monkeypatch.setattr(mt5_client, "connect", lambda: True)
+    monkeypatch.setattr(mt5_client, "disconnect", lambda: None)
+
+    rate = mt5_client.get_usd_jpy_rate()
+
+    assert rate is not None
+    assert abs(rate - 154.1) < 1e-9
+
+
+def test_get_usd_jpy_rate_resolves_broker_suffix_symbol(monkeypatch) -> None:
+    fake = _FakeFxMt5({"USDJPY.r": SimpleNamespace(bid=153.0, ask=153.2)}, symbols=["GOLD#", "USDJPY.r"])
+    monkeypatch.setattr(mt5_client, "mt5", fake)
+    monkeypatch.setattr(mt5_client, "connect", lambda: True)
+    monkeypatch.setattr(mt5_client, "disconnect", lambda: None)
+
+    rate = mt5_client.get_usd_jpy_rate()
+
+    assert rate is not None
+    assert abs(rate - 153.1) < 1e-9
+
+
+def test_get_usd_jpy_rate_rejects_out_of_range_values(monkeypatch) -> None:
+    fake = _FakeFxMt5({"USDJPY": SimpleNamespace(bid=2349.5, ask=2350.5)})
+    monkeypatch.setattr(mt5_client, "mt5", fake)
+    monkeypatch.setattr(mt5_client, "connect", lambda: True)
+    monkeypatch.setattr(mt5_client, "disconnect", lambda: None)
+
+    assert mt5_client.get_usd_jpy_rate() is None
+
+
+def test_get_usd_jpy_rate_returns_none_without_mt5(monkeypatch) -> None:
+    monkeypatch.setattr(mt5_client, "mt5", None)
+
+    assert mt5_client.get_usd_jpy_rate() is None

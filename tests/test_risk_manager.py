@@ -11,20 +11,30 @@ from risk.risk_manager import (
 
 
 def test_calc_lot_minimum_floor() -> None:
-    lot = calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=1000)
+    # Small accounts floor at the broker minimum lot so they can still trade,
+    # even though effective risk then exceeds the configured risk_pct.
+    lot = calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=1000, jpy_usd_rate=155.0)
     assert lot == 0.01
 
 
 def test_calc_lot_regular_case() -> None:
-    lot = calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=10)
+    lot = calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=10, jpy_usd_rate=155.0)
     assert lot > 0
     assert round(lot, 2) == lot
+
+
+def test_calc_lot_uses_given_fx_rate() -> None:
+    # A weaker JPY (higher USDJPY) means less USD risk budget -> smaller lot.
+    lot_low_rate = calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=10, jpy_usd_rate=100.0)
+    lot_high_rate = calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=10, jpy_usd_rate=200.0)
+    assert lot_low_rate > lot_high_rate
 
 
 def test_calc_lot_invalid_inputs_return_zero() -> None:
     assert calc_lot(balance_jpy=0, risk_pct=0.01, sl_distance_usd=10) == 0.0
     assert calc_lot(balance_jpy=500_000, risk_pct=0.0, sl_distance_usd=10) == 0.0
     assert calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=0) == 0.0
+    assert calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=10, jpy_usd_rate=0.0) == 0.0
 
 
 def test_calc_sl_tp_buy() -> None:
@@ -230,6 +240,24 @@ def test_build_risk_plan_sell_rejects_wrong_direction_suggested_tp() -> None:
     assert plan["ok"]
     assert float(plan["tp"]) == float(plan["tp_2r"])
     assert plan["tp_source"] == "fallback_2r"
+
+
+def test_build_risk_plan_passes_fx_rate_to_lot_calc() -> None:
+    plan_low = build_risk_plan(
+        action="BUY", entry_price=2300.0, atr=10.0, balance_jpy=5_000_000, jpy_usd_rate=100.0
+    )
+    plan_high = build_risk_plan(
+        action="BUY", entry_price=2300.0, atr=10.0, balance_jpy=5_000_000, jpy_usd_rate=200.0
+    )
+    assert plan_low["ok"] and plan_high["ok"]
+    assert float(plan_low["lot"]) > float(plan_high["lot"])
+
+
+def test_build_risk_plan_small_balance_floors_to_min_lot() -> None:
+    plan = build_risk_plan(action="BUY", entry_price=2300.0, atr=100.0, balance_jpy=10_000)
+    assert plan["ok"]
+    assert plan["action"] == "BUY"
+    assert float(plan["lot"]) == 0.01
 
 
 def test_build_risk_plan_sl_is_unchanged_with_suggested_tp() -> None:

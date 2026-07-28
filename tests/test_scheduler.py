@@ -22,73 +22,6 @@ def _next_fire_jst(hour: int, minute: int, now: datetime) -> tuple[datetime, str
     return fire_time, fire_jst.strftime("%H:%M")
 
 
-def test_scheduler_runs_when_time_is_within_catchup_window(monkeypatch) -> None:
-    monkeypatch.setattr(main, "NY_RUN_TIMES", ((9, 0),))
-    now_local = datetime(2026, 7, 2, 9, 3, 0, tzinfo=ZoneInfo("America/New_York"))
-
-    calls: list[dict[str, float]] = []
-
-    def _fake_run_once(baseline_spread, consecutive_losses, daily_loss_pct):
-        calls.append(
-            {
-                "consecutive_losses": float(consecutive_losses),
-                "daily_loss_pct": float(daily_loss_pct),
-            }
-        )
-        return {"action": "HOLD"}
-
-    monkeypatch.setattr(main, "calc_today_risk_stats", lambda: (2, 0.015))
-    monkeypatch.setattr(main, "run_once", _fake_run_once)
-
-    executed_today: set[str] = set()
-    main._run_scheduler_due_jobs(now_local=now_local, executed_today=executed_today, baseline_spread=10.0)
-
-    assert len(calls) == 1
-    assert calls[0]["consecutive_losses"] == 2.0
-    assert calls[0]["daily_loss_pct"] == 0.015
-
-
-def test_scheduler_does_not_double_execute_same_slot(monkeypatch) -> None:
-    monkeypatch.setattr(main, "NY_RUN_TIMES", ((9, 0),))
-    now_local = datetime(2026, 7, 2, 9, 1, 0, tzinfo=ZoneInfo("America/New_York"))
-
-    count = {"n": 0}
-
-    def _fake_run_once(baseline_spread, consecutive_losses, daily_loss_pct):
-        count["n"] += 1
-        return {"action": "HOLD"}
-
-    monkeypatch.setattr(main, "calc_today_risk_stats", lambda: (0, 0.0))
-    monkeypatch.setattr(main, "run_once", _fake_run_once)
-
-    executed_today: set[str] = set()
-    main._run_scheduler_due_jobs(now_local=now_local, executed_today=executed_today, baseline_spread=10.0)
-    main._run_scheduler_due_jobs(now_local=now_local, executed_today=executed_today, baseline_spread=10.0)
-
-    assert count["n"] == 1
-
-
-def test_scheduler_continues_when_run_once_raises(monkeypatch) -> None:
-    monkeypatch.setattr(main, "NY_RUN_TIMES", ((9, 0), (9, 1)))
-    now_local = datetime(2026, 7, 2, 9, 1, 30, tzinfo=ZoneInfo("America/New_York"))
-
-    calls = {"n": 0}
-
-    def _fake_run_once(baseline_spread, consecutive_losses, daily_loss_pct):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("boom")
-        return {"action": "HOLD"}
-
-    monkeypatch.setattr(main, "calc_today_risk_stats", lambda: (0, 0.0))
-    monkeypatch.setattr(main, "run_once", _fake_run_once)
-
-    executed_today: set[str] = set()
-    main._run_scheduler_due_jobs(now_local=now_local, executed_today=executed_today, baseline_spread=10.0)
-
-    assert calls["n"] == 2
-
-
 def test_run_scheduler_sets_misfire_grace_time(monkeypatch) -> None:
     monkeypatch.setattr(run_scheduler, "NY_RUN_TIMES", ((8, 0),))
     monkeypatch.setattr(run_scheduler, "STAGE", 1)
@@ -303,15 +236,35 @@ def test_consecutive_losses_reset_when_win_inserted(tmp_path: Path, monkeypatch)
     assert consecutive_losses == 1
 
 
-def test_calc_today_risk_stats_falls_back_safe_on_failure(tmp_path: Path, monkeypatch) -> None:
+def test_calc_today_risk_stats_skips_malformed_rows(tmp_path: Path, monkeypatch) -> None:
     log_path = tmp_path / "trade_log.csv"
+    now = datetime.now(UTC).isoformat()
     log_path.write_text(
         "timestamp_utc,action,pnl,reasoning\n"
-        "not-a-datetime,SELL,-100,closed_trade_sync\n",
+        "not-a-datetime,SELL,-100,closed_trade_sync\n"
+        f"{now},SELL,not-a-number,closed_trade_sync\n"
+        f"{now},SELL,-100,closed_trade_sync\n",
         encoding="utf-8",
     )
 
     monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+
+    class _Account:
+        balance = 500_000.0
+
+    monkeypatch.setattr(main, "get_account_info", lambda: {"success": True, "data": _Account()})
+
+    consecutive_losses, daily_loss_pct = main.calc_today_risk_stats()
+
+    # Malformed rows are skipped; the valid loss row is still counted.
+    assert consecutive_losses == 1
+    assert abs(daily_loss_pct - (100.0 / 500_000.0)) < 1e-12
+
+
+def test_calc_today_risk_stats_falls_back_safe_on_structural_failure(tmp_path: Path, monkeypatch) -> None:
+    # Point at a directory so opening the "file" raises: structural failures
+    # must still resolve to the blocking fail-closed thresholds.
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", tmp_path)
 
     consecutive_losses, daily_loss_pct = main.calc_today_risk_stats()
 

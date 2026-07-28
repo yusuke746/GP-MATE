@@ -22,7 +22,9 @@ SYSTEM_PROMPT = (
     "反発が予想される強レベルの手前にsuggested_tpを数値で設定すること。"
     "複数根拠が重なるほど強いのでconfluence_noteを重視すること。"
     "direction_context.technical.adxが強いトレンドを示す場合は、"
-    "手前のサポレジで反発しにくいためsuggested_tpを伸ばしてよい。"
+    "手前のサポレジで反発しにくいためsuggested_tpを遠めに設定してよい。"
+    "ただし最終TPはリスクリワード2Rが上限であり、2Rを超えるsuggested_tpは2Rに丸められる。"
+    "したがってsuggested_tpは原則2R以内で、最も反発が強そうなレベルの手前に置くこと。"
     "HOLDの場合や算出根拠が不十分な場合、suggested_tpはnullにすること。"
     "suggested_tp_basisには、その価格にした根拠を簡潔な日本語で記すこと。"
 )

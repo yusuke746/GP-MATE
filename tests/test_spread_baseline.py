@@ -21,6 +21,8 @@ def test_run_once_holds_when_baseline_calibration_fails(tmp_path: Path, monkeypa
     log_path = tmp_path / "trade_log.csv"
     monkeypatch.setattr(main, "LOG_DIR", tmp_path)
     monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+    monkeypatch.setattr(main, "sync_closed_trades", lambda: 0)
+    monkeypatch.setattr(main, "_is_trading_session_allowed", lambda reference=None: (True, ""))
     monkeypatch.setattr(main, "get_baseline_spread", lambda symbol, samples, interval_sec: None)
 
     result = main.run_once()
@@ -37,6 +39,8 @@ def test_run_once_holds_when_spread_exceeds_multiplier(tmp_path: Path, monkeypat
     monkeypatch.setattr(main, "LOG_DIR", tmp_path)
     monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
 
+    monkeypatch.setattr(main, "sync_closed_trades", lambda: 0)
+    monkeypatch.setattr(main, "_is_trading_session_allowed", lambda reference=None: (True, ""))
     monkeypatch.setattr(main, "is_high_impact_soon", lambda minutes: False)
     monkeypatch.setattr(main, "get_positions", lambda symbol: [])
 
@@ -99,7 +103,7 @@ def test_run_once_holds_when_spread_exceeds_multiplier(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
             "ok": True,
             "action": "BUY",
             "lot": 0.1,

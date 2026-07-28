@@ -722,6 +722,59 @@ def modify_sl(ticket: int, new_sl: float) -> dict[str, Any]:
         disconnect()
 
 
+USD_JPY_SYMBOL_CANDIDATES = ("USDJPY", "USDJPY#", "USDJPYm", "USDJPY.r")
+USD_JPY_RATE_MIN = 50.0
+USD_JPY_RATE_MAX = 500.0
+
+
+def _mid_price_if_valid(symbol: str) -> float | None:
+    if mt5 is None or not _ensure_symbol(symbol):
+        return None
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return None
+    mid = (float(tick.bid) + float(tick.ask)) / 2.0
+    if USD_JPY_RATE_MIN <= mid <= USD_JPY_RATE_MAX:
+        return mid
+    return None
+
+
+def get_usd_jpy_rate() -> float | None:
+    """Get current USD/JPY mid rate from MT5.
+
+    Tries common broker symbol variants, then a normalized partial match.
+    Returns None when unavailable or outside a sanity range, so callers
+    can fall back to a configured static rate.
+    """
+    if not connect():
+        return None
+
+    try:
+        if mt5 is None:
+            return None
+
+        for candidate in USD_JPY_SYMBOL_CANDIDATES:
+            rate = _mid_price_if_valid(candidate)
+            if rate is not None:
+                return rate
+
+        symbols = mt5.symbols_get()
+        if not symbols:
+            return None
+        for symbol in symbols:
+            name = str(getattr(symbol, "name", "") or "")
+            if "usdjpy" in name.lower():
+                rate = _mid_price_if_valid(name)
+                if rate is not None:
+                    return rate
+        return None
+    except Exception as exc:
+        LOGGER.exception("get_usd_jpy_rate exception: %s", exc)
+        return None
+    finally:
+        disconnect()
+
+
 def get_account_info() -> dict[str, Any]:
     """Fetch account information from MT5 as a dictionary."""
     if not connect():
