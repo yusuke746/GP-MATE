@@ -31,9 +31,9 @@ def calc_lot(
 ) -> float:
     """Calculate lot size from account risk and SL distance.
 
-    Returns 0.0 when inputs are invalid, or when the computed lot rounds
-    below the broker minimum (MIN_LOT) — forcing the minimum lot would
-    exceed the configured risk, so no-trade is the safe outcome.
+    Returns minimum MIN_LOT (0.01) for valid inputs, so small accounts can
+    still trade; note the effective risk then exceeds risk_pct.
+    Returns 0.0 when inputs are invalid to force a no-trade decision.
     """
     if balance_jpy <= 0 or risk_pct <= 0 or sl_distance_usd <= 0 or contract_size <= 0:
         return 0.0
@@ -47,11 +47,11 @@ def calc_lot(
     if loss_per_lot <= 0:
         return 0.0
 
-    lot = round(risk_amount_usd / loss_per_lot, 2)
-    if lot < MIN_LOT:
+    lot = risk_amount_usd / loss_per_lot
+    if lot <= 0:
         return 0.0
 
-    return lot
+    return max(MIN_LOT, round(lot, 2))
 
 
 def calc_sl_tp(

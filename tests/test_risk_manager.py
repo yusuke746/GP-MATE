@@ -10,11 +10,11 @@ from risk.risk_manager import (
 )
 
 
-def test_calc_lot_below_min_lot_returns_zero() -> None:
-    # Computed lot rounds below 0.01: forcing the broker minimum would exceed
-    # the configured risk, so the safe outcome is no-trade (0.0).
+def test_calc_lot_minimum_floor() -> None:
+    # Small accounts floor at the broker minimum lot so they can still trade,
+    # even though effective risk then exceeds the configured risk_pct.
     lot = calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=1000, jpy_usd_rate=155.0)
-    assert lot == 0.0
+    assert lot == 0.01
 
 
 def test_calc_lot_regular_case() -> None:
@@ -253,11 +253,11 @@ def test_build_risk_plan_passes_fx_rate_to_lot_calc() -> None:
     assert float(plan_low["lot"]) > float(plan_high["lot"])
 
 
-def test_build_risk_plan_holds_when_lot_below_minimum() -> None:
+def test_build_risk_plan_small_balance_floors_to_min_lot() -> None:
     plan = build_risk_plan(action="BUY", entry_price=2300.0, atr=100.0, balance_jpy=10_000)
-    assert not plan["ok"]
-    assert plan["action"] == "HOLD"
-    assert plan["reason"] == "Lot calculation failed"
+    assert plan["ok"]
+    assert plan["action"] == "BUY"
+    assert float(plan["lot"]) == 0.01
 
 
 def test_build_risk_plan_sl_is_unchanged_with_suggested_tp() -> None:
