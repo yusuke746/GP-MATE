@@ -90,6 +90,38 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(main, "is_high_impact_soon", lambda minutes: False)
     monkeypatch.setattr(main, "get_positions", lambda symbol: [])
 
+    # Default: skip the debate so tests never reach the real LangGraph/LLM path.
+    # Individual tests override these when they exercise debate behavior.
+    monkeypatch.setattr(
+        main,
+        "should_execute_debate",
+        lambda technical_report, sentiment_report, macro_report: {
+            "should_debate": False,
+            "reason": "議論スキップ（テスト既定）",
+            "technical_direction": "BUY",
+            "sentiment_direction": "BULLISH",
+            "macro_direction": "NEUTRAL",
+            "alignment": "ALIGNED",
+            "estimated_confidence": 0.7,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "run_debate_graph",
+        lambda technical_report, sentiment_report, macro_report=None: {
+            "judge_summary": {
+                "agreements": [],
+                "conflicts": [],
+                "confidence_shift": {"bull": [], "bear": []},
+                "stronger_side": "neutral",
+            },
+            "_meta": {
+                "ok": True,
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            },
+        },
+    )
+
     rates = pd.DataFrame(
         [
             {
