@@ -4,12 +4,10 @@ import csv
 import json
 import logging
 import sys
-import time
 import warnings
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 # Suppress known non-fatal warning from langchain_core on Python 3.14+.
 warnings.filterwarnings(
@@ -30,11 +28,11 @@ from config import (
     BREAKEVEN_BUFFER,
     CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
+    JPY_USD_RATE_FALLBACK,
     MARKET_TZ,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
     NEWS_FILTER_MINUTES,
-    NY_RUN_TIMES,
     SPREAD_SAMPLE_INTERVAL,
     SPREAD_SAMPLES,
     SYMBOL,
@@ -48,6 +46,7 @@ from data.mt5_client import (
     get_positions,
     get_rates,
     get_spread,
+    get_usd_jpy_rate,
     modify_sl,
     send_order,
 )
@@ -62,7 +61,6 @@ LOGGER = logging.getLogger(__name__)
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 TRADE_LOG_PATH = LOG_DIR / "trade_log.csv"
 CLOSED_DEAL_STATE_PATH = LOG_DIR / "closed_deal_state.json"
-SCHEDULER_CATCHUP_WINDOW_SECONDS = 5 * 60
 
 # TP reference proximity in USD. Used only for TP-target confluence labels.
 TP_PROXIMITY_ROUND_NUMBER = 5.0
@@ -802,26 +800,32 @@ def calc_today_risk_stats() -> tuple[int, float]:
         with TRADE_LOG_PATH.open("r", newline="", encoding="utf-8") as fp:
             reader = csv.DictReader(fp)
             for row in reader:
-                ts_raw = str(row.get("timestamp_utc", "") or "").strip()
-                if not ts_raw:
+                # A single corrupt row (partial write etc.) must not disable
+                # trading for the whole day; skip it and keep aggregating.
+                try:
+                    ts_raw = str(row.get("timestamp_utc", "") or "").strip()
+                    if not ts_raw:
+                        continue
+
+                    ts = datetime.fromisoformat(ts_raw)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=UTC)
+                    else:
+                        ts = ts.astimezone(UTC)
+
+                    if ts.date() != today:
+                        continue
+
+                    action = str(row.get("action", "") or "").strip().upper()
+                    reasoning = str(row.get("reasoning", "") or "").strip()
+
+                    pnl_value: float | None = None
+                    pnl_raw = str(row.get("pnl", "") or "").strip()
+                    if pnl_raw:
+                        pnl_value = float(pnl_raw)
+                except Exception as row_exc:
+                    LOGGER.warning("calc_today_risk_stats: skipping malformed row: %s", row_exc)
                     continue
-
-                ts = datetime.fromisoformat(ts_raw)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=UTC)
-                else:
-                    ts = ts.astimezone(UTC)
-
-                if ts.date() != today:
-                    continue
-
-                action = str(row.get("action", "") or "").strip().upper()
-                reasoning = str(row.get("reasoning", "") or "").strip()
-
-                pnl_value: float | None = None
-                pnl_raw = str(row.get("pnl", "") or "").strip()
-                if pnl_raw:
-                    pnl_value = float(pnl_raw)
 
                 today_rows.append(
                     {
@@ -883,45 +887,6 @@ def calc_today_risk_stats() -> tuple[int, float]:
     except Exception as exc:
         LOGGER.exception("calc_today_risk_stats failed; using safe fallback: %s", exc)
         return CONSECUTIVE_LOSS_LIMIT, MAX_DAILY_LOSS_PCT
-
-
-def _run_scheduler_due_jobs(
-    now_local: datetime,
-    executed_today: set[str],
-    baseline_spread: float | None,
-) -> None:
-    local_tz = now_local.tzinfo or datetime.now().astimezone().tzinfo or ZoneInfo("UTC")
-    current_local = now_local if now_local.tzinfo is not None else now_local.replace(tzinfo=local_tz)
-    current_market = current_local.astimezone(MARKET_TZ)
-
-    for hour, minute in NY_RUN_TIMES:
-        target_market = current_market.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        target_local = target_market.astimezone(local_tz)
-        delta = (current_local - target_local).total_seconds()
-        execution_key = target_market.strftime("%Y-%m-%d-%H:%M")
-
-        if execution_key in executed_today:
-            continue
-        if not (0 <= delta <= SCHEDULER_CATCHUP_WINDOW_SECONDS):
-            continue
-
-        try:
-            consecutive_losses, daily_loss_pct = calc_today_risk_stats()
-        except Exception as exc:
-            LOGGER.exception("Risk aggregation failed; using safe fallback: %s", exc)
-            consecutive_losses = CONSECUTIVE_LOSS_LIMIT
-            daily_loss_pct = MAX_DAILY_LOSS_PCT
-
-        try:
-            run_once(
-                baseline_spread=baseline_spread,
-                consecutive_losses=consecutive_losses,
-                daily_loss_pct=daily_loss_pct,
-            )
-        except Exception as exc:
-            LOGGER.exception("run_once failed in scheduler loop (continuing): %s", exc)
-        finally:
-            executed_today.add(execution_key)
 
 
 def run_once(
@@ -1139,12 +1104,23 @@ def run_once(
         entry_price = float(h1.iloc[-1].get("close", 0.0))
         atr = float(h1.iloc[-1].get("atr_14", 0.0))
 
+        jpy_usd_rate: float | None = None
+        if action in {"BUY", "SELL"}:
+            jpy_usd_rate = get_usd_jpy_rate()
+            if jpy_usd_rate is None:
+                LOGGER.warning(
+                    "USDJPY rate unavailable from MT5; using configured fallback %.2f",
+                    JPY_USD_RATE_FALLBACK,
+                )
+                jpy_usd_rate = JPY_USD_RATE_FALLBACK
+
         risk_plan = build_risk_plan(
             action=action,
             entry_price=entry_price,
             atr=atr,
             balance_jpy=balance,
             suggested_tp=trader_report.get("suggested_tp"),
+            jpy_usd_rate=jpy_usd_rate,
         )
 
         order_result: dict[str, Any] = {
@@ -1207,31 +1183,6 @@ def run_once(
             filter_reason="Exception",
             error=str(exc),
         )
-
-
-def run_scheduler(
-    baseline_spread: float | None = None,
-    consecutive_losses: int | None = None,
-    daily_loss_pct: float | None = None,
-) -> None:
-    """Run scheduler loop and execute strategy at configured judgment times."""
-    _ = (consecutive_losses, daily_loss_pct)
-    executed_today: set[str] = set()
-    while True:
-        now_local = datetime.now()
-        # Execution keys are stamped with the market (NY) date, so pruning must
-        # use the market date too; the local date can differ for hours around
-        # midnight and would evict still-active keys.
-        market_today = datetime.now(tz=MARKET_TZ).strftime("%Y-%m-%d")
-        executed_today = {x for x in executed_today if x.startswith(market_today)}
-
-        _run_scheduler_due_jobs(
-            now_local=now_local,
-            executed_today=executed_today,
-            baseline_spread=baseline_spread,
-        )
-
-        time.sleep(20)
 
 
 if __name__ == "__main__":

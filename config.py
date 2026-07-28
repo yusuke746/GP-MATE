@@ -55,6 +55,8 @@ class Settings:
     breakeven_monitor_times: tuple[str, ...]
 
     news_filter_minutes: int
+    calendar_timezone: str
+    jpy_usd_rate_fallback: float
     spread_multiplier_limit: float
     spread_samples: int
     spread_sample_interval: float
@@ -229,6 +231,8 @@ def load_settings() -> Settings:
             _get_env_str("BREAKEVEN_MONITOR_TIMES", "07,22,37,52")
         ),
         news_filter_minutes=_get_env_int("NEWS_FILTER_MINUTES", 15),
+        calendar_timezone=_get_env_str("CALENDAR_TIMEZONE", "UTC"),
+        jpy_usd_rate_fallback=_get_env_float("JPY_USD_RATE_FALLBACK", 155.0),
         spread_multiplier_limit=2.0,
         spread_samples=20,
         spread_sample_interval=0.5,
@@ -270,6 +274,8 @@ BREAKEVEN_BUFFER: Final[float] = settings.breakeven_buffer
 BREAKEVEN_MONITOR_TIMES: Final[tuple[str, ...]] = settings.breakeven_monitor_times
 
 NEWS_FILTER_MINUTES: Final[int] = settings.news_filter_minutes
+CALENDAR_TIMEZONE_NAME: Final[str] = settings.calendar_timezone
+JPY_USD_RATE_FALLBACK: Final[float] = settings.jpy_usd_rate_fallback
 SPREAD_MULTIPLIER_LIMIT: Final[float] = settings.spread_multiplier_limit
 SPREAD_SAMPLES: Final[int] = settings.spread_samples
 SPREAD_SAMPLE_INTERVAL: Final[float] = settings.spread_sample_interval

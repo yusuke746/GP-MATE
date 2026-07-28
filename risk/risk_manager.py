@@ -6,11 +6,14 @@ from config import (
     ATR_MULTIPLIER_SL,
     CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
+    JPY_USD_RATE_FALLBACK,
     MAX_DAILY_LOSS_PCT,
     RISK_PERCENT,
     RISK_REWARD_RATIO,
     SPREAD_MULTIPLIER_LIMIT,
 )
+
+MIN_LOT = 0.01
 
 
 @dataclass(frozen=True)
@@ -24,12 +27,13 @@ def calc_lot(
     risk_pct: float,
     sl_distance_usd: float,
     contract_size: float = 100.0,
-    jpy_usd_rate: float = 155.0,
+    jpy_usd_rate: float = JPY_USD_RATE_FALLBACK,
 ) -> float:
     """Calculate lot size from account risk and SL distance.
 
-    Returns minimum 0.01 lot for valid inputs.
-    Returns 0.0 when inputs are invalid to force a no-trade decision.
+    Returns 0.0 when inputs are invalid, or when the computed lot rounds
+    below the broker minimum (MIN_LOT) — forcing the minimum lot would
+    exceed the configured risk, so no-trade is the safe outcome.
     """
     if balance_jpy <= 0 or risk_pct <= 0 or sl_distance_usd <= 0 or contract_size <= 0:
         return 0.0
@@ -43,11 +47,11 @@ def calc_lot(
     if loss_per_lot <= 0:
         return 0.0
 
-    lot = risk_amount_usd / loss_per_lot
-    if lot <= 0:
+    lot = round(risk_amount_usd / loss_per_lot, 2)
+    if lot < MIN_LOT:
         return 0.0
 
-    return max(0.01, round(lot, 2))
+    return lot
 
 
 def calc_sl_tp(
@@ -136,6 +140,7 @@ def build_risk_plan(
     risk_pct: float = RISK_PERCENT,
     atr_mult: float = ATR_MULTIPLIER_SL,
     rr: float = RISK_REWARD_RATIO,
+    jpy_usd_rate: float | None = None,
 ) -> dict[str, float | str | bool]:
     """Build lot/SL/TP plan with safe fallback for invalid cases.
 
@@ -188,10 +193,12 @@ def build_risk_plan(
                 tp_source = "suggested" if final_tp == round(suggested_tp_value, 5) else "suggested_capped_2r"
 
         sl_distance = abs(entry_price - sl)
+        effective_rate = jpy_usd_rate if jpy_usd_rate is not None and jpy_usd_rate > 0 else JPY_USD_RATE_FALLBACK
         lot = calc_lot(
             balance_jpy=balance_jpy,
             risk_pct=risk_pct,
             sl_distance_usd=sl_distance,
+            jpy_usd_rate=effective_rate,
         )
 
         if lot <= 0:

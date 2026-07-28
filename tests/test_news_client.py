@@ -68,6 +68,18 @@ def test_parse_calendar_event_datetime_supports_forexfactory_format() -> None:
     assert _parse_calendar_event_datetime("", "8:30am") is None
 
 
+def test_parse_calendar_event_datetime_honors_configured_timezone(monkeypatch) -> None:
+    from zoneinfo import ZoneInfo
+
+    import data.news_client as news_client
+
+    monkeypatch.setattr(news_client, "CALENDAR_TZ", ZoneInfo("America/New_York"))
+
+    parsed = _parse_calendar_event_datetime("07-28-2026", "8:30am")
+    # 8:30 New York (EDT, UTC-4) == 12:30 UTC
+    assert parsed == datetime(2026, 7, 28, 12, 30, tzinfo=UTC)
+
+
 def test_is_high_impact_soon_detects_nearby_high_impact_usd_event() -> None:
     event_dt = datetime.now(UTC) + timedelta(minutes=5)
     xml = _calendar_xml("USD", "High", event_dt)

@@ -5,12 +5,28 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 import requests
 
-from config import MAX_NEWS_ITEMS, NEWS_FILTER_MINUTES, RSS_FEEDS
+from config import CALENDAR_TIMEZONE_NAME, MAX_NEWS_ITEMS, NEWS_FILTER_MINUTES, RSS_FEEDS
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _resolve_calendar_tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(CALENDAR_TIMEZONE_NAME)
+    except Exception:
+        LOGGER.warning(
+            "Invalid CALENDAR_TIMEZONE %r; falling back to UTC", CALENDAR_TIMEZONE_NAME
+        )
+        return ZoneInfo("UTC")
+
+
+# Timezone the economic-calendar feed timestamps are expressed in.
+# Configurable because feed providers differ; default UTC.
+CALENDAR_TZ = _resolve_calendar_tz()
 
 GOLD_KEYWORDS: tuple[str, ...] = (
     "gold",
@@ -213,7 +229,7 @@ def _parse_calendar_event_datetime(date_text: str, time_text: str) -> datetime |
     for fmt in formats:
         try:
             dt = datetime.strptime(candidate, fmt)
-            return dt.replace(tzinfo=UTC)
+            return dt.replace(tzinfo=CALENDAR_TZ).astimezone(UTC)
         except Exception:
             continue
     return None

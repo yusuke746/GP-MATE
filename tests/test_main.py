@@ -185,6 +185,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     )
 
     monkeypatch.setattr(main, "get_spread", lambda symbol: 10.0)
+    monkeypatch.setattr(main, "get_usd_jpy_rate", lambda: 150.0)
     monkeypatch.setattr(main, "check_filters", lambda **kwargs: SimpleNamespace(ok=True, reason="OK"))
     monkeypatch.setattr(
         main,
@@ -194,7 +195,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
             "ok": True,
             "action": "BUY",
             "lot": 0.01,
