@@ -63,6 +63,9 @@ BEAR_MAX_ATTEMPTS = 2
 JUDGE_MAX_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 0.4
 STRONGER_SIDE_CONFIDENCE_GAP = 0.05
+# Concession-count asymmetry treated as a meaningful signal of the weaker side.
+CONCESSION_ASYMMETRY_THRESHOLD = 3
+DEFAULT_MAX_ROUNDS = 2
 
 
 class UsageStats(TypedDict):
@@ -85,6 +88,7 @@ class DebateState(TypedDict):
     bull_arguments: Annotated[list[str], add]
     bear_arguments: Annotated[list[str], add]
     bull_conceded_points: Annotated[list[str], add]
+    bear_conceded_points: Annotated[list[str], add]
     round_count: int
     max_rounds: int
     bull_confidence: float
@@ -373,6 +377,7 @@ def build_skipped_debate_report(reason: str) -> dict[str, Any]:
         "bull_arguments": [],
         "bear_arguments": [],
         "bull_conceded_points": [],
+        "bear_conceded_points": [],
         "round_count": 0,
         "bull_confidence": 0.5,
         "bear_confidence": 0.5,
@@ -531,12 +536,13 @@ def _build_judge_summary_from_state(state: DebateState, reason: str) -> JudgeSum
     summary = _default_judge_summary()
 
     agreements: list[str] = []
-    conceded = state.get("bull_conceded_points", [])
-    if isinstance(conceded, list):
-        for item in conceded:
-            text = str(item or "").strip()
-            if text:
-                agreements.append(text)
+    for conceded_key in ("bull_conceded_points", "bear_conceded_points"):
+        conceded = state.get(conceded_key, [])
+        if isinstance(conceded, list):
+            for item in conceded:
+                text = str(item or "").strip()
+                if text:
+                    agreements.append(text)
 
     conflicts: list[str] = []
     bull_arguments = [str(x).strip() for x in state.get("bull_arguments", []) if str(x).strip()]
@@ -670,6 +676,53 @@ def _coerce_judge_summary(value: Any) -> JudgeSummary:
         },
         "stronger_side": stronger_side,
     }
+
+
+def _count_conceded(value: Any) -> int:
+    if not isinstance(value, list):
+        return 0
+    return len([x for x in value if str(x).strip()])
+
+
+def _stronger_side_from_concessions(state: DebateState) -> Literal["bull", "bear", "neutral"]:
+    """Infer the stronger side from concession asymmetry.
+
+    A side that concedes far more points than the other has effectively
+    acknowledged the opponent's case.
+    """
+    bull_conceded = _count_conceded(state.get("bull_conceded_points", []))
+    bear_conceded = _count_conceded(state.get("bear_conceded_points", []))
+
+    if bull_conceded - bear_conceded >= CONCESSION_ASYMMETRY_THRESHOLD:
+        return "bear"
+    if bear_conceded - bull_conceded >= CONCESSION_ASYMMETRY_THRESHOLD:
+        return "bull"
+    return "neutral"
+
+
+def _resolve_stronger_side(
+    state: DebateState,
+    judge_verdict: str,
+    judge_ok: bool,
+) -> Literal["bull", "bear", "neutral"]:
+    """Resolve the final stronger_side.
+
+    Priority:
+    1. Judge's argument-quality verdict (when the judge succeeded and picked a side).
+       Advocates are instructed to argue confidently, so their self-reported
+       confidence inflates on both sides and is the weakest signal.
+    2. Concession asymmetry (a side that conceded far more is weaker).
+    3. Self-reported confidence gap as the last fallback.
+    """
+    normalized_verdict = str(judge_verdict or "neutral").strip().lower()
+    if judge_ok and normalized_verdict in {"bull", "bear"}:
+        return cast(Literal["bull", "bear"], normalized_verdict)
+
+    concession_side = _stronger_side_from_concessions(state)
+    if concession_side != "neutral":
+        return concession_side
+
+    return _compute_stronger_side_from_state(state)
 
 
 def _compute_stronger_side_from_state(state: DebateState) -> Literal["bull", "bear", "neutral"]:
@@ -992,7 +1045,13 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
 
 def _invoke_judge_llm(state: DebateState) -> _JudgeResponse:
     system_prompt = (
-        "あなたはJudgeです。議論全体から合意点・対立点・confidence変遷・論拠の強さを抽出してください。"
+        "あなたはJudgeです。Bull/Bearの議論全体を裁定し、合意点・対立点と、"
+        "どちらの論拠が強いか(stronger_side)を判定してください。"
+        "stronger_sideは自己申告のconfidence数値に引きずられず、"
+        "論拠の具体性・相手の反論への応答力・譲歩の非対称性"
+        "（多く譲歩した側は劣勢）に基づいて判定すること。"
+        "両者が議論を通じてconfidenceを吊り上げるのは通常の挙動であり、判定材料として弱い。"
+        "本当に優劣がつかない場合のみneutralとすること。"
         "必ず次のJSON形式で返してください:"
         "{agreements: string[], conflicts: string[], stronger_side:'bull'|'bear'|'neutral'}"
     )
@@ -1003,6 +1062,7 @@ def _invoke_judge_llm(state: DebateState) -> _JudgeResponse:
         "bear_confidence": state["bear_confidence"],
         "round_count": state["round_count"],
         "bull_conceded_points": state["bull_conceded_points"],
+        "bear_conceded_points": state.get("bear_conceded_points", []),
         "bull_confidence_history": state["bull_confidence_history"],
         "bear_confidence_history": state["bear_confidence_history"],
         "macro_report": state.get("macro_report", {}),
@@ -1012,7 +1072,6 @@ def _invoke_judge_llm(state: DebateState) -> _JudgeResponse:
             "alignment": state["technical_report"].get("alignment", "MIXED"),
         },
     }
-    fallback = _default_judge_summary()
 
     if ChatOpenAI is None:
         summary = _build_judge_summary_from_state(
@@ -1151,12 +1210,15 @@ def _bear_node(state: DebateState, llm: RoleLLMCallable | None) -> dict[str, Any
         current = prev
     if role_ok and current < 0.3:
         current = 0.3
+    conceded = role_response.get("conceded_points", [])
+    conceded_points = [str(x) for x in conceded] if isinstance(conceded, list) else []
     usage = _usage_from_payload(role_response)
     return {
         "bear_confidence": current,
         "bear_confidence_history": [current],
         "bear_ok_history": [bool(role_response.get("ok", True))],
         "bear_arguments": [str(role_response.get("argument", ""))],
+        "bear_conceded_points": conceded_points,
         "round_count": int(state["round_count"]) + 1,
         "bear_ok": bool(state.get("bear_ok", True)) and role_ok,
         "bear_error": _is_nonempty_error(role_response.get("error", "")),
@@ -1168,18 +1230,21 @@ def _bear_node(state: DebateState, llm: RoleLLMCallable | None) -> dict[str, Any
 
 def _judge_node(state: DebateState, llm: RoleLLMCallable | None) -> dict[str, Any]:
     judge_payload = llm("judge", state) if llm is not None else _invoke_judge_llm(state)
+    judge_ok_now = bool(judge_payload.get("ok", True))
     summary = _coerce_judge_summary(judge_payload.get("judge_summary", judge_payload.get("summary", {})))
     summary["confidence_shift"] = _build_confidence_shift_from_state(state)
 
     llm_stronger = str(summary.get("stronger_side", "neutral") or "neutral")
-    algorithmic_stronger = _compute_stronger_side_from_state(state)
-    if llm_stronger in {"bull", "bear", "neutral"} and llm_stronger != algorithmic_stronger:
-        LOGGER.warning(
-            "Judge stronger_side conflicted with confidence diff; llm=%s algorithmic=%s",
+    resolved_stronger = _resolve_stronger_side(state, judge_verdict=llm_stronger, judge_ok=judge_ok_now)
+    if llm_stronger != resolved_stronger:
+        LOGGER.info(
+            "Judge stronger_side resolved: llm=%s resolved=%s (concessions bull=%s bear=%s)",
             llm_stronger,
-            algorithmic_stronger,
+            resolved_stronger,
+            _count_conceded(state.get("bull_conceded_points", [])),
+            _count_conceded(state.get("bear_conceded_points", [])),
         )
-    summary["stronger_side"] = algorithmic_stronger
+    summary["stronger_side"] = resolved_stronger
 
     technical = state.get("technical_report", {})
     if isinstance(technical, dict):
@@ -1188,9 +1253,9 @@ def _judge_node(state: DebateState, llm: RoleLLMCallable | None) -> dict[str, An
         alignment = str(technical.get("alignment", "MIXED") or "MIXED").upper()
         macro_bias = str((state.get("macro_report", {}) or {}).get("macro_bias", "NEUTRAL") or "NEUTRAL").upper()
         contradiction = False
-        if ("DOWN" in trend or signal == "SELL") and algorithmic_stronger == "bull":
+        if ("DOWN" in trend or signal == "SELL") and resolved_stronger == "bull":
             contradiction = True
-        if ("UP" in trend or signal == "BUY") and algorithmic_stronger == "bear":
+        if ("UP" in trend or signal == "BUY") and resolved_stronger == "bear":
             contradiction = True
         if contradiction:
             warn_msg = "テクニカル方向と議論結論が逆転"
@@ -1198,7 +1263,7 @@ def _judge_node(state: DebateState, llm: RoleLLMCallable | None) -> dict[str, An
                 "debate_graph contradiction: trend=%s signal=%s stronger_side=%s",
                 trend,
                 signal,
-                algorithmic_stronger,
+                resolved_stronger,
             )
             conflicts = summary.get("conflicts", [])
             if isinstance(conflicts, list) and warn_msg not in conflicts:
@@ -1221,7 +1286,6 @@ def _judge_node(state: DebateState, llm: RoleLLMCallable | None) -> dict[str, An
                 conflicts.append(divergent_msg)
                 summary["conflicts"] = [str(x) for x in conflicts]
 
-    judge_ok_now = bool(judge_payload.get("ok", True))
     temp_state = dict(state)
     temp_state["judge_ok"] = judge_ok_now
     incomplete = _build_incomplete_marker(cast(DebateState, temp_state))
@@ -1285,7 +1349,7 @@ def run_debate_graph(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
     macro_report: dict[str, Any] | None = None,
-    max_rounds: int = 3,
+    max_rounds: int = DEFAULT_MAX_ROUNDS,
     llm_override: RoleLLMCallable | None = None,
 ) -> dict[str, Any]:
     """Run Bull/Bear/Judge debate with LangGraph and return structured report.
@@ -1299,6 +1363,7 @@ def run_debate_graph(
         "bull_arguments": [],
         "bear_arguments": [],
         "bull_conceded_points": [],
+        "bear_conceded_points": [],
         "round_count": 0,
         "max_rounds": max(1, int(max_rounds)),
         "bull_confidence": 0.5,
@@ -1324,14 +1389,16 @@ def run_debate_graph(
         app = _build_graph(llm_override)
         final_state = app.invoke(initial_state)
 
+        # stronger_side was already resolved in the judge node (judge verdict ->
+        # concession asymmetry -> confidence gap); do not override it here.
         summary = _coerce_judge_summary(final_state.get("judge_summary", {}))
         summary["confidence_shift"] = _build_confidence_shift_from_state(cast(DebateState, final_state))
-        summary["stronger_side"] = _compute_stronger_side_from_state(cast(DebateState, final_state))
 
         return {
             "bull_arguments": list(final_state.get("bull_arguments", [])),
             "bear_arguments": list(final_state.get("bear_arguments", [])),
             "bull_conceded_points": list(final_state.get("bull_conceded_points", [])),
+            "bear_conceded_points": list(final_state.get("bear_conceded_points", [])),
             "round_count": int(final_state.get("round_count", 0) or 0),
             "bull_confidence": float(final_state.get("bull_confidence", 0.0) or 0.0),
             "bear_confidence": float(final_state.get("bear_confidence", 0.0) or 0.0),
@@ -1364,6 +1431,7 @@ def run_debate_graph(
             "bull_arguments": ["Bull分析失敗"],
             "bear_arguments": ["Bear分析失敗"],
             "bull_conceded_points": [],
+            "bear_conceded_points": [],
             "round_count": 0,
             "bull_confidence": 0.0,
             "bear_confidence": 0.0,

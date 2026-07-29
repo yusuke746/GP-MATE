@@ -15,7 +15,8 @@ SYSTEM_PROMPT = (
     "macro_context.macro_vs_position が AGAINST かつ macro_confidence が高い場合は、"
     "保有方向にマクロの逆風が強いことを意味するため、CLOSE寄りの検討材料として重視してください。"
     "ただし逆風が単一材料のみで確信が弱い場合はHOLDを維持してください。"
-    "confidenceが閾値未満なら必ずHOLDにしてください。"
+    "confidenceは判断の確からしさ(0-1)を正直に申告すること。"
+    "決済可否の閾値判定はシステム側で行うため、閾値を意識して数値を調整しないこと。"
     "必ず evaluate_position_action 関数を呼び出して返答してください。"
 )
 
@@ -88,8 +89,10 @@ def evaluate_position(
         "macro_context": macro_context,
         "debate": debate_report,
         "judge_summary": judge_summary,
+        # The confidence threshold is intentionally NOT exposed to the model:
+        # it is enforced in code below, and telling the model the cutoff lets
+        # it anchor its self-reported confidence around it.
         "constraints": {
-            "confidence_threshold": confidence_threshold,
             "symbol": str(position_context.get("symbol") or SYMBOL),
         },
     }

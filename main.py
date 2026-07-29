@@ -89,6 +89,7 @@ def python_runtime_notice() -> str:
 TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "timestamp_utc",
     "deal_id",
+    "position_id",
     "symbol",
     "action",
     "entry_price",
@@ -306,6 +307,7 @@ def sync_closed_trades() -> int:
         row = {
             "timestamp_utc": str(deal.get("time_utc", datetime.now(UTC).isoformat())),
             "deal_id": deal_id,
+            "position_id": str(deal.get("position_id", "") or ""),
             "symbol": str(deal.get("symbol", SYMBOL)),
             "action": str(deal.get("action", "HOLD")),
             "entry_price": deal.get("entry_price", ""),
@@ -1042,6 +1044,7 @@ def run_once(
             result = {
                 "timestamp_utc": now_iso,
                 "deal_id": str(close_result.get("deal", "") or ""),
+                "position_id": str(position_context.get("ticket", "") or ""),
                 "symbol": SYMBOL,
                 "action": evaluation_action,
                 "entry_price": float(position_context.get("price_open", 0.0) or 0.0),
@@ -1144,7 +1147,10 @@ def run_once(
 
         result = {
             "timestamp_utc": now_iso,
-            "deal_id": "",
+            "deal_id": str(order_result.get("deal", "") or ""),
+            # MT5 market entries: the position ticket equals the opening order
+            # ticket, which lets analysis join this decision to its closed deal.
+            "position_id": str(order_result.get("order", "") or ""),
             "symbol": SYMBOL,
             "action": final_action,
             "entry_price": "",

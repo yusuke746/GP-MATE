@@ -51,6 +51,7 @@ def _build_log_row(position_context: dict[str, Any], breakeven_log: dict[str, An
     return {
         "timestamp_utc": timestamp_utc,
         "deal_id": "",
+        "position_id": str(position_context.get("ticket", "") or ""),
         "symbol": SYMBOL,
         "action": "HOLD",
         "entry_price": float(position_context.get("price_open", 0.0) or 0.0),

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Final, Literal, TypedDict
 
 from agents.base import analysis_model, get_default_client
 from agents.data.fred_client import MacroData
+
+LOGGER = logging.getLogger(__name__)
 
 MACRO_BIAS_VALUES: Final[tuple[Literal["BULLISH", "BEARISH", "NEUTRAL"], ...]] = (
     "BULLISH",
@@ -15,7 +18,9 @@ MACRO_BIAS_VALUES: Final[tuple[Literal["BULLISH", "BEARISH", "NEUTRAL"], ...]] =
 SYSTEM_PROMPT = (
     "あなたはGOLDのマクロ環境を評価する分析官です。"
     "FREDデータだけを根拠に、macro_bias/confidence/key_drivers/reasoningをJSONで返してください。"
-    "最重要の主軸はDTWEXBGSの方向です。DTWEXBGSは広義ドル指数(2006=100基準)であり、"
+    "最重要の主軸はDTWEXBGSの方向です。入力のfred_data.dxyがDTWEXBGSそのもの"
+    "（キー名がdxyなだけでICE-DXYではない）なので、『DTWEXBGSが与えられていない』と判断しないこと。"
+    "DTWEXBGSは広義ドル指数(2006=100基準)であり、"
     "一般的なICE-DXY(90-110)とは水準が異なるため、絶対値ではなく方向(UP/DOWN/FLAT)だけで判断してください。"
     "ドル安(DOWN)は金にポジティブ、ドル高(UP)は金にネガティブです。"
     "FEDFUNDSの方向も重視してください。利下げ方向は金にポジティブ、利上げ/据え置き長期化はネガティブです。"
@@ -163,7 +168,20 @@ def _merge_llm_result(
     baseline: MacroAnalysisResult,
     llm_payload: dict[str, Any],
 ) -> MacroAnalysisResult:
-    reasoning = str(llm_payload.get("reasoning") or baseline["reasoning"]).strip()
+    # The rule-based bias/confidence are authoritative. The LLM narrative is
+    # adopted only when its own conclusion agrees with that bias — otherwise the
+    # final payload would state e.g. bias=BULLISH with a reasoning text that
+    # concludes NEUTRAL, and downstream agents cannot tell which to trust.
+    llm_bias = _normalize_bias(llm_payload.get("macro_bias"))
+    reasoning = str(llm_payload.get("reasoning") or "").strip()
+    if reasoning and llm_bias != baseline["macro_bias"]:
+        LOGGER.warning(
+            "macro_analyst: LLM bias %s disagrees with rule-based bias %s; keeping rule-based reasoning",
+            llm_bias,
+            baseline["macro_bias"],
+        )
+        reasoning = ""
+
     key_drivers_raw = llm_payload.get("key_drivers", baseline["key_drivers"])
     key_drivers = [str(item) for item in key_drivers_raw] if isinstance(key_drivers_raw, list) else baseline["key_drivers"]
 
@@ -199,7 +217,7 @@ def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
         {
             "fred_data": fred_data,
             "requirements": {
-                "dxy_priority": "DTWEXBGSの方向を最重要視し、絶対値ではなく方向で判定する",
+                "dxy_priority": "fred_data.dxy(=DTWEXBGS)の方向を最重要視し、絶対値ではなく方向で判定する",
                 "real_rate_caveat": "2025-2026年は実質金利と金の逆相関が崩れているため単純弱気に使わない",
                 "output_format": {
                     "macro_bias": MACRO_BIAS_VALUES,

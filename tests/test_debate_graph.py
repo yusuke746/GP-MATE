@@ -397,7 +397,7 @@ def test_failed_zero_confidence_round_is_excluded_from_stronger_side() -> None:
             "judge_summary": {
                 "agreements": [],
                 "conflicts": ["方向"],
-                "stronger_side": "bull",
+                "stronger_side": "neutral",
             },
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             "ok": True,
@@ -411,6 +411,9 @@ def test_failed_zero_confidence_round_is_excluded_from_stronger_side() -> None:
         llm_override=fake_llm,
     )
 
+    # Judge is neutral and there is no concession asymmetry, so the
+    # confidence fallback applies; the failed bear round contributes no valid
+    # confidence, which resolves to neutral rather than an artificial bull win.
     assert report["judge_summary"]["stronger_side"] == "neutral"
 
 
@@ -733,7 +736,9 @@ def test_confidence_shift_uses_state_history_not_judge_generated_values() -> Non
     assert shift["bear"] == report["bear_confidence_history"]
 
 
-def test_stronger_side_is_bull_when_bull_confidence_is_higher() -> None:
+def test_judge_verdict_overrides_confidence_gap() -> None:
+    # Self-reported confidence favors bull, but the judge's argument-quality
+    # verdict (bear) takes priority under the new resolution order.
     def fake_llm(role: str, state: dict[str, Any]) -> dict[str, Any]:
         if role == "bull":
             return {
@@ -766,7 +771,79 @@ def test_stronger_side_is_bull_when_bull_confidence_is_higher() -> None:
     )
 
     assert report["bull_confidence"] > report["bear_confidence"]
+    assert report["judge_summary"]["stronger_side"] == "bear"
+
+
+def test_confidence_gap_decides_when_judge_is_neutral() -> None:
+    def fake_llm(role: str, state: dict[str, Any]) -> dict[str, Any]:
+        if role == "bull":
+            return {
+                "argument": "bull argument",
+                "confidence": 0.82,
+                "conceded_points": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        if role == "bear":
+            return {
+                "argument": "bear argument",
+                "confidence": 0.55,
+                "conceded_points": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        return {
+            "judge_summary": {
+                "agreements": [],
+                "conflicts": ["方向"],
+                "stronger_side": "neutral",
+            },
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    report = run_debate_graph(
+        technical_report={"signal": "BUY"},
+        sentiment_report={"score": 0.0},
+        max_rounds=2,
+        llm_override=fake_llm,
+    )
+
     assert report["judge_summary"]["stronger_side"] == "bull"
+
+
+def test_concession_asymmetry_decides_when_judge_is_neutral() -> None:
+    # Confidences are level and the judge is neutral, but bull conceded many
+    # points while bear conceded none -> bear's case prevailed.
+    def fake_llm(role: str, state: dict[str, Any]) -> dict[str, Any]:
+        if role == "bull":
+            return {
+                "argument": "bull argument",
+                "confidence": 0.6,
+                "conceded_points": ["譲歩1", "譲歩2", "譲歩3"],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        if role == "bear":
+            return {
+                "argument": "bear argument",
+                "confidence": 0.6,
+                "conceded_points": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        return {
+            "judge_summary": {
+                "agreements": [],
+                "conflicts": ["方向"],
+                "stronger_side": "neutral",
+            },
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    report = run_debate_graph(
+        technical_report={"signal": "NEUTRAL"},
+        sentiment_report={"score": 0.0},
+        max_rounds=2,
+        llm_override=fake_llm,
+    )
+
+    assert report["judge_summary"]["stronger_side"] == "bear"
 
 
 def test_stronger_side_becomes_neutral_when_confidence_gap_is_not_clear() -> None:
@@ -789,7 +866,7 @@ def test_stronger_side_becomes_neutral_when_confidence_gap_is_not_clear() -> Non
             "judge_summary": {
                 "agreements": [],
                 "conflicts": ["方向"],
-                "stronger_side": "bull",
+                "stronger_side": "neutral",
             },
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }
