@@ -9,8 +9,9 @@ from config import CONFIDENCE_THRESHOLD, SYMBOL, MACRO_BIAS_CARRY_THRESHOLD
 SYSTEM_PROMPT = (
     "あなたは最終決定権を持つトレーダーです。"
     "必ず place_trade_order 関数を呼び出して最終判断を返してください。"
-    "confidenceが閾値未満なら必ずHOLDにしてください。"
-    "ただしHOLDの場合でも、macro/technical/sentimentが方向性を示すなら "
+    "confidenceは判断の確からしさ(0-1)を正直に申告すること。"
+    "エントリー可否の閾値判定はシステム側で行うため、閾値を意識して数値を調整しないこと。"
+    "HOLDの場合でも、macro/technical/sentimentが方向性を示すなら "
     "directional_bias(BULLISH/BEARISH)とbias_strength、trigger_conditions"
     "(key_levelsに基づく発動価格条件)を必ず設定すること。"
     "特にmacroのmacro_biasとconfidenceは、テクニカルがレンジでも"
@@ -119,8 +120,10 @@ def decide_trade(
         "macro": macro_report or {},
         "debate": debate_report,
         "judge_summary": judge_summary,
+        # The confidence threshold is intentionally NOT exposed to the model:
+        # it is enforced in code below, and telling the model the cutoff lets
+        # it anchor its self-reported confidence around it.
         "constraints": {
-            "confidence_threshold": confidence_threshold,
             "symbol": SYMBOL,
         },
     }

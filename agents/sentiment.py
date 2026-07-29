@@ -6,8 +6,11 @@ from typing import Any
 from agents.base import analysis_model, get_default_client
 
 SYSTEM_PROMPT = (
-    "あなたは金融ニュースのセンチメント専門家です。"
-    "ニュース見出しを評価し、score/dominant_news/reasoningをJSONで返してください。"
+    "あなたはGOLD(XAU/USD)のニュースセンチメント専門家です。"
+    "各ニュースが『金価格にとって』強気か弱気かを評価し、"
+    "score(-1〜1、金にとっての方向)/dominant_news/reasoningをJSONで返してください。"
+    "注意: 株高・リスクオン材料は株式には強気でも、安全資産の金には中立〜弱気になり得る。"
+    "必ず金価格への影響として評価すること。"
 )
 
 FALLBACK_RESPONSE: dict[str, Any] = {
@@ -40,7 +43,7 @@ def analyze_sentiment(news_items: list[dict[str, Any]]) -> dict[str, Any]:
         }
 
     user_prompt = (
-        "以下ニュースを強気/中立/弱気で評価し、score(-1~1)を算出してください。\n"
+        "以下ニュースが金(XAU/USD)にとって強気/中立/弱気かを評価し、score(-1~1)を算出してください。\n"
         f"{json.dumps(news_items, ensure_ascii=False)}"
     )
 

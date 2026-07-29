@@ -8,6 +8,8 @@ from agents.base import analysis_model, get_default_client
 SYSTEM_PROMPT = (
     "あなたは経験20年のテクニカルアナリストです。"
     "与えられたデータのみで判断し、必ずJSONで返してください。"
+    "出力JSONのトップレベルには必ず reasoning キー（日本語の説明文字列）を含めること。"
+    "summary や details など別のキー名に説明を書いてはならない。"
 )
 
 TIMEFRAME_TREND_VALUES: Final[tuple[Literal["UP", "DOWN", "RANGE"], ...]] = (
@@ -348,6 +350,7 @@ def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
             "重要: D1は大局、H4/H1は執行足として扱い、alignmentをALIGNED/DIVERGENT/MIXEDで要約してください。\n"
             "D1が無い/壊れている場合は、執行足のみで安全側に判断してください。\n"
             "注意: tp_reference_only は利確ターゲット専用であり、方向判断には使わないでください。\n"
+            '出力形式: {"alignment": "ALIGNED|DIVERGENT|MIXED", "reasoning": "日本語の説明"} のJSONのみ。\n'
             f"{json.dumps(direction_payload, ensure_ascii=False)}"
         )
     else:
@@ -374,7 +377,10 @@ def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
     merged["signal"] = baseline["signal"]
     merged["rsi_14"] = baseline["rsi_14"]
     merged["key_levels"] = baseline["key_levels"]
-    merged["reasoning"] = str(payload.get("reasoning", baseline["reasoning"]))
+    # Some models put their narrative under "summary" despite the format
+    # instruction; accept it as a fallback so the LLM call is not wasted.
+    llm_reasoning = str(payload.get("reasoning") or payload.get("summary") or "").strip()
+    merged["reasoning"] = llm_reasoning or baseline["reasoning"]
     merged["d1_trend"] = baseline["d1_trend"]
     merged["execution_trend"] = baseline["execution_trend"]
     merged["alignment"] = baseline["alignment"]
