@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,9 @@ import pandas as pd
 PF_STAGE_THRESHOLD = 1.3
 MAX_DD_STAGE_THRESHOLD = 20.0
 MIN_TRADES_STAGE_THRESHOLD = 30
+
+# Confidence-band edges for threshold calibration reporting.
+CONFIDENCE_BAND_EDGES: tuple[float, ...] = (0.0, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 1.0)
 
 PNL_COLUMN_CANDIDATES: tuple[str, ...] = (
     "pnl",
@@ -179,6 +183,244 @@ def daily_summary(df: pd.DataFrame) -> pd.DataFrame:
     return grouped[["date", "daily_pnl", "trades", "win_rate"]]
 
 
+def load_raw_log(csv_path: str) -> pd.DataFrame:
+    """Load the full trade log without filtering (all row types)."""
+    path = Path(csv_path)
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(path, dtype=str).fillna("")
+    if "timestamp_utc" in df.columns:
+        df["_ts"] = _safe_to_datetime(df["timestamp_utc"])
+    else:
+        df["_ts"] = pd.NaT
+    return df
+
+
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    if name in df.columns:
+        return df[name].astype(str)
+    return pd.Series([""] * len(df), index=df.index, dtype=str)
+
+
+def link_decisions_to_outcomes(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Join executed entry decisions to their realized (closed) PnL.
+
+    Matching:
+    1. Exact join on position_id when both rows carry it.
+    2. Fallback: each closed row is matched to the latest earlier unmatched
+       entry decision (valid because MAX_POSITIONS=1 keeps trades sequential).
+
+    Returns a DataFrame with one row per executed decision:
+    timestamp_utc, action, confidence, realized_pnl (NaN if still open /
+    unmatched), matched_by ('position_id' | 'sequence' | '').
+    """
+    if raw_df.empty:
+        return pd.DataFrame(
+            columns=["timestamp_utc", "action", "confidence", "realized_pnl", "matched_by"]
+        )
+
+    action = _col(raw_df, "action").str.upper().str.strip()
+    reasoning = _col(raw_df, "reasoning").str.strip()
+    order_success = _col(raw_df, "order_success").str.lower() == "true"
+
+    decisions = raw_df[
+        action.isin(["BUY", "SELL"]) & order_success & (reasoning != "closed_trade_sync")
+    ].copy()
+    outcomes = raw_df[
+        (reasoning == "closed_trade_sync")
+        & (pd.to_numeric(_col(raw_df, "pnl"), errors="coerce").notna())
+    ].copy()
+
+    decisions["_confidence"] = pd.to_numeric(_col(decisions, "confidence"), errors="coerce")
+    decisions["_position_id"] = _col(decisions, "position_id").str.strip()
+    decisions["_realized_pnl"] = float("nan")
+    decisions["_matched_by"] = ""
+
+    outcomes["_position_id"] = _col(outcomes, "position_id").str.strip()
+    outcomes["_pnl"] = pd.to_numeric(_col(outcomes, "pnl"), errors="coerce")
+    outcomes = outcomes.sort_values("_ts", kind="stable")
+
+    matched_outcome_indices: set[Any] = set()
+
+    # Pass 1: exact position_id join. A position may close via multiple deals
+    # (partial closes); sum the realized PnL over all matching closed rows.
+    for idx, decision in decisions.iterrows():
+        pos_id = str(decision["_position_id"] or "")
+        if not pos_id:
+            continue
+        hits = outcomes[(outcomes["_position_id"] == pos_id) & (~outcomes.index.isin(matched_outcome_indices))]
+        if hits.empty:
+            continue
+        decisions.at[idx, "_realized_pnl"] = float(hits["_pnl"].sum())
+        decisions.at[idx, "_matched_by"] = "position_id"
+        matched_outcome_indices.update(hits.index.tolist())
+
+    # Pass 2: sequential fallback for rows without a usable position_id.
+    unmatched_decisions = decisions[decisions["_matched_by"] == ""].sort_values("_ts", kind="stable")
+    for out_idx, outcome in outcomes.iterrows():
+        if out_idx in matched_outcome_indices:
+            continue
+        candidates = unmatched_decisions[
+            (unmatched_decisions["_matched_by"] == "")
+            & (unmatched_decisions["_ts"].notna())
+            & (unmatched_decisions["_ts"] <= outcome["_ts"])
+        ]
+        if candidates.empty:
+            continue
+        target_idx = candidates.index[-1]
+        decisions.at[target_idx, "_realized_pnl"] = float(outcome["_pnl"])
+        decisions.at[target_idx, "_matched_by"] = "sequence"
+        unmatched_decisions.at[target_idx, "_matched_by"] = "sequence"
+        matched_outcome_indices.add(out_idx)
+
+    linked = pd.DataFrame(
+        {
+            "timestamp_utc": decisions["_ts"],
+            "action": _col(decisions, "action").str.upper().str.strip(),
+            "confidence": decisions["_confidence"],
+            "realized_pnl": decisions["_realized_pnl"],
+            "matched_by": decisions["_matched_by"],
+        }
+    ).sort_values("timestamp_utc", kind="stable")
+    return linked.reset_index(drop=True)
+
+
+def _band_label(low: float, high: float) -> str:
+    return f"[{low:.2f}-{high:.2f})"
+
+
+def confidence_band_summary(
+    linked: pd.DataFrame,
+    edges: tuple[float, ...] = CONFIDENCE_BAND_EDGES,
+) -> pd.DataFrame:
+    """Aggregate realized results per confidence band.
+
+    Only decisions with a realized outcome contribute to win_rate/PF; the
+    `open_or_unmatched` column shows how many are excluded per band.
+    """
+    columns = [
+        "band",
+        "decisions",
+        "settled",
+        "open_or_unmatched",
+        "wins",
+        "win_rate",
+        "total_pnl",
+        "avg_pnl",
+        "profit_factor",
+    ]
+    if linked.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    for low, high in zip(edges[:-1], edges[1:]):
+        upper_inclusive = high >= edges[-1]
+        conf = linked["confidence"]
+        in_band = (conf >= low) & ((conf <= high) if upper_inclusive else (conf < high))
+        band_df = linked[in_band]
+        settled = band_df[band_df["realized_pnl"].notna()]
+        pnl = settled["realized_pnl"]
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl < 0]
+
+        if float(losses.sum()) < 0:
+            pf: float | None = float(wins.sum()) / abs(float(losses.sum()))
+        elif float(wins.sum()) > 0:
+            pf = float("inf")
+        else:
+            pf = None
+
+        rows.append(
+            {
+                "band": _band_label(low, high),
+                "decisions": int(len(band_df)),
+                "settled": int(len(settled)),
+                "open_or_unmatched": int(len(band_df) - len(settled)),
+                "wins": int(len(wins)),
+                "win_rate": (len(wins) / len(settled) * 100.0) if len(settled) else 0.0,
+                "total_pnl": float(pnl.sum()) if len(settled) else 0.0,
+                "avg_pnl": float(pnl.mean()) if len(settled) else 0.0,
+                "profit_factor": pf,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def threshold_blocked_summary(
+    raw_df: pd.DataFrame,
+    edges: tuple[float, ...] = CONFIDENCE_BAND_EDGES,
+) -> pd.DataFrame:
+    """Count HOLD decisions per confidence band.
+
+    `with_bias` counts HOLDs where the trader still reported a directional
+    bias — the candidates a lower threshold would most likely have converted
+    into trades.
+    """
+    columns = ["band", "holds", "with_bias"]
+    if raw_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    action = _col(raw_df, "action").str.upper().str.strip()
+    reasoning = _col(raw_df, "reasoning").str.strip()
+    holds = raw_df[(action == "HOLD") & (reasoning != "closed_trade_sync") & (reasoning != "breakeven_monitor")].copy()
+    holds["_confidence"] = pd.to_numeric(_col(holds, "confidence"), errors="coerce")
+    holds["_bias"] = _col(holds, "directional_bias").str.upper().str.strip()
+    holds = holds[holds["_confidence"].notna()]
+
+    rows: list[dict[str, Any]] = []
+    for low, high in zip(edges[:-1], edges[1:]):
+        upper_inclusive = high >= edges[-1]
+        conf = holds["_confidence"]
+        in_band = (conf >= low) & ((conf <= high) if upper_inclusive else (conf < high))
+        band_df = holds[in_band]
+        rows.append(
+            {
+                "band": _band_label(low, high),
+                "holds": int(len(band_df)),
+                "with_bias": int((band_df["_bias"].isin(["BULLISH", "BEARISH"])).sum()),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def print_confidence_report(csv_path: str) -> None:
+    raw = load_raw_log(csv_path)
+    linked = link_decisions_to_outcomes(raw)
+    bands = confidence_band_summary(linked)
+    blocked = threshold_blocked_summary(raw)
+
+    settled_total = int(linked["realized_pnl"].notna().sum()) if not linked.empty else 0
+
+    print("=== GP-MATE Confidence Calibration Report ===")
+    print(f"CSV: {csv_path}")
+    print("")
+    print(f"Executed decisions : {len(linked)}")
+    print(f"Settled (matched)  : {settled_total}")
+    print("")
+    print("[Realized results by confidence band]")
+    if bands.empty or bands["decisions"].sum() == 0:
+        print("No executed decisions yet")
+    else:
+        display = bands.copy()
+        display["win_rate"] = display["win_rate"].map(lambda v: f"{v:.1f}%")
+        display["profit_factor"] = display["profit_factor"].map(
+            lambda v: "N/A" if v is None or pd.isna(v) else ("inf" if v == float("inf") else f"{v:.2f}")
+        )
+        print(display.to_string(index=False))
+    print("")
+    print("[HOLD decisions by confidence band]")
+    if blocked.empty or blocked["holds"].sum() == 0:
+        print("No HOLD decisions yet")
+    else:
+        print(blocked.to_string(index=False))
+    print("")
+    if settled_total < MIN_TRADES_STAGE_THRESHOLD:
+        print(
+            f"注意: 決済済みサンプルが{settled_total}件と少なく（目安 {MIN_TRADES_STAGE_THRESHOLD}件以上）、"
+            "帯別の勝率/PFはまだ統計的に信頼できません。閾値変更は保留を推奨。"
+        )
+
+
 def _status_line(name: str, ok: bool, detail: str) -> str:
     marker = "✓" if ok else "-"
     return f"{marker} {name}: {detail}"
@@ -230,4 +472,11 @@ def print_report(csv_path: str) -> None:
 
 if __name__ == "__main__":
     default_csv = Path(__file__).resolve().parent.parent / "logs" / "trade_log.csv"
-    print_report(str(default_csv))
+    args = sys.argv[1:]
+    csv_arg = next((a for a in args if not a.startswith("-")), str(default_csv))
+    if "--confidence" in args:
+        print_confidence_report(csv_arg)
+    else:
+        print_report(csv_arg)
+        print("")
+        print_confidence_report(csv_arg)
