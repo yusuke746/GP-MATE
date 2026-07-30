@@ -39,6 +39,8 @@ BULL_SYSTEM_PROMPT = (
     "あなたは必ず【Bull】の立場です。相手の主張を引用・反論する際、相手の文章を冒頭からそのまま書き写さないこと。"
     "相手の論点を要約して引用し、それに対するBullの立場からの反論を述べること。自分がBullであることを絶対に見失わないこと。"
     "相手(Bear)の主張を名指しで引用し、必ず『相手は○○と言うが、△△を見落としている』形式で反論すること。"
+    "ただし初回ラウンド（相手の主張がまだ存在しない場合）は反論形式を使わず、"
+    "存在しない主張を捏造せず、与えられた材料だけから自分の主張を構築すること。"
     "マクロと多時間軸も強気材料として解釈し、マクロがBEARISHでも『織り込み済み』や『逆風は過剰評価』として反論してよい。"
     "D1が下でもH4/H1が上向きなら、押し目からの反発や短期優位として主張してよい。"
     "JSONのみで返答し、必ず次のキーを含めること:"
@@ -53,6 +55,8 @@ BEAR_SYSTEM_PROMPT = (
     "confidenceは必ず0.3以上で答え、0.0や極端な棄権は禁止。"
     "相手(Bull)の主張の弱点を必ず1つ以上、名指しで突くこと。"
     "必ず『相手は○○と言うが、△△を見落としている』形式で反論すること。"
+    "ただし相手の主張がまだ存在しない場合は反論形式を使わず、"
+    "存在しない主張を捏造せず、与えられた材料だけから自分の主張を構築すること。"
     "マクロと多時間軸も弱気材料として解釈し、マクロがBULLISHでも実需やヘッジ需要の鈍化として反論してよい。"
     "D1下降トレンド中のH4/H1上昇はダマシや戻り売り候補として主張してよい。"
     "JSONのみで返答し、必ず次のキーを含めること:"
@@ -678,10 +682,20 @@ def _coerce_judge_summary(value: Any) -> JudgeSummary:
     }
 
 
+def _normalize_concession_key(value: Any) -> str:
+    text = str(value or "").strip()
+    # Cheap normalization so "…点は認める。" round-to-round repeats collapse.
+    for token in ("。", "、", " ", "　", "点は認める", "は認める", "認める"):
+        text = text.replace(token, "")
+    return text
+
+
 def _count_conceded(value: Any) -> int:
+    """Count unique concessions (advocates tend to repeat the same concession
+    each round, which would inflate the asymmetry tiebreaker)."""
     if not isinstance(value, list):
         return 0
-    return len([x for x in value if str(x).strip()])
+    return len({key for key in (_normalize_concession_key(x) for x in value) if key})
 
 
 def _stronger_side_from_concessions(state: DebateState) -> Literal["bull", "bear", "neutral"]:
@@ -890,20 +904,34 @@ def _build_horizontal_levels_context(technical_report: dict[str, Any]) -> dict[s
     }
 
 
+def _build_opponent_context(opponent_label: str, latest_argument: str) -> tuple[str, str]:
+    """Return (latest_argument_text, context_block) for the role prompt.
+
+    When the opponent has not argued yet (first round), say so explicitly —
+    otherwise the rebuttal-format instruction pushes the model to fabricate an
+    opponent quote out of the placeholder text.
+    """
+    text = str(latest_argument or "").strip()
+    if not text:
+        note = (
+            f"初回ラウンド: 相手({opponent_label})の主張はまだ存在しない。"
+            "反論形式を使わず、自分の主張を材料から構築すること。"
+        )
+        return note, note
+    block = (
+        f"--- 相手({opponent_label})の主張ここから ---\n"
+        f"{text}\n"
+        f"--- 相手({opponent_label})の主張ここまで ---"
+    )
+    return text, block
+
+
 def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
-    latest_bear = state["bear_arguments"][-1] if state["bear_arguments"] else "初回ラウンド。"
-    latest_bull = state["bull_arguments"][-1] if state["bull_arguments"] else "初回ラウンド。"
+    latest_bear_raw = state["bear_arguments"][-1] if state["bear_arguments"] else ""
+    latest_bull_raw = state["bull_arguments"][-1] if state["bull_arguments"] else ""
+    latest_bear, bear_opponent_context = _build_opponent_context("Bear", latest_bear_raw)
+    latest_bull, bull_opponent_context = _build_opponent_context("Bull", latest_bull_raw)
     horizontal_levels_context = _build_horizontal_levels_context(state["technical_report"])
-    bear_opponent_context = (
-        "--- 相手(Bear)の主張ここから ---\n"
-        f"{latest_bear}\n"
-        "--- 相手(Bear)の主張ここまで ---"
-    )
-    bull_opponent_context = (
-        "--- 相手(Bull)の主張ここから ---\n"
-        f"{latest_bull}\n"
-        "--- 相手(Bull)の主張ここまで ---"
-    )
 
     if role == "bull":
         system_prompt = BULL_SYSTEM_PROMPT
