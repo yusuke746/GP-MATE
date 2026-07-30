@@ -1493,3 +1493,30 @@ def test_judge_parse_failure_logs_raw_focus(monkeypatch, caplog) -> None:
     assert judge["ok"] is False
     assert "json parse error" in judge["error"]
     assert any("raw_focus=" in rec.message for rec in caplog.records)
+
+
+def test_build_opponent_context_first_round_has_no_fabricated_quote() -> None:
+    latest, context = debate_graph._build_opponent_context("Bear", "")
+
+    assert "初回ラウンド" in latest
+    assert "反論形式を使わず" in context
+    assert "主張ここから" not in context
+
+
+def test_build_opponent_context_quotes_existing_argument() -> None:
+    latest, context = debate_graph._build_opponent_context("Bear", "下落継続を主張する。")
+
+    assert latest == "下落継続を主張する。"
+    assert "--- 相手(Bear)の主張ここから ---" in context
+    assert "下落継続を主張する。" in context
+
+
+def test_count_conceded_deduplicates_repeated_concessions() -> None:
+    conceded = [
+        "H4/H1の執行足が現時点でDOWNである点は認める。",
+        "H4/H1の執行足が現時点でDOWNである点は認める",
+        "H4/H1の執行足が現時点でDOWNであるは認める。",
+        "4022〜4042には強い戻り抵抗がある。",
+    ]
+
+    assert debate_graph._count_conceded(conceded) == 2
