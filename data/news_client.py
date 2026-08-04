@@ -188,6 +188,7 @@ def fetch_news(hours: int = 24, max_items: int = MAX_NEWS_ITEMS) -> list[dict[st
         LOGGER.warning("RSS feed skipped this cycle: %s", ", ".join(skipped_feeds))
 
     filtered: list[dict[str, Any]] = []
+    dropped_undated = 0
     for item in _deduplicate_by_title(all_items):
         title = str(item.get("title") or "")
         if not _contains_keywords(title, GOLD_KEYWORDS):
@@ -198,10 +199,19 @@ def fetch_news(hours: int = 24, max_items: int = MAX_NEWS_ITEMS) -> list[dict[st
         if published_at is not None and published_at.tzinfo is None:
             published_at = published_at.replace(tzinfo=UTC)
 
-        if published_at is not None and published_at < oldest:
+        # Undated items cannot be age-checked and were observed persisting in
+        # the sentiment input for weeks; treat them as stale and drop them.
+        if published_at is None:
+            dropped_undated += 1
+            continue
+
+        if published_at < oldest:
             continue
 
         filtered.append(item)
+
+    if dropped_undated:
+        LOGGER.info("fetch_news: dropped %d undated item(s) as unverifiable/stale", dropped_undated)
 
     filtered.sort(key=lambda x: str(x.get("published_at") or ""), reverse=True)
     result = filtered[:max_items]

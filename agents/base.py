@@ -2,12 +2,47 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from config import MODEL_ANALYSIS, MODEL_DECISION, OPENAI_API_KEY
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _parse_json_object(raw_text: str) -> dict[str, Any] | None:
+    """Parse a JSON object, tolerating markdown fences and surrounding prose.
+
+    Models occasionally wrap output in ```json fences even when a JSON
+    response format is requested; without this tolerance the whole analysis
+    silently degrades to its fallback.
+    """
+    text = raw_text.strip()
+    if not text:
+        return None
+
+    candidates: list[str] = [text]
+
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    for chunk in fenced:
+        stripped = chunk.strip()
+        if stripped:
+            candidates.append(stripped)
+
+    first_obj = text.find("{")
+    last_obj = text.rfind("}")
+    if first_obj != -1 and first_obj < last_obj:
+        candidates.append(text[first_obj : last_obj + 1])
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 try:
     from openai import OpenAI  # type: ignore[import-not-found]
@@ -79,10 +114,9 @@ class LLMClient:
                     error="empty output",
                 )
 
-            try:
-                payload = json.loads(output_text)
-            except json.JSONDecodeError as exc:
-                LOGGER.warning("LLM JSON parse failed: %s", exc)
+            payload = _parse_json_object(output_text)
+            if payload is None:
+                LOGGER.warning("LLM JSON parse failed: head=%s", output_text[:200])
                 return LLMResult(
                     ok=False,
                     payload=fallback_payload,

@@ -277,3 +277,77 @@ def test_llm_call_json_returns_not_ok_on_json_parse_error() -> None:
     assert not result.ok
     assert result.error == "json parse error"
     assert result.payload == fallback
+
+
+def test_llm_call_json_parses_markdown_fenced_output() -> None:
+    fallback = {"macro_bias": "NEUTRAL"}
+
+    client = LLMClient(api_key="dummy")
+    mocked_client = Mock()
+    mocked_response = Mock()
+    mocked_response.output_text = '```json\n{"macro_bias": "BULLISH", "confidence": 0.78}\n```'
+    mocked_response.usage = type(
+        "Usage", (), {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    )()
+    mocked_client.responses.create.return_value = mocked_response
+    client._client = mocked_client
+
+    result = client.call_json(
+        system_prompt="sys",
+        user_prompt="usr",
+        model="gpt-5.4-mini",
+        fallback_payload=fallback,
+    )
+
+    assert result.ok
+    assert result.payload["macro_bias"] == "BULLISH"
+    assert result.payload["confidence"] == 0.78
+
+
+def test_llm_call_json_parses_json_embedded_in_prose() -> None:
+    fallback = {"score": 0.0}
+
+    client = LLMClient(api_key="dummy")
+    mocked_client = Mock()
+    mocked_response = Mock()
+    mocked_response.output_text = '以下が評価です。\n{"score": -0.2, "dominant_news": "x"}\n以上。'
+    mocked_response.usage = type(
+        "Usage", (), {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    )()
+    mocked_client.responses.create.return_value = mocked_response
+    client._client = mocked_client
+
+    result = client.call_json(
+        system_prompt="sys",
+        user_prompt="usr",
+        model="gpt-5.4-mini",
+        fallback_payload=fallback,
+    )
+
+    assert result.ok
+    assert result.payload["score"] == -0.2
+
+
+def test_llm_call_json_rejects_non_object_output() -> None:
+    fallback = {"score": 0.0}
+
+    client = LLMClient(api_key="dummy")
+    mocked_client = Mock()
+    mocked_response = Mock()
+    mocked_response.output_text = '["not", "an", "object"]'
+    mocked_response.usage = type(
+        "Usage", (), {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    )()
+    mocked_client.responses.create.return_value = mocked_response
+    client._client = mocked_client
+
+    result = client.call_json(
+        system_prompt="sys",
+        user_prompt="usr",
+        model="gpt-5.4-mini",
+        fallback_payload=fallback,
+    )
+
+    assert not result.ok
+    assert result.error == "json parse error"
+    assert result.payload == fallback

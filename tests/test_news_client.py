@@ -110,3 +110,22 @@ def test_fetch_news_returns_empty_when_all_feeds_dead() -> None:
         items = fetch_news(hours=24, max_items=10)
 
     assert items == []
+
+
+def test_fetch_news_drops_undated_items() -> None:
+    # Undated items bypassed the recency window and were observed polluting
+    # sentiment input for weeks with the same stale headlines.
+    now = datetime.now(UTC).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    rss = f"""
+    <rss><channel>
+      <item><title>Gold climbs as dollar softens</title><link>a</link><pubDate>{now}</pubDate></item>
+      <item><title>Gold outlook: Fed minutes ahead</title><link>b</link></item>
+    </channel></rss>
+    """
+
+    with patch("data.news_client.requests.get", return_value=_mock_response(text=rss)):
+        items = fetch_news(hours=24, max_items=10)
+
+    titles = [item["title"] for item in items]
+    assert "Gold climbs as dollar softens" in titles
+    assert "Gold outlook: Fed minutes ahead" not in titles
