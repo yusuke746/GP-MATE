@@ -14,8 +14,9 @@ LOGGER = logging.getLogger(__name__)
 
 FRED_BASE_URL: Final[str] = "https://api.stlouisfed.org/fred/series/observations"
 ALPHA_VANTAGE_BASE_URL: Final[str] = "https://www.alphavantage.co/query"
-REQUEST_TIMEOUT_SECONDS: Final[float] = 10.0
-REQUEST_MAX_RETRIES: Final[int] = 2
+REQUEST_TIMEOUT_SECONDS: Final[float] = 30.0
+REQUEST_MAX_RETRIES: Final[int] = 4
+REQUEST_BACKOFF_BASE_SECONDS: Final[float] = 1.0
 STALE_CACHE_MAX_AGE_DAYS: Final[int] = 5
 CACHE_LOCK = Lock()
 
@@ -122,7 +123,7 @@ def _parse_float(value: Any) -> float | None:
         return None
 
 
-def _safe_get_json(url: str, params: dict[str, Any]) -> dict[str, Any] | None:
+def _safe_get_json(url: str, params: dict[str, Any], context: str = "") -> dict[str, Any] | None:
     last_error = ""
     for attempt in range(REQUEST_MAX_RETRIES):
         try:
@@ -134,10 +135,16 @@ def _safe_get_json(url: str, params: dict[str, Any]) -> dict[str, Any] | None:
             last_error = "non-dict json"
         except Exception as exc:
             last_error = str(exc)
-            LOGGER.warning("FRED request failed (attempt=%s/%s): %s", attempt + 1, REQUEST_MAX_RETRIES, exc)
+            LOGGER.warning(
+                "FRED request failed (%s attempt=%s/%s): %s",
+                context or "no-context",
+                attempt + 1,
+                REQUEST_MAX_RETRIES,
+                exc,
+            )
         if attempt + 1 < REQUEST_MAX_RETRIES:
-            time.sleep(0.2 * (attempt + 1))
-    LOGGER.warning("FRED request exhausted retries: %s", last_error)
+            time.sleep(REQUEST_BACKOFF_BASE_SECONDS * (2 ** attempt))
+    LOGGER.warning("FRED request exhausted retries (%s): %s", context or "no-context", last_error)
     return None
 
 
@@ -199,6 +206,7 @@ def _fetch_fred_series(series_id: str, api_key: str) -> MacroSeriesSnapshot | No
             "sort_order": "desc",
             "limit": 200,
         },
+        context=f"series_id={series_id}",
     )
     if payload is None:
         return None
@@ -297,6 +305,7 @@ def get_alpha_vantage_fx_rate(
             "to_currency": to_symbol,
             "apikey": resolved_key,
         },
+        context=f"alpha_vantage {from_symbol}/{to_symbol}",
     )
     if payload is None:
         return _empty_alpha_vantage_data(from_symbol, to_symbol, "request failed")

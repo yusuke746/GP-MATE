@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import logging
+import logging.handlers
 import sys
 import time
 from pathlib import Path
@@ -16,6 +17,24 @@ from main import run_once
 
 LOGGER = logging.getLogger("gp_mate.scheduler")
 SCHEDULER_MISFIRE_GRACE_SECONDS = 30
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / "scheduler.log"
+LOG_BACKUP_DAYS = 14
+
+
+def _setup_logging() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        LOG_FILE,
+        when="midnight",
+        backupCount=LOG_BACKUP_DAYS,
+        encoding="utf-8",
+    )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[logging.StreamHandler(), file_handler],
+    )
 
 
 def _trade_mode_name(trade_mode: int) -> str:
@@ -74,10 +93,7 @@ def _confirm_real_stage_warning(trade_mode: int) -> bool:
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    _setup_logging()
 
     info = get_account_info()
     if not info.get("success"):
