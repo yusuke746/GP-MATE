@@ -28,6 +28,7 @@ from config import (
     BREAKEVEN_BUFFER,
     CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
+    FRIDAY_FLAT_TIME_NY,
     JPY_USD_RATE_FALLBACK,
     MARKET_TZ,
     MAX_DAILY_LOSS_PCT,
@@ -395,7 +396,8 @@ def _is_trading_session_allowed(reference: datetime | None = None) -> tuple[bool
 
     Policy:
     - Block all Monday (weekday=0) trades.
-    - Block NY market close window: Fri 17:00 -> Sun 16:59 (America/New_York).
+    - Block new entries from the Friday weekend-flat cutoff (default 16:30 NY)
+      through Sun 16:59 (America/New_York).
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
     weekday = now_market.weekday()
@@ -403,8 +405,8 @@ def _is_trading_session_allowed(reference: datetime | None = None) -> tuple[bool
     if weekday == 0:
         return False, "Monday trading paused"
 
-    if weekday == 4 and now_market.hour >= NY_MARKET_CLOSE_HOUR:
-        return False, "NY market closed (Friday close)"
+    if weekday == 4 and (now_market.hour, now_market.minute) >= FRIDAY_FLAT_TIME_NY:
+        return False, "Friday weekend-flat window"
 
     if weekday == 5:
         return False, "NY market closed (Saturday)"
@@ -413,6 +415,24 @@ def _is_trading_session_allowed(reference: datetime | None = None) -> tuple[bool
         return False, "NY market closed (Sunday pre-open)"
 
     return True, ""
+
+
+def _is_weekend_flat_window(reference: datetime | None = None) -> bool:
+    """Return True while open positions must be force-closed to avoid
+    holding over the weekend.
+
+    Window (America/New_York):
+    - Friday from the flat cutoff (default 16:30) onward.
+    - Saturday/Sunday/Monday: no legitimate position can exist there (entries
+      are blocked), so anything still open is a weekend leftover — close it as
+      soon as the market lets us (Sunday 17:00 reopen or Monday).
+    """
+    now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    weekday = now_market.weekday()
+
+    if weekday == 4:
+        return (now_market.hour, now_market.minute) >= FRIDAY_FLAT_TIME_NY
+    return weekday in {5, 6, 0}
 
 
 def _build_round_numbers(current_price: float, scan_range: float = TP_ROUND_SCAN_RANGE) -> list[float]:

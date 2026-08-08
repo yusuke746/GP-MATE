@@ -40,6 +40,43 @@ def test_is_trading_session_allowed_blocks_weekend_close_window() -> None:
     assert sunday_open
 
 
+def test_is_weekend_flat_window_covers_friday_cutoff_to_monday() -> None:
+    # Friday before cutoff (16:29 NY): not in flat window.
+    assert not main._is_weekend_flat_window(
+        reference=datetime(2026, 8, 7, 16, 29, tzinfo=main.MARKET_TZ)
+    )
+    # Friday at/after cutoff (16:30 NY): flat window active.
+    assert main._is_weekend_flat_window(
+        reference=datetime(2026, 8, 7, 16, 30, tzinfo=main.MARKET_TZ)
+    )
+    # Saturday, Sunday, Monday: leftovers must be closed when possible.
+    assert main._is_weekend_flat_window(
+        reference=datetime(2026, 8, 8, 12, 0, tzinfo=main.MARKET_TZ)
+    )
+    assert main._is_weekend_flat_window(
+        reference=datetime(2026, 8, 9, 18, 0, tzinfo=main.MARKET_TZ)
+    )
+    assert main._is_weekend_flat_window(
+        reference=datetime(2026, 8, 10, 9, 0, tzinfo=main.MARKET_TZ)
+    )
+    # Tuesday-Thursday: normal operation.
+    assert not main._is_weekend_flat_window(
+        reference=datetime(2026, 8, 11, 16, 45, tzinfo=main.MARKET_TZ)
+    )
+
+
+def test_is_trading_session_allowed_blocks_friday_flat_cutoff() -> None:
+    allowed_before, _ = main._is_trading_session_allowed(
+        reference=datetime(2026, 8, 7, 16, 29, tzinfo=main.MARKET_TZ)
+    )
+    blocked_after, reason = main._is_trading_session_allowed(
+        reference=datetime(2026, 8, 7, 16, 30, tzinfo=main.MARKET_TZ)
+    )
+    assert allowed_before
+    assert not blocked_after
+    assert reason == "Friday weekend-flat window"
+
+
 def test_run_once_with_missing_baseline_logs_hold(tmp_path: Path, monkeypatch) -> None:
     log_path = tmp_path / "trade_log.csv"
     monkeypatch.setattr(main, "LOG_DIR", tmp_path)

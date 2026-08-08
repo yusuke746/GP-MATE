@@ -11,8 +11,8 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from config import BREAKEVEN_MONITOR_TIMES, STAGE, SYMBOL
-from data.mt5_client import get_account_info, get_position_details
-from main import _append_trade_log, manage_breakeven_for_position
+from data.mt5_client import close_position, get_account_info, get_position_details
+from main import _append_trade_log, _is_weekend_flat_window, manage_breakeven_for_position
 
 LOGGER = logging.getLogger("gp_mate.breakeven_monitor")
 SCHEDULER_MISFIRE_GRACE_SECONDS = 30
@@ -86,6 +86,79 @@ def _build_log_row(position_context: dict[str, Any], breakeven_log: dict[str, An
     }
 
 
+def _build_weekend_flat_log_row(
+    position_context: dict[str, Any],
+    close_result: dict[str, Any],
+    timestamp_utc: str,
+) -> dict[str, Any]:
+    return {
+        "timestamp_utc": timestamp_utc,
+        "deal_id": str(close_result.get("deal", "") or ""),
+        "position_id": str(position_context.get("ticket", "") or ""),
+        "symbol": SYMBOL,
+        "action": "CLOSE",
+        "entry_price": float(position_context.get("price_open", 0.0) or 0.0),
+        "exit_price": float(position_context.get("price_current", 0.0) or 0.0),
+        "pnl": float(position_context.get("profit", 0.0) or 0.0),
+        "confidence": "",
+        "reasoning": "weekend_flat_close",
+        "risk_level": "",
+        "allowed": bool(close_result.get("success", False)),
+        "filter_reason": "Weekend flat window",
+        "lot": float(position_context.get("volume", 0.0) or 0.0),
+        "sl": float(position_context.get("sl", 0.0) or 0.0),
+        "tp": float(position_context.get("tp", 0.0) or 0.0),
+        "order_success": bool(close_result.get("success", False)),
+        "retcode": close_result.get("retcode", ""),
+        "error": str(close_result.get("reason", "")),
+        "position_direction": str(position_context.get("type", "") or ""),
+        "evaluate_action": "CLOSE",
+    }
+
+
+def _close_positions_for_weekend(positions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Force-close all open positions during the weekend-flat window."""
+    result: dict[str, Any] = {
+        "success": True,
+        "checked_positions": len(positions),
+        "moved_positions": 0,
+        "closed_positions": 0,
+        "reason": "WEEKEND_FLAT",
+    }
+    for position_context in positions:
+        ticket = int(position_context.get("ticket", 0) or 0)
+        timestamp_utc = str(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        try:
+            close_result = close_position(ticket)
+        except Exception as exc:
+            LOGGER.warning("weekend flat close failed for ticket=%s: %s", ticket, exc)
+            close_result = {"success": False, "retcode": None, "reason": str(exc)}
+
+        if bool(close_result.get("success", False)):
+            result["closed_positions"] = int(result["closed_positions"]) + 1
+            LOGGER.info("Weekend flat: closed position ticket=%s", ticket)
+        else:
+            result["success"] = False
+            LOGGER.warning(
+                "Weekend flat: close failed ticket=%s reason=%s (will retry next cycle)",
+                ticket,
+                close_result.get("reason", ""),
+            )
+
+        try:
+            _append_trade_log(
+                _build_weekend_flat_log_row(
+                    position_context=position_context,
+                    close_result=close_result,
+                    timestamp_utc=timestamp_utc,
+                )
+            )
+        except Exception as exc:
+            LOGGER.warning("weekend flat log append failed: %s", exc)
+
+    return result
+
+
 def run_monitor_once() -> dict[str, Any]:
     result: dict[str, Any] = {
         "success": True,
@@ -107,6 +180,12 @@ def run_monitor_once() -> dict[str, Any]:
     if not positions:
         LOGGER.info("No open positions for %s", SYMBOL)
         return result
+
+    if _is_weekend_flat_window():
+        LOGGER.warning(
+            "Weekend flat window active: force-closing %d open position(s)", len(positions)
+        )
+        return _close_positions_for_weekend(positions)
 
     result["checked_positions"] = len(positions)
     for position_context in positions:
