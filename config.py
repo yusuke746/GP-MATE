@@ -57,6 +57,7 @@ class Settings:
     news_filter_minutes: int
     calendar_timezone: str
     jpy_usd_rate_fallback: float
+    friday_flat_time_ny: tuple[int, int]
     spread_multiplier_limit: float
     spread_samples: int
     spread_sample_interval: float
@@ -96,6 +97,18 @@ def _get_env_float(name: str, default: float) -> float:
     if value == "":
         return default
     return float(value)
+
+
+def _parse_hhmm(value: str, default: tuple[int, int]) -> tuple[int, int]:
+    try:
+        hour_text, minute_text = value.strip().split(":")
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except Exception:
+        return default
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return (hour, minute)
+    return default
 
 
 def _parse_breakeven_monitor_times(value: str) -> tuple[str, ...]:
@@ -233,6 +246,7 @@ def load_settings() -> Settings:
         news_filter_minutes=_get_env_int("NEWS_FILTER_MINUTES", 15),
         calendar_timezone=_get_env_str("CALENDAR_TIMEZONE", "UTC"),
         jpy_usd_rate_fallback=_get_env_float("JPY_USD_RATE_FALLBACK", 155.0),
+        friday_flat_time_ny=_parse_hhmm(_get_env_str("FRIDAY_FLAT_TIME_NY", "16:30"), (16, 30)),
         spread_multiplier_limit=2.0,
         spread_samples=20,
         spread_sample_interval=0.5,
@@ -276,6 +290,7 @@ BREAKEVEN_MONITOR_TIMES: Final[tuple[str, ...]] = settings.breakeven_monitor_tim
 NEWS_FILTER_MINUTES: Final[int] = settings.news_filter_minutes
 CALENDAR_TIMEZONE_NAME: Final[str] = settings.calendar_timezone
 JPY_USD_RATE_FALLBACK: Final[float] = settings.jpy_usd_rate_fallback
+FRIDAY_FLAT_TIME_NY: Final[tuple[int, int]] = settings.friday_flat_time_ny
 SPREAD_MULTIPLIER_LIMIT: Final[float] = settings.spread_multiplier_limit
 SPREAD_SAMPLES: Final[int] = settings.spread_samples
 SPREAD_SAMPLE_INTERVAL: Final[float] = settings.spread_sample_interval
