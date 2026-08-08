@@ -22,6 +22,15 @@ SYSTEM_PROMPT = (
     "actionがBUY/SELLの場合、tp_reference_onlyのlevels/round_numbers/prev_day/moving_averagesを参照し、"
     "反発が予想される強レベルの手前にsuggested_tpを数値で設定すること。"
     "複数根拠が重なるほど強いのでconfluence_noteを重視すること。"
+    "direction_context.technical.extensionがD1の伸び切り(BBミドルから2ATR超の乖離)を"
+    "示す場合、直近の急騰・急落に追随するエントリーは平均回帰による反転リスクが高い。"
+    "その局面では押し目/戻りを待つHOLDを優先的に検討し、"
+    "それでもエントリーする場合はreasoningで伸び切りリスクを上回る根拠を明示すること。"
+    "recent_contextには直近24時間の自分の判断履歴(decisions)と決済結果(recent_closed)が含まれる。"
+    "過去判断への盲従は不要だが、数時間前の自分のHOLD判断を覆してエントリーする場合は、"
+    "前回から何が新しく変わったのかをreasoningに明示すること。"
+    "recent_closedに直近2時間以内のLOSSがあり、同方向へ再エントリーする場合は、"
+    "明確な状況変化がない限り見送る(HOLD)こと。"
     "direction_context.technical.adxが強いトレンドを示す場合は、"
     "手前のサポレジで反発しにくいためsuggested_tpを遠めに設定してよい。"
     "ただし最終TPはリスクリワード2Rが上限であり、2Rを超えるsuggested_tpは2Rに丸められる。"
@@ -102,6 +111,7 @@ def decide_trade(
     debate_report: dict[str, Any],
     macro_report: dict[str, Any] | None = None,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    recent_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_judge_summary = debate_report.get("judge_summary", {})
     judge_summary: dict[str, Any]
@@ -120,6 +130,7 @@ def decide_trade(
         "macro": macro_report or {},
         "debate": debate_report,
         "judge_summary": judge_summary,
+        "recent_context": recent_context or {"decisions": [], "recent_closed": []},
         # The confidence threshold is intentionally NOT exposed to the model:
         # it is enforced in code below, and telling the model the cutoff lets
         # it anchor its self-reported confidence around it.

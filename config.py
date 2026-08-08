@@ -72,6 +72,7 @@ class Settings:
     mt5_password: str
     mt5_server: str
     mt5_path: str
+    mt5_server_timezone: str
 
     openai_api_key: str
     news_api_key: str
@@ -259,6 +260,7 @@ def load_settings() -> Settings:
         mt5_password=mt5_password,
         mt5_server=mt5_server,
         mt5_path=mt5_path,
+        mt5_server_timezone=_get_env_str("MT5_SERVER_TIMEZONE", ""),
         openai_api_key=_get_env_str("OPENAI_API_KEY", ""),
         news_api_key=_get_env_str("NEWS_API_KEY", ""),
         fred_api_key=_get_env_str("FRED_API_KEY", ""),
@@ -305,6 +307,7 @@ MT5_LOGIN: Final[int | None] = settings.mt5_login
 MT5_PASSWORD: Final[str] = settings.mt5_password
 MT5_SERVER: Final[str] = settings.mt5_server
 MT5_PATH: Final[str] = settings.mt5_path
+MT5_SERVER_TIMEZONE: Final[str] = settings.mt5_server_timezone
 
 OPENAI_API_KEY: Final[str] = settings.openai_api_key
 NEWS_API_KEY: Final[str] = settings.news_api_key

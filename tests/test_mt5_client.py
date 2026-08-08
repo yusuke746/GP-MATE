@@ -306,3 +306,18 @@ def test_get_usd_jpy_rate_returns_none_without_mt5(monkeypatch) -> None:
     monkeypatch.setattr(mt5_client, "mt5", None)
 
     assert mt5_client.get_usd_jpy_rate() is None
+
+
+def test_deal_epoch_to_utc_converts_server_wall_clock() -> None:
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    # Raw epoch renders as 16:09 "UTC" but is actually EEST (UTC+3) wall time.
+    raw_epoch = int(datetime(2026, 8, 6, 16, 9, 17, tzinfo=timezone.utc).timestamp())
+
+    converted = mt5_client._deal_epoch_to_utc(raw_epoch, server_tz=ZoneInfo("Europe/Athens"))
+    assert converted == datetime(2026, 8, 6, 13, 9, 17, tzinfo=timezone.utc)
+
+    # Without a configured server timezone, legacy behavior is preserved.
+    unchanged = mt5_client._deal_epoch_to_utc(raw_epoch, server_tz=None)
+    assert unchanged == datetime(2026, 8, 6, 16, 9, 17, tzinfo=timezone.utc)

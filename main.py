@@ -52,6 +52,7 @@ from data.mt5_client import (
     send_order,
 )
 from data.news_client import fetch_news, is_high_impact_soon
+from agents.technical import EXTENSION_ATR_CAUTION, calc_extension_atr
 from indicators.ta_calc import add_indicators
 from indicators.horizontal_levels import build_horizontal_levels
 from risk.risk_manager import build_risk_plan, check_filters
@@ -376,6 +377,22 @@ def _adx_strength_note(adx_value: float | None) -> str:
     return "トレンド強度: 弱"
 
 
+def _extension_note(extension: float | None) -> str:
+    if extension is None:
+        return "D1乖離: 不明"
+    if extension > EXTENSION_ATR_CAUTION:
+        return (
+            f"D1終値がBBミドルから{extension:+.1f}ATR上方乖離。"
+            "パラボリック上昇の伸び切り警戒。追随買いは反落リスクが高い"
+        )
+    if extension < -EXTENSION_ATR_CAUTION:
+        return (
+            f"D1終値がBBミドルから{extension:+.1f}ATR下方乖離。"
+            "急落の売られ過ぎ警戒。追随売りは反発リスクが高い"
+        )
+    return f"D1乖離{extension:+.1f}ATRで通常範囲"
+
+
 def _calc_latest_ma(frame: Any, period: int) -> float | None:
     try:
         if frame is None or frame.empty or "close" not in frame.columns:
@@ -676,6 +693,11 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
     )
 
     adx_value = _safe_float_or_none(h4_latest.get("adx_14"))
+    d1_extension = calc_extension_atr(
+        close=float(d1_latest.get("close", 0.0) or 0.0),
+        bb_mid=float(d1_latest.get("bb_mid", 0.0) or 0.0),
+        atr=float(d1_latest.get("atr_14", 0.0) or 0.0),
+    )
     direction_context = {
         "d1": d1_latest,
         "h4": h4_latest,
@@ -684,7 +706,11 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
             "adx": {
                 "value": adx_value,
                 "note": _adx_strength_note(adx_value),
-            }
+            },
+            "extension": {
+                "d1_close_vs_mid_atr": round(d1_extension, 2) if d1_extension is not None else None,
+                "note": _extension_note(d1_extension),
+            },
         },
     }
     tp_reference_only = _build_tp_reference_only(
@@ -802,6 +828,85 @@ def _position_context_from_details(details: dict[str, Any], position_count: int)
         "profit": float(details.get("profit") or 0.0),
         "position_count": int(position_count),
     }
+
+
+RECENT_CONTEXT_HOURS = 24
+RECENT_CONTEXT_LIMIT = 5
+RECENT_REASONING_HEAD_CHARS = 220
+_NON_DECISION_REASONS = {"closed_trade_sync", "breakeven_monitor", "weekend_flat_close"}
+
+
+def _load_recent_decisions(
+    hours: int = RECENT_CONTEXT_HOURS,
+    limit: int = RECENT_CONTEXT_LIMIT,
+) -> dict[str, Any]:
+    """Summarize the trader's own recent decisions and realized closes.
+
+    Passed to decide_trade so consecutive judgments are not memoryless:
+    without this, the trader flip-flopped HOLD/BUY on near-identical inputs
+    within hours and re-entered a setup right after it was stopped out.
+    Failures return an empty context (never block the pipeline).
+    """
+    context: dict[str, Any] = {"decisions": [], "recent_closed": []}
+    try:
+        if not TRADE_LOG_PATH.exists():
+            return context
+
+        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+        with TRADE_LOG_PATH.open("r", newline="", encoding="utf-8") as fp:
+            reader = csv.DictReader(fp)
+            for row in reader:
+                try:
+                    ts_raw = str(row.get("timestamp_utc", "") or "").strip()
+                    if not ts_raw:
+                        continue
+                    ts = datetime.fromisoformat(ts_raw)
+                    ts = ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+                    if ts < cutoff:
+                        continue
+
+                    reasoning = str(row.get("reasoning", "") or "").strip()
+                    action = str(row.get("action", "") or "").strip().upper()
+
+                    if reasoning == "closed_trade_sync":
+                        pnl_raw = str(row.get("pnl", "") or "").strip()
+                        if not pnl_raw:
+                            continue
+                        context["recent_closed"].append(
+                            {
+                                "time_utc": ts.isoformat(),
+                                "pnl": float(pnl_raw),
+                                "result": "LOSS" if float(pnl_raw) < 0 else "WIN",
+                            }
+                        )
+                        continue
+
+                    if reasoning in _NON_DECISION_REASONS:
+                        continue
+                    if action not in {"BUY", "SELL", "HOLD"}:
+                        continue
+                    confidence_raw = str(row.get("confidence", "") or "").strip()
+                    if not confidence_raw:
+                        continue
+
+                    context["decisions"].append(
+                        {
+                            "time_utc": ts.isoformat(),
+                            "action": action,
+                            "confidence": float(confidence_raw),
+                            "directional_bias": str(row.get("directional_bias", "") or ""),
+                            "reasoning_head": reasoning[:RECENT_REASONING_HEAD_CHARS],
+                        }
+                    )
+                except Exception:
+                    continue
+
+        context["decisions"] = context["decisions"][-limit:]
+        context["recent_closed"] = context["recent_closed"][-limit:]
+        return context
+    except Exception as exc:
+        LOGGER.warning("_load_recent_decisions failed; empty context used: %s", exc)
+        return {"decisions": [], "recent_closed": []}
 
 
 def calc_today_risk_stats() -> tuple[int, float]:
@@ -1106,6 +1211,7 @@ def run_once(
             sentiment_report,
             debate_report,
             macro_report=macro_report,
+            recent_context=_load_recent_decisions(),
         )
 
         spread = get_spread(SYMBOL)

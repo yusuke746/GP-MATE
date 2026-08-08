@@ -209,7 +209,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -472,7 +472,7 @@ def test_run_once_uses_evaluate_position_when_position_exists(tmp_path: Path, mo
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None: called.__setitem__("decide", called["decide"] + 1) or {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: called.__setitem__("decide", called["decide"] + 1) or {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -680,7 +680,7 @@ def test_run_once_without_position_keeps_decide_trade_flow(tmp_path: Path, monke
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None: called.__setitem__("decide", called["decide"] + 1) or {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: called.__setitem__("decide", called["decide"] + 1) or {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -848,3 +848,44 @@ def test_tp_reference_only_safe_on_missing_data() -> None:
         "d1_ma50": None,
         "d1_ma200": None,
     }
+
+
+def test_load_recent_decisions_summarizes_history(tmp_path: Path, monkeypatch) -> None:
+    from datetime import UTC, timedelta
+
+    log_path = tmp_path / "trade_log.csv"
+    now = datetime.now(UTC)
+    rows = [
+        # Too old: outside the 24h window.
+        {"timestamp_utc": (now - timedelta(hours=30)).isoformat(), "action": "BUY", "confidence": "0.8", "reasoning": "old entry", "directional_bias": "BULLISH", "pnl": ""},
+        # Recent decisions.
+        {"timestamp_utc": (now - timedelta(hours=5)).isoformat(), "action": "HOLD", "confidence": "0.62", "reasoning": "過熱のため見送り", "directional_bias": "BULLISH", "pnl": ""},
+        {"timestamp_utc": (now - timedelta(hours=3)).isoformat(), "action": "BUY", "confidence": "0.74", "reasoning": "押し目買い", "directional_bias": "BULLISH", "pnl": ""},
+        # Realized close (loss).
+        {"timestamp_utc": (now - timedelta(hours=1)).isoformat(), "action": "SELL", "confidence": "", "reasoning": "closed_trade_sync", "directional_bias": "", "pnl": "-8468"},
+        # Non-decision rows must be excluded.
+        {"timestamp_utc": (now - timedelta(minutes=30)).isoformat(), "action": "HOLD", "confidence": "", "reasoning": "breakeven_monitor", "directional_bias": "", "pnl": "10"},
+    ]
+    with log_path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=["timestamp_utc", "action", "confidence", "reasoning", "directional_bias", "pnl"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+
+    context = main._load_recent_decisions()
+
+    assert [d["action"] for d in context["decisions"]] == ["HOLD", "BUY"]
+    assert context["decisions"][0]["reasoning_head"] == "過熱のため見送り"
+    assert len(context["recent_closed"]) == 1
+    assert context["recent_closed"][0]["result"] == "LOSS"
+    assert context["recent_closed"][0]["pnl"] == -8468.0
+
+
+def test_load_recent_decisions_missing_file_returns_empty(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", tmp_path / "none.csv")
+
+    context = main._load_recent_decisions()
+
+    assert context == {"decisions": [], "recent_closed": []}
