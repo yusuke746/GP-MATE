@@ -175,3 +175,43 @@ def test_existing_action_confidence_directional_bias_logic_is_preserved() -> Non
     assert result["confidence"] == 0.8
     assert result["directional_bias"] == "BULLISH"
     assert result["trigger_conditions"] == ["4055上抜け"]
+
+
+def test_decide_trade_passes_recent_context_to_model() -> None:
+    from unittest.mock import Mock, patch
+
+    from agents.trader import decide_trade
+
+    fake_result = Mock()
+    fake_result.ok = True
+    fake_result.payload = {
+        "action": "HOLD",
+        "symbol": "GOLD#",
+        "confidence": 0.5,
+        "reasoning": "test",
+        "risk_level": "MID",
+    }
+    fake_result.model = "gpt-5.5"
+    fake_result.error = ""
+    fake_result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+
+    fake_client = Mock()
+    fake_client.call_function.return_value = fake_result
+
+    recent_context = {
+        "decisions": [{"time_utc": "2026-08-06T12:00:00+00:00", "action": "BUY", "confidence": 0.74}],
+        "recent_closed": [{"time_utc": "2026-08-06T13:09:17+00:00", "pnl": -8468.0, "result": "LOSS"}],
+    }
+
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        decide_trade(
+            technical_report={"signal": "BUY"},
+            sentiment_report={"score": 0.2},
+            debate_report={},
+            recent_context=recent_context,
+        )
+
+    user_prompt = fake_client.call_function.call_args.kwargs["user_prompt"]
+    assert "recent_context" in user_prompt
+    assert "-8468" in user_prompt
+    assert "LOSS" in user_prompt

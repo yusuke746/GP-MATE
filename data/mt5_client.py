@@ -6,15 +6,45 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from statistics import median
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from config import MT5_LOGIN, MT5_PASSWORD, MT5_PATH, MT5_SERVER
+from config import MT5_LOGIN, MT5_PASSWORD, MT5_PATH, MT5_SERVER, MT5_SERVER_TIMEZONE
 
 LOGGER = logging.getLogger(__name__)
 
 ORDER_MAGIC = 20260702
 ORDER_DEVIATION = 20
+
+
+def _resolve_server_tz() -> ZoneInfo | None:
+    if not MT5_SERVER_TIMEZONE:
+        return None
+    try:
+        return ZoneInfo(MT5_SERVER_TIMEZONE)
+    except Exception:
+        LOGGER.warning("Invalid MT5_SERVER_TIMEZONE %r; deal times treated as UTC", MT5_SERVER_TIMEZONE)
+        return None
+
+
+SERVER_TZ = _resolve_server_tz()
+
+
+def _deal_epoch_to_utc(epoch: int, server_tz: ZoneInfo | None = None) -> datetime:
+    """Convert an MT5 deal epoch to true UTC.
+
+    MT5 stamps deals with the trade server's wall-clock time encoded as if it
+    were UTC (e.g. XM uses EET/EEST, so raw values run ~2-3h ahead). When
+    MT5_SERVER_TIMEZONE is configured, reinterpret the wall clock in that zone;
+    otherwise keep the legacy behavior (treat as UTC).
+    """
+    tz = server_tz if server_tz is not None else SERVER_TZ
+    as_utc = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    if tz is None:
+        return as_utc
+    wall_clock = as_utc.replace(tzinfo=None)
+    return wall_clock.replace(tzinfo=tz).astimezone(timezone.utc)
 
 try:
     import MetaTrader5 as mt5  # type: ignore[import-not-found]
@@ -339,9 +369,11 @@ def get_closed_deals(symbol: str, since: datetime) -> list[dict[str, Any]]:
         if now_utc <= since_utc:
             return []
 
-        # Pull a slightly wider window to estimate holding time from opening deal.
+        # Pull a slightly wider window to estimate holding time from opening
+        # deal. The upper bound is padded because MT5 interprets the bounds in
+        # server wall-clock time, which can run hours ahead of UTC.
         history_from = since_utc - timedelta(days=30)
-        all_deals = mt5.history_deals_get(history_from, now_utc)
+        all_deals = mt5.history_deals_get(history_from, now_utc + timedelta(days=1))
         if all_deals is None:
             LOGGER.error("history_deals_get failed: %s", mt5.last_error())
             return []
@@ -360,7 +392,7 @@ def get_closed_deals(symbol: str, since: datetime) -> list[dict[str, Any]]:
             if entry_type != mt5.DEAL_ENTRY_IN:
                 continue
 
-            opened_at = datetime.fromtimestamp(int(deal.get("time") or 0), tz=timezone.utc)
+            opened_at = _deal_epoch_to_utc(int(deal.get("time") or 0))
             opened_price = float(deal.get("price") or 0.0)
             prev = open_by_position.get(position_id)
             if prev is None or opened_at < prev[0]:
@@ -372,7 +404,7 @@ def get_closed_deals(symbol: str, since: datetime) -> list[dict[str, Any]]:
             if str(deal.get("symbol", "")).upper() != symbol.upper():
                 continue
 
-            closed_at = datetime.fromtimestamp(int(deal.get("time") or 0), tz=timezone.utc)
+            closed_at = _deal_epoch_to_utc(int(deal.get("time") or 0))
             if closed_at < since_utc:
                 continue
 

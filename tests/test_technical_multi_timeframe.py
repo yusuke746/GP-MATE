@@ -153,3 +153,56 @@ def test_multitimeframe_keeps_horizontal_levels_in_key_levels() -> None:
     assert "horizontal_levels" in result["key_levels"]
     assert result["key_levels"]["horizontal_levels"]["resistances"][0]["price"] == 101.5
     assert result["key_levels"]["horizontal_levels"]["supports"][0]["price"] == 96.5
+
+
+def test_score_frame_band_breach_with_extreme_extension_is_not_bullish() -> None:
+    from agents.technical import _score_frame
+
+    # Parabolic case modeled on the 2026-08-06 losing trade: D1 close far above
+    # the upper band, >2 ATR from the mid.
+    frame = {
+        "close": 4262.98,
+        "rsi_14": 61.35,
+        "macd_hist": 29.53,
+        "bb_mid": 4075.25,
+        "bb_upper": 4216.15,
+        "bb_lower": 3934.36,
+        "atr_14": 93.68,
+        "recent_high_20": 4304.01,
+        "recent_low_20": 3959.54,
+    }
+
+    scored = _score_frame(frame, "D1")
+
+    assert any("伸び切り警戒" in reason for reason in scored["reason"].split("、"))
+    # The +0.2 band bonus must NOT be applied: RSI(+0.4) + MACD(+0.6)
+    # + BBミドル上(+0.2) + 高値圏(+0.1) = 1.3 (not 1.5).
+    assert abs(scored["score"] - 1.3) < 1e-9
+
+
+def test_score_frame_normal_band_touch_keeps_momentum_bonus() -> None:
+    from agents.technical import _score_frame
+
+    frame = {
+        "close": 105.0,
+        "rsi_14": 55.0,
+        "macd_hist": 0.0,
+        "bb_mid": 100.0,
+        "bb_upper": 104.9,
+        "bb_lower": 95.0,
+        "atr_14": 10.0,  # extension = 0.5 ATR -> normal band ride
+        "recent_high_20": 0.0,
+        "recent_low_20": 0.0,
+    }
+
+    scored = _score_frame(frame, "H4")
+
+    assert "終値がBB上限に到達" in scored["reason"]
+
+
+def test_calc_extension_atr_handles_invalid_inputs() -> None:
+    from agents.technical import calc_extension_atr
+
+    assert calc_extension_atr(close=105.0, bb_mid=100.0, atr=10.0) == 0.5
+    assert calc_extension_atr(close=105.0, bb_mid=100.0, atr=0.0) is None
+    assert calc_extension_atr(close=105.0, bb_mid=0.0, atr=10.0) is None

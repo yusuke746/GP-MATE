@@ -32,6 +32,20 @@ FALLBACK_RESPONSE: dict[str, Any] = {
     "reasoning": "テクニカル分析に失敗したため保守的にNEUTRAL。",
 }
 
+# Distance from the BB mid (in ATR units) beyond which a band breach is treated
+# as overextension (parabolic risk) rather than momentum.
+EXTENSION_ATR_CAUTION: Final[float] = 2.0
+
+
+def calc_extension_atr(close: float, bb_mid: float, atr: float) -> float | None:
+    """Distance of close from the BB mid, in ATR units (signed).
+
+    Returns None when inputs cannot support the calculation.
+    """
+    if atr <= 0 or bb_mid <= 0 or close <= 0:
+        return None
+    return (close - bb_mid) / atr
+
 
 class TechnicalAnalysisMeta(TypedDict):
     ok: bool
@@ -146,12 +160,23 @@ def _score_frame(frame: dict[str, Any], label: str) -> dict[str, Any]:
             score -= 0.2
             reasons.append("終値がBBミッドを下回る")
 
+    atr = _as_float(frame.get("atr_14", 0.0), 0.0)
+    extension = calc_extension_atr(close=close, bb_mid=bb_mid, atr=atr)
+
     if bb_upper > 0.0 and close >= bb_upper:
-        score += 0.2
-        reasons.append("終値がBB上限に到達")
+        if extension is not None and extension > EXTENSION_ATR_CAUTION:
+            # Parabolic stretch: a breach this far above the mean is a
+            # mean-reversion risk, not extra bullish momentum.
+            reasons.append(f"BB上限超過かつミドル乖離{extension:+.1f}ATRで伸び切り警戒")
+        else:
+            score += 0.2
+            reasons.append("終値がBB上限に到達")
     elif bb_lower > 0.0 and close <= bb_lower:
-        score -= 0.2
-        reasons.append("終値がBB下限に到達")
+        if extension is not None and extension < -EXTENSION_ATR_CAUTION:
+            reasons.append(f"BB下限超過かつミドル乖離{extension:+.1f}ATRで売られ過ぎ警戒")
+        else:
+            score -= 0.2
+            reasons.append("終値がBB下限に到達")
 
     if recent_high > 0.0 and close >= recent_high * 0.99:
         score += 0.1
