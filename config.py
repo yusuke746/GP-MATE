@@ -64,6 +64,7 @@ class Settings:
 
     model_analysis: str
     model_decision: str
+    model_debate: str
     max_news_items: int
     rss_feeds: tuple[str, ...]
     stage: int
@@ -251,8 +252,9 @@ def load_settings() -> Settings:
         spread_multiplier_limit=2.0,
         spread_samples=20,
         spread_sample_interval=0.5,
-        model_analysis=_get_env_str("MODEL_ANALYSIS", "gpt-5.4-mini-2026-03-17"),
-        model_decision=_get_env_str("MODEL_DECISION", "gpt-5.5-2026-04-23"),
+        model_analysis=_get_env_str("MODEL_ANALYSIS", "gpt-5.6-terra"),
+        model_decision=_get_env_str("MODEL_DECISION", "gpt-5.6-sol"),
+        model_debate=_get_env_str("MODEL_DEBATE", "gpt-5.6-terra"),
         max_news_items=_get_env_int("MAX_NEWS_ITEMS", 15),
         rss_feeds=DEFAULT_RSS_FEEDS,
         stage=_get_env_int("STAGE", 1),
@@ -299,6 +301,7 @@ SPREAD_SAMPLE_INTERVAL: Final[float] = settings.spread_sample_interval
 
 MODEL_ANALYSIS: Final[str] = settings.model_analysis
 MODEL_DECISION: Final[str] = settings.model_decision
+MODEL_DEBATE: Final[str] = settings.model_debate
 MAX_NEWS_ITEMS: Final[int] = settings.max_news_items
 RSS_FEEDS: Final[tuple[str, ...]] = settings.rss_feeds
 STAGE: Final[int] = settings.stage
