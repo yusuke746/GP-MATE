@@ -28,17 +28,20 @@ from config import (
     BREAKEVEN_BUFFER,
     CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
+    DAILY_PENDING_CUTOFF_NY,
     FRIDAY_FLAT_TIME_NY,
     JPY_USD_RATE_FALLBACK,
     MARKET_TZ,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
     NEWS_FILTER_MINUTES,
+    NY_RUN_TIMES,
     SPREAD_SAMPLE_INTERVAL,
     SPREAD_SAMPLES,
     SYMBOL,
 )
 from data.mt5_client import (
+    cancel_pending_orders,
     close_position,
     get_account_info,
     get_baseline_spread,
@@ -49,6 +52,7 @@ from data.mt5_client import (
     get_spread,
     get_usd_jpy_rate,
     modify_sl,
+    place_pending_order,
     send_order,
 )
 from data.news_client import fetch_news, is_high_impact_soon
@@ -432,6 +436,23 @@ def _is_trading_session_allowed(reference: datetime | None = None) -> tuple[bool
         return False, "NY market closed (Sunday pre-open)"
 
     return True, ""
+
+
+def _is_pending_flat_window(reference: datetime | None = None) -> bool:
+    """Return True while unfilled pending orders must be cancelled (Good For Day).
+
+    Pending orders are conditional plans made from same-day analysis; they must
+    not survive into the daily rollover (spread spikes can falsely trigger
+    stops) or the thin Asia session where no re-analysis happens. Window
+    (America/New_York): from DAILY_PENDING_CUTOFF_NY (default 16:45, before the
+    16:55 daily close) until the first judgment of the next day re-plans.
+    """
+    now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (3, 0)
+
+    if (now_market.hour, now_market.minute) >= DAILY_PENDING_CUTOFF_NY:
+        return True
+    return (now_market.hour, now_market.minute) < first_judgment
 
 
 def _is_weekend_flat_window(reference: datetime | None = None) -> bool:
@@ -830,6 +851,128 @@ def _position_context_from_details(details: dict[str, Any], position_count: int)
     }
 
 
+# Pending-order placement guards: the trigger level must be a meaningful
+# distance from the current price (in H1 ATR units), but still reachable.
+PENDING_MIN_DISTANCE_ATR = 0.1
+PENDING_MAX_DISTANCE_ATR = 3.0
+
+
+def _handle_pending_orders(
+    pendings: list[dict[str, Any]],
+    current_price: float,
+    atr: float,
+    spread: float,
+    baseline_spread: float,
+    consecutive_losses: int,
+    daily_loss_pct: float,
+    balance: float,
+    trader_confidence: float,
+    now_iso: str,
+) -> None:
+    """Place the trader's conditional entry as a broker-side pending order.
+
+    Runs only on trader-intent HOLD with a validated pending plan. All risk
+    filters except the confidence threshold apply (a pending order fills only
+    after the market confirms the price condition). Never raises.
+    """
+    try:
+        gate = check_filters(
+            confidence=1.0,
+            spread=spread,
+            baseline_spread=baseline_spread,
+            is_news_soon=False,
+            consecutive_losses=consecutive_losses,
+            daily_loss_pct=daily_loss_pct,
+        )
+        if not gate.ok:
+            LOGGER.info("Pending order skipped by risk filters: %s", gate.reason)
+            return
+
+        pending = pendings[0] if pendings and isinstance(pendings[0], dict) else None
+        if pending is None:
+            return
+
+        order_type = str(pending.get("type", "") or "")
+        price = float(pending.get("price", 0.0) or 0.0)
+        if price <= 0 or atr <= 0 or current_price <= 0:
+            return
+
+        distance = abs(price - current_price)
+        if not (PENDING_MIN_DISTANCE_ATR * atr <= distance <= PENDING_MAX_DISTANCE_ATR * atr):
+            LOGGER.info(
+                "Pending order skipped: trigger distance %.2f outside [%.2f, %.2f]",
+                distance,
+                PENDING_MIN_DISTANCE_ATR * atr,
+                PENDING_MAX_DISTANCE_ATR * atr,
+            )
+            return
+
+        jpy_usd_rate = get_usd_jpy_rate()
+        if jpy_usd_rate is None:
+            LOGGER.warning(
+                "USDJPY rate unavailable for pending order; using fallback %.2f",
+                JPY_USD_RATE_FALLBACK,
+            )
+            jpy_usd_rate = JPY_USD_RATE_FALLBACK
+
+        direction = "BUY" if order_type.startswith("BUY") else "SELL"
+        risk_plan = build_risk_plan(
+            action=direction,
+            entry_price=price,
+            atr=atr,
+            balance_jpy=balance,
+            suggested_tp=pending.get("tp"),
+            jpy_usd_rate=jpy_usd_rate,
+        )
+        if not bool(risk_plan.get("ok")):
+            LOGGER.info("Pending order skipped: risk plan failed (%s)", risk_plan.get("reason"))
+            return
+
+        order_result = place_pending_order(
+            symbol=SYMBOL,
+            order_type=order_type,
+            price=price,
+            lot=float(risk_plan["lot"]),
+            sl=float(risk_plan["sl"]),
+            tp=float(risk_plan["tp"]),
+        )
+
+        basis = str(pending.get("basis", "") or "")
+        _append_trade_log(
+            {
+                "timestamp_utc": now_iso,
+                "deal_id": "",
+                "position_id": str(order_result.get("order", "") or ""),
+                "symbol": SYMBOL,
+                "action": order_type,
+                "entry_price": price,
+                "pnl": "",
+                "confidence": trader_confidence,
+                "reasoning": f"pending_order: {basis}" if basis else "pending_order",
+                "risk_level": "",
+                "allowed": bool(order_result.get("success", False)),
+                "filter_reason": "Pending order placed" if order_result.get("success") else "Pending order failed",
+                "lot": float(risk_plan.get("lot", 0.0) or 0.0),
+                "sl": float(risk_plan.get("sl", 0.0) or 0.0),
+                "tp": float(risk_plan.get("tp", 0.0) or 0.0),
+                "order_success": bool(order_result.get("success", False)),
+                "retcode": order_result.get("retcode", ""),
+                "error": str(order_result.get("reason", "")),
+            }
+        )
+        if bool(order_result.get("success", False)):
+            LOGGER.info(
+                "Pending order placed: %s @ %.2f lot=%.2f sl=%.2f tp=%.2f",
+                order_type,
+                price,
+                float(risk_plan["lot"]),
+                float(risk_plan["sl"]),
+                float(risk_plan["tp"]),
+            )
+    except Exception as exc:
+        LOGGER.warning("_handle_pending_orders failed safely: %s", exc)
+
+
 RECENT_CONTEXT_HOURS = 24
 RECENT_CONTEXT_LIMIT = 5
 RECENT_REASONING_HEAD_CHARS = 220
@@ -1033,6 +1176,18 @@ def run_once(
             sync_closed_trades()
         except Exception as sync_exc:
             LOGGER.warning("sync_closed_trades failed and was skipped: %s", sync_exc)
+
+        # Every judgment starts from a clean slate: stale conditional plans
+        # from the previous judgment are cancelled before deciding anew.
+        try:
+            cancel_result = cancel_pending_orders(SYMBOL)
+            if int(cancel_result.get("canceled", 0) or 0) > 0:
+                LOGGER.info(
+                    "Cancelled %s stale pending order(s) before judgment",
+                    cancel_result.get("canceled"),
+                )
+        except Exception as cancel_exc:
+            LOGGER.warning("cancel_pending_orders failed and was skipped: %s", cancel_exc)
 
         trading_allowed, trading_block_reason = _is_trading_session_allowed()
         if not trading_allowed:
@@ -1306,6 +1461,22 @@ def run_once(
             **debate_log_fields,
         }
         _append_trade_log(result)
+
+        pendings = trader_report.get("pending_orders") if isinstance(trader_report, dict) else None
+        if final_action == "HOLD" and isinstance(pendings, list) and pendings:
+            _handle_pending_orders(
+                pendings=pendings,
+                current_price=entry_price,
+                atr=atr,
+                spread=spread,
+                baseline_spread=calibrated_baseline,
+                consecutive_losses=effective_consecutive_losses,
+                daily_loss_pct=effective_daily_loss_pct,
+                balance=balance,
+                trader_confidence=float(trader_report.get("confidence", 0.0) or 0.0),
+                now_iso=now_iso,
+            )
+
         return result
     except Exception as exc:
         LOGGER.exception("run_once failed: %s", exc)

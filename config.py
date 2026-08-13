@@ -58,12 +58,14 @@ class Settings:
     calendar_timezone: str
     jpy_usd_rate_fallback: float
     friday_flat_time_ny: tuple[int, int]
+    daily_pending_cutoff_ny: tuple[int, int]
     spread_multiplier_limit: float
     spread_samples: int
     spread_sample_interval: float
 
     model_analysis: str
     model_decision: str
+    model_debate: str
     max_news_items: int
     rss_feeds: tuple[str, ...]
     stage: int
@@ -248,11 +250,13 @@ def load_settings() -> Settings:
         calendar_timezone=_get_env_str("CALENDAR_TIMEZONE", "UTC"),
         jpy_usd_rate_fallback=_get_env_float("JPY_USD_RATE_FALLBACK", 155.0),
         friday_flat_time_ny=_parse_hhmm(_get_env_str("FRIDAY_FLAT_TIME_NY", "16:30"), (16, 30)),
+        daily_pending_cutoff_ny=_parse_hhmm(_get_env_str("DAILY_PENDING_CUTOFF_NY", "16:45"), (16, 45)),
         spread_multiplier_limit=2.0,
         spread_samples=20,
         spread_sample_interval=0.5,
-        model_analysis=_get_env_str("MODEL_ANALYSIS", "gpt-5.4-mini-2026-03-17"),
-        model_decision=_get_env_str("MODEL_DECISION", "gpt-5.5-2026-04-23"),
+        model_analysis=_get_env_str("MODEL_ANALYSIS", "gpt-5.6-terra"),
+        model_decision=_get_env_str("MODEL_DECISION", "gpt-5.6-sol"),
+        model_debate=_get_env_str("MODEL_DEBATE", "gpt-5.6-terra"),
         max_news_items=_get_env_int("MAX_NEWS_ITEMS", 15),
         rss_feeds=DEFAULT_RSS_FEEDS,
         stage=_get_env_int("STAGE", 1),
@@ -293,12 +297,14 @@ NEWS_FILTER_MINUTES: Final[int] = settings.news_filter_minutes
 CALENDAR_TIMEZONE_NAME: Final[str] = settings.calendar_timezone
 JPY_USD_RATE_FALLBACK: Final[float] = settings.jpy_usd_rate_fallback
 FRIDAY_FLAT_TIME_NY: Final[tuple[int, int]] = settings.friday_flat_time_ny
+DAILY_PENDING_CUTOFF_NY: Final[tuple[int, int]] = settings.daily_pending_cutoff_ny
 SPREAD_MULTIPLIER_LIMIT: Final[float] = settings.spread_multiplier_limit
 SPREAD_SAMPLES: Final[int] = settings.spread_samples
 SPREAD_SAMPLE_INTERVAL: Final[float] = settings.spread_sample_interval
 
 MODEL_ANALYSIS: Final[str] = settings.model_analysis
 MODEL_DECISION: Final[str] = settings.model_decision
+MODEL_DEBATE: Final[str] = settings.model_debate
 MAX_NEWS_ITEMS: Final[int] = settings.max_news_items
 RSS_FEEDS: Final[tuple[str, ...]] = settings.rss_feeds
 STAGE: Final[int] = settings.stage

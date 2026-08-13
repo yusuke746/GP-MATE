@@ -25,10 +25,26 @@ class _FakeMt5:
     TRADE_RETCODE_DONE = 10009
     TRADE_RETCODE_PLACED = 10008
 
-    def __init__(self, positions: list[_FakeStruct] | None = None, order_result: _FakeStruct | None = None) -> None:
+    TRADE_ACTION_PENDING = 40
+    TRADE_ACTION_REMOVE = 41
+    ORDER_TYPE_BUY_LIMIT = 2
+    ORDER_TYPE_SELL_LIMIT = 3
+    ORDER_TYPE_BUY_STOP = 4
+    ORDER_TYPE_SELL_STOP = 5
+
+    def __init__(
+        self,
+        positions: list[_FakeStruct] | None = None,
+        order_result: _FakeStruct | None = None,
+        orders: list[_FakeStruct] | None = None,
+    ) -> None:
         self._positions = positions or []
         self._order_result = order_result or _FakeStruct(retcode=self.TRADE_RETCODE_DONE, order=111, deal=222)
+        self._orders = orders or []
         self.sent_requests: list[dict[str, object]] = []
+
+    def orders_get(self, symbol: str | None = None):
+        return list(self._orders)
 
     def positions_get(self, symbol: str | None = None):
         if symbol is None:
@@ -321,3 +337,59 @@ def test_deal_epoch_to_utc_converts_server_wall_clock() -> None:
     # Without a configured server timezone, legacy behavior is preserved.
     unchanged = mt5_client._deal_epoch_to_utc(raw_epoch, server_tz=None)
     assert unchanged == datetime(2026, 8, 6, 16, 9, 17, tzinfo=timezone.utc)
+
+
+def test_place_pending_order_builds_request(monkeypatch) -> None:
+    fake_mt5 = _FakeMt5()
+    monkeypatch.setattr(mt5_client, "mt5", fake_mt5)
+    monkeypatch.setattr(mt5_client, "connect", lambda: True)
+    monkeypatch.setattr(mt5_client, "disconnect", lambda: None)
+
+    result = mt5_client.place_pending_order(
+        symbol="GOLD#", order_type="BUY_LIMIT", price=4382.45, lot=0.02, sl=4351.0, tp=4440.0
+    )
+
+    assert result["success"] is True
+    request = fake_mt5.sent_requests[0]
+    assert request["action"] == _FakeMt5.TRADE_ACTION_PENDING
+    assert request["type"] == _FakeMt5.ORDER_TYPE_BUY_LIMIT
+    assert request["price"] == 4382.45
+    assert request["sl"] == 4351.0
+    assert request["tp"] == 4440.0
+    assert request["magic"] == mt5_client.ORDER_MAGIC
+    assert request["comment"] == "GP-MATE pending"
+
+
+def test_place_pending_order_rejects_invalid_type() -> None:
+    result = mt5_client.place_pending_order(
+        symbol="GOLD#", order_type="MARKET", price=100.0, lot=0.01, sl=95.0, tp=110.0
+    )
+    assert result["success"] is False
+    assert "Invalid pending order type" in result["reason"]
+
+
+def test_cancel_pending_orders_only_cancels_own_magic(monkeypatch) -> None:
+    fake_mt5 = _FakeMt5(
+        orders=[
+            _FakeStruct(ticket=1001, magic=mt5_client.ORDER_MAGIC),
+            _FakeStruct(ticket=1002, magic=999999),
+        ]
+    )
+    monkeypatch.setattr(mt5_client, "mt5", fake_mt5)
+    monkeypatch.setattr(mt5_client, "connect", lambda: True)
+    monkeypatch.setattr(mt5_client, "disconnect", lambda: None)
+
+    result = mt5_client.cancel_pending_orders("GOLD#")
+
+    assert result["success"] is True
+    assert result["canceled"] == 1
+    removes = [r for r in fake_mt5.sent_requests if r.get("action") == _FakeMt5.TRADE_ACTION_REMOVE]
+    assert len(removes) == 1
+    assert removes[0]["order"] == 1001
+
+
+def test_cancel_pending_orders_safe_without_mt5(monkeypatch) -> None:
+    monkeypatch.setattr(mt5_client, "mt5", None)
+    result = mt5_client.cancel_pending_orders("GOLD#")
+    assert result["success"] is False
+    assert result["canceled"] == 0

@@ -7,7 +7,7 @@ import time
 from operator import add
 from typing import Any, Callable, Literal, TypedDict, cast
 
-from config import MACRO_DEBATE_CONF_THRESHOLD
+from config import MACRO_DEBATE_CONF_THRESHOLD, MODEL_DEBATE
 
 try:
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -29,7 +29,7 @@ LOGGER = logging.getLogger(__name__)
 _BEAR_RAW_LOGGED_ONCE = False
 _JUDGE_RAW_LOGGED_ONCE = False
 
-DEBATE_MODEL = "gpt-5.4-mini"
+DEBATE_MODEL = MODEL_DEBATE
 BULL_TEMPERATURE = 0.7
 BEAR_TEMPERATURE = 0.3
 JUDGE_TEMPERATURE = 0.2

@@ -37,7 +37,18 @@ SYSTEM_PROMPT = (
     "したがってsuggested_tpは原則2R以内で、最も反発が強そうなレベルの手前に置くこと。"
     "HOLDの場合や算出根拠が不十分な場合、suggested_tpはnullにすること。"
     "suggested_tp_basisには、その価格にした根拠を簡潔な日本語で記すこと。"
+    "HOLDで見送る場合でも、directional_biasが明確でtrigger_conditionsに"
+    "具体的な発動価格条件があるなら、その中で最も優位な1件をpending_ordersに"
+    "構造化して返すこと。ブレイク待ちはBUY_STOP/SELL_STOP、"
+    "押し目・戻り待ちはBUY_LIMIT/SELL_LIMITを使い、priceに発動価格を数値で設定する。"
+    "伸び切り警戒中の順方向エントリーは、ブレイク追随ではなく押し目/戻りのLIMIT型を優先すること。"
+    "pending_ordersのtpは任意で、設定時は2R上限が適用される。"
+    "予約に値する明確な条件がなければpending_ordersは空配列にすること。"
 )
+
+PENDING_ORDER_TYPES = ("BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT")
+MAX_PENDING_ORDERS = 1
+PENDING_MIN_BIAS_STRENGTH = 0.6
 
 PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
     "description": "分析結果に基づき売買判断を実行する",
@@ -59,6 +70,20 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
             "suggested_tp_basis": {
                 "type": "string",
                 "description": "suggested_tpの根拠(例: キリ番4000と前日安値が重なる4023の手前)",
+            },
+            "pending_orders": {
+                "type": "array",
+                "description": "HOLD時の条件付き予約注文(最大1件採用)。条件がなければ空配列",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT"]},
+                        "price": {"type": "number", "description": "発動価格"},
+                        "tp": {"type": ["number", "null"], "description": "任意の利確目標(2R上限適用)"},
+                        "basis": {"type": "string", "description": "この予約の根拠(日本語)"},
+                    },
+                    "required": ["type", "price"],
+                },
             },
         },
         "required": ["action", "symbol", "confidence", "reasoning"],
@@ -103,6 +128,64 @@ def _extract_current_price_for_tp_sanity(technical_report: dict[str, Any]) -> fl
     except Exception:
         return None
     return None
+
+
+def _validate_pending_orders(
+    raw: Any,
+    action: str,
+    directional_bias: str,
+    bias_strength: float,
+    current_price: float | None,
+) -> list[dict[str, Any]]:
+    """Validate model-proposed pending orders.
+
+    Only meaningful for HOLD with a clear directional bias; each order must be
+    on the bias side and on the correct side of the current price for its type.
+    """
+    if action != "HOLD":
+        return []
+    if directional_bias not in {"BULLISH", "BEARISH"}:
+        return []
+    if bias_strength < PENDING_MIN_BIAS_STRENGTH:
+        return []
+    if not isinstance(raw, list):
+        return []
+
+    valid: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        order_type = str(item.get("type", "") or "").upper().strip()
+        if order_type not in PENDING_ORDER_TYPES:
+            continue
+        price = _safe_float_or_none(item.get("price"))
+        if price is None or price <= 0:
+            continue
+        if directional_bias == "BULLISH" and not order_type.startswith("BUY"):
+            continue
+        if directional_bias == "BEARISH" and not order_type.startswith("SELL"):
+            continue
+        if current_price is not None:
+            if order_type == "BUY_STOP" and price <= current_price:
+                continue
+            if order_type == "BUY_LIMIT" and price >= current_price:
+                continue
+            if order_type == "SELL_STOP" and price >= current_price:
+                continue
+            if order_type == "SELL_LIMIT" and price <= current_price:
+                continue
+
+        valid.append(
+            {
+                "type": order_type,
+                "price": round(price, 5),
+                "tp": _safe_float_or_none(item.get("tp")),
+                "basis": str(item.get("basis", "") or ""),
+            }
+        )
+        if len(valid) >= MAX_PENDING_ORDERS:
+            break
+    return valid
 
 
 def decide_trade(
@@ -198,6 +281,14 @@ def decide_trade(
     suggested_tp_basis = str(payload.get("suggested_tp_basis", "") or "")
     payload["suggested_tp"] = suggested_tp
     payload["suggested_tp_basis"] = suggested_tp_basis
+
+    payload["pending_orders"] = _validate_pending_orders(
+        raw=payload.get("pending_orders"),
+        action=action,
+        directional_bias=directional_bias,
+        bias_strength=float(payload.get("bias_strength", 0.0) or 0.0),
+        current_price=current_price,
+    )
 
     payload["_meta"] = {
         "ok": result.ok,

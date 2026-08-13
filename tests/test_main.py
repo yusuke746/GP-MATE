@@ -223,6 +223,8 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
 
     monkeypatch.setattr(main, "get_spread", lambda symbol: 10.0)
     monkeypatch.setattr(main, "get_usd_jpy_rate", lambda: 150.0)
+    monkeypatch.setattr(main, "cancel_pending_orders", lambda symbol: {"success": True, "canceled": 0, "reason": "OK"})
+    monkeypatch.setattr(main, "place_pending_order", lambda **kwargs: {"success": True, "retcode": 0, "order": 42})
     monkeypatch.setattr(main, "check_filters", lambda **kwargs: SimpleNamespace(ok=True, reason="OK"))
     monkeypatch.setattr(
         main,
@@ -889,3 +891,157 @@ def test_load_recent_decisions_missing_file_returns_empty(tmp_path: Path, monkey
     context = main._load_recent_decisions()
 
     assert context == {"decisions": [], "recent_closed": []}
+
+
+def _pending_common(monkeypatch, tmp_path: Path) -> tuple[Path, list[dict[str, Any]]]:
+    log_path = tmp_path / "trade_log.csv"
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+    monkeypatch.setattr(main, "get_usd_jpy_rate", lambda: 150.0)
+
+    placed: list[dict[str, Any]] = []
+
+    def _fake_place(**kwargs):
+        placed.append(kwargs)
+        return {"success": True, "retcode": 0, "order": 777}
+
+    monkeypatch.setattr(main, "place_pending_order", _fake_place)
+    return log_path, placed
+
+
+def test_handle_pending_orders_places_and_logs(tmp_path: Path, monkeypatch) -> None:
+    log_path, placed = _pending_common(monkeypatch, tmp_path)
+
+    main._handle_pending_orders(
+        pendings=[{"type": "BUY_LIMIT", "price": 4382.45, "tp": None, "basis": "D1サポート押し目"}],
+        current_price=4404.0,
+        atr=15.0,
+        spread=10.0,
+        baseline_spread=10.0,
+        consecutive_losses=0,
+        daily_loss_pct=0.0,
+        balance=400_000.0,
+        trader_confidence=0.68,
+        now_iso="2026-08-12T12:00:00+00:00",
+    )
+
+    assert len(placed) == 1
+    assert placed[0]["order_type"] == "BUY_LIMIT"
+    assert placed[0]["price"] == 4382.45
+    assert placed[0]["sl"] < 4382.45 < placed[0]["tp"]
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert rows[0]["action"] == "BUY_LIMIT"
+    assert rows[0]["reasoning"].startswith("pending_order")
+    assert rows[0]["position_id"] == "777"
+    assert rows[0]["order_success"] == "True"
+
+
+def test_handle_pending_orders_respects_risk_filters(tmp_path: Path, monkeypatch) -> None:
+    _, placed = _pending_common(monkeypatch, tmp_path)
+
+    main._handle_pending_orders(
+        pendings=[{"type": "BUY_LIMIT", "price": 4382.45, "tp": None, "basis": "x"}],
+        current_price=4404.0,
+        atr=15.0,
+        spread=10.0,
+        baseline_spread=10.0,
+        consecutive_losses=main.CONSECUTIVE_LOSS_LIMIT,
+        daily_loss_pct=0.0,
+        balance=400_000.0,
+        trader_confidence=0.68,
+        now_iso="2026-08-12T12:00:00+00:00",
+    )
+
+    assert placed == []
+
+
+def test_handle_pending_orders_skips_far_triggers(tmp_path: Path, monkeypatch) -> None:
+    _, placed = _pending_common(monkeypatch, tmp_path)
+
+    main._handle_pending_orders(
+        pendings=[{"type": "BUY_LIMIT", "price": 4300.0, "tp": None, "basis": "遠すぎ"}],
+        current_price=4404.0,
+        atr=15.0,  # distance 104 > 3*15
+        spread=10.0,
+        baseline_spread=10.0,
+        consecutive_losses=0,
+        daily_loss_pct=0.0,
+        balance=400_000.0,
+        trader_confidence=0.68,
+        now_iso="2026-08-12T12:00:00+00:00",
+    )
+
+    assert placed == []
+
+
+def test_run_once_places_pending_order_on_hold_with_plan(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+
+    # The common build_risk_plan stub always returns BUY; this test needs one
+    # that respects the requested action (HOLD stays HOLD).
+    monkeypatch.setattr(
+        main,
+        "build_risk_plan",
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
+            "ok": action in {"BUY", "SELL"},
+            "action": action if action in {"BUY", "SELL"} else "HOLD",
+            "lot": 0.01,
+            "sl": entry_price - 3.0,
+            "tp": entry_price + 6.0,
+        },
+    )
+
+    placed: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        main,
+        "place_pending_order",
+        lambda **kwargs: placed.append(kwargs) or {"success": True, "retcode": 0, "order": 888},
+    )
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+            "action": "HOLD",
+            "confidence": 0.66,
+            "reasoning": "押し目待ち",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.7,
+            "pending_orders": [{"type": "BUY_LIMIT", "price": 98.0, "tp": None, "basis": "サポート"}],
+            "_meta": {"model": "t", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert len(placed) == 1
+    assert placed[0]["order_type"] == "BUY_LIMIT"
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    actions = [row["action"] for row in rows]
+    assert actions == ["HOLD", "BUY_LIMIT"]
+
+
+def test_is_pending_flat_window_good_for_day() -> None:
+    # Daytime (judgment hours): pendings stay armed.
+    assert not main._is_pending_flat_window(
+        reference=datetime(2026, 8, 12, 12, 0, tzinfo=main.MARKET_TZ)
+    )
+    assert not main._is_pending_flat_window(
+        reference=datetime(2026, 8, 12, 16, 44, tzinfo=main.MARKET_TZ)
+    )
+    # From the cutoff (16:45 NY) through the evening: cancelled.
+    assert main._is_pending_flat_window(
+        reference=datetime(2026, 8, 12, 16, 45, tzinfo=main.MARKET_TZ)
+    )
+    assert main._is_pending_flat_window(
+        reference=datetime(2026, 8, 12, 23, 0, tzinfo=main.MARKET_TZ)
+    )
+    # Overnight until the first judgment (3:00 NY): still cancelled.
+    assert main._is_pending_flat_window(
+        reference=datetime(2026, 8, 13, 2, 59, tzinfo=main.MARKET_TZ)
+    )
+    # After the first judgment re-plans, fresh pendings must survive.
+    assert not main._is_pending_flat_window(
+        reference=datetime(2026, 8, 13, 3, 7, tzinfo=main.MARKET_TZ)
+    )
