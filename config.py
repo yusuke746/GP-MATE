@@ -58,6 +58,7 @@ class Settings:
     calendar_timezone: str
     jpy_usd_rate_fallback: float
     friday_flat_time_ny: tuple[int, int]
+    daily_pending_cutoff_ny: tuple[int, int]
     spread_multiplier_limit: float
     spread_samples: int
     spread_sample_interval: float
@@ -249,6 +250,7 @@ def load_settings() -> Settings:
         calendar_timezone=_get_env_str("CALENDAR_TIMEZONE", "UTC"),
         jpy_usd_rate_fallback=_get_env_float("JPY_USD_RATE_FALLBACK", 155.0),
         friday_flat_time_ny=_parse_hhmm(_get_env_str("FRIDAY_FLAT_TIME_NY", "16:30"), (16, 30)),
+        daily_pending_cutoff_ny=_parse_hhmm(_get_env_str("DAILY_PENDING_CUTOFF_NY", "16:45"), (16, 45)),
         spread_multiplier_limit=2.0,
         spread_samples=20,
         spread_sample_interval=0.5,
@@ -295,6 +297,7 @@ NEWS_FILTER_MINUTES: Final[int] = settings.news_filter_minutes
 CALENDAR_TIMEZONE_NAME: Final[str] = settings.calendar_timezone
 JPY_USD_RATE_FALLBACK: Final[float] = settings.jpy_usd_rate_fallback
 FRIDAY_FLAT_TIME_NY: Final[tuple[int, int]] = settings.friday_flat_time_ny
+DAILY_PENDING_CUTOFF_NY: Final[tuple[int, int]] = settings.daily_pending_cutoff_ny
 SPREAD_MULTIPLIER_LIMIT: Final[float] = settings.spread_multiplier_limit
 SPREAD_SAMPLES: Final[int] = settings.spread_samples
 SPREAD_SAMPLE_INTERVAL: Final[float] = settings.spread_sample_interval

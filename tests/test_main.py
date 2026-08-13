@@ -1020,3 +1020,28 @@ def test_run_once_places_pending_order_on_hold_with_plan(tmp_path: Path, monkeyp
     rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
     actions = [row["action"] for row in rows]
     assert actions == ["HOLD", "BUY_LIMIT"]
+
+
+def test_is_pending_flat_window_good_for_day() -> None:
+    # Daytime (judgment hours): pendings stay armed.
+    assert not main._is_pending_flat_window(
+        reference=datetime(2026, 8, 12, 12, 0, tzinfo=main.MARKET_TZ)
+    )
+    assert not main._is_pending_flat_window(
+        reference=datetime(2026, 8, 12, 16, 44, tzinfo=main.MARKET_TZ)
+    )
+    # From the cutoff (16:45 NY) through the evening: cancelled.
+    assert main._is_pending_flat_window(
+        reference=datetime(2026, 8, 12, 16, 45, tzinfo=main.MARKET_TZ)
+    )
+    assert main._is_pending_flat_window(
+        reference=datetime(2026, 8, 12, 23, 0, tzinfo=main.MARKET_TZ)
+    )
+    # Overnight until the first judgment (3:00 NY): still cancelled.
+    assert main._is_pending_flat_window(
+        reference=datetime(2026, 8, 13, 2, 59, tzinfo=main.MARKET_TZ)
+    )
+    # After the first judgment re-plans, fresh pendings must survive.
+    assert not main._is_pending_flat_window(
+        reference=datetime(2026, 8, 13, 3, 7, tzinfo=main.MARKET_TZ)
+    )

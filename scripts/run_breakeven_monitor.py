@@ -12,7 +12,12 @@ if str(BASE_DIR) not in sys.path:
 
 from config import BREAKEVEN_MONITOR_TIMES, STAGE, SYMBOL
 from data.mt5_client import cancel_pending_orders, close_position, get_account_info, get_position_details
-from main import _append_trade_log, _is_weekend_flat_window, manage_breakeven_for_position
+from main import (
+    _append_trade_log,
+    _is_pending_flat_window,
+    _is_weekend_flat_window,
+    manage_breakeven_for_position,
+)
 
 LOGGER = logging.getLogger("gp_mate.breakeven_monitor")
 SCHEDULER_MISFIRE_GRACE_SECONDS = 30
@@ -194,6 +199,20 @@ def run_monitor_once() -> dict[str, Any]:
             )
             return _close_positions_for_weekend(positions)
         return result
+
+    if _is_pending_flat_window():
+        # Good For Day: unfilled pending orders die before the daily rollover
+        # and stay dead through the Asia session until the next judgment
+        # re-plans. Open positions are still breakeven-managed below.
+        try:
+            cancel_result = cancel_pending_orders(SYMBOL)
+            if int(cancel_result.get("canceled", 0) or 0) > 0:
+                LOGGER.info(
+                    "Daily pending cutoff: cancelled %s pending order(s)",
+                    cancel_result.get("canceled"),
+                )
+        except Exception as exc:
+            LOGGER.warning("Daily pending cutoff cancel failed: %s", exc)
 
     if not positions:
         LOGGER.info("No open positions for %s", SYMBOL)

@@ -14,6 +14,7 @@ def test_run_monitor_once_exits_cleanly_without_positions(monkeypatch: pytest.Mo
     monkeypatch.setattr(run_breakeven_monitor, "get_position_details", lambda symbol: [])
 
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
     result = run_breakeven_monitor.run_monitor_once()
 
     assert result["success"] is True
@@ -46,6 +47,7 @@ def test_run_monitor_once_moves_breakeven_at_1r(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr(main, "modify_sl", lambda ticket, new_sl: modify_calls.append((ticket, new_sl)) or {"success": True, "retcode": 0})
 
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
     result = run_breakeven_monitor.run_monitor_once()
 
     assert result["success"] is True
@@ -79,6 +81,7 @@ def test_run_monitor_once_does_not_move_before_1r(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(main, "modify_sl", lambda ticket, new_sl: {"success": True, "retcode": 0})
 
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
     result = run_breakeven_monitor.run_monitor_once()
 
     assert result["success"] is True
@@ -90,6 +93,7 @@ def test_run_monitor_once_price_fetch_failure_exits_safely(monkeypatch: pytest.M
     monkeypatch.setattr(run_breakeven_monitor, "get_position_details", lambda symbol: (_ for _ in ()).throw(RuntimeError("mt5 error")))
 
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
     result = run_breakeven_monitor.run_monitor_once()
 
     assert result["success"] is False
@@ -232,3 +236,48 @@ def test_run_monitor_once_cancels_pendings_in_weekend_flat_window(monkeypatch: p
     assert calls == [run_breakeven_monitor.SYMBOL]
     assert result["success"] is True
     assert result["checked_positions"] == 0
+
+
+def test_run_monitor_once_cancels_pendings_at_daily_cutoff_but_keeps_breakeven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_path = tmp_path / "trade_log.csv"
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: True)
+
+    cancel_calls: list[str] = []
+    monkeypatch.setattr(
+        run_breakeven_monitor,
+        "cancel_pending_orders",
+        lambda symbol: cancel_calls.append(symbol) or {"success": True, "canceled": 1, "reason": "OK"},
+    )
+    monkeypatch.setattr(
+        run_breakeven_monitor,
+        "get_position_details",
+        lambda symbol: [
+            {
+                "ticket": 321,
+                "symbol": symbol,
+                "type": "BUY",
+                "volume": 0.01,
+                "price_open": 100.0,
+                "price_current": 105.0,
+                "sl": 95.0,
+                "tp": 110.0,
+                "profit": 50.0,
+            }
+        ],
+    )
+    modify_calls: list[tuple[int, float]] = []
+    monkeypatch.setattr(
+        main, "modify_sl", lambda ticket, new_sl: modify_calls.append((ticket, new_sl)) or {"success": True, "retcode": 0}
+    )
+
+    result = run_breakeven_monitor.run_monitor_once()
+
+    # Pendings are cancelled, but open positions are still breakeven-managed.
+    assert cancel_calls == [run_breakeven_monitor.SYMBOL]
+    assert result["moved_positions"] == 1
+    assert modify_calls == [(321, 100.0 + main.BREAKEVEN_BUFFER)]

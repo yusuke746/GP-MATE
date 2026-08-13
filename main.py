@@ -28,12 +28,14 @@ from config import (
     BREAKEVEN_BUFFER,
     CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
+    DAILY_PENDING_CUTOFF_NY,
     FRIDAY_FLAT_TIME_NY,
     JPY_USD_RATE_FALLBACK,
     MARKET_TZ,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
     NEWS_FILTER_MINUTES,
+    NY_RUN_TIMES,
     SPREAD_SAMPLE_INTERVAL,
     SPREAD_SAMPLES,
     SYMBOL,
@@ -434,6 +436,23 @@ def _is_trading_session_allowed(reference: datetime | None = None) -> tuple[bool
         return False, "NY market closed (Sunday pre-open)"
 
     return True, ""
+
+
+def _is_pending_flat_window(reference: datetime | None = None) -> bool:
+    """Return True while unfilled pending orders must be cancelled (Good For Day).
+
+    Pending orders are conditional plans made from same-day analysis; they must
+    not survive into the daily rollover (spread spikes can falsely trigger
+    stops) or the thin Asia session where no re-analysis happens. Window
+    (America/New_York): from DAILY_PENDING_CUTOFF_NY (default 16:45, before the
+    16:55 daily close) until the first judgment of the next day re-plans.
+    """
+    now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (3, 0)
+
+    if (now_market.hour, now_market.minute) >= DAILY_PENDING_CUTOFF_NY:
+        return True
+    return (now_market.hour, now_market.minute) < first_judgment
 
 
 def _is_weekend_flat_window(reference: datetime | None = None) -> bool:
