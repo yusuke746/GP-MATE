@@ -214,3 +214,21 @@ def test_run_monitor_once_reports_failure_when_weekend_close_fails(
     rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
     assert rows[0]["order_success"] == "False"
     assert rows[0]["error"] == "market closed"
+
+
+def test_run_monitor_once_cancels_pendings_in_weekend_flat_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: True)
+    monkeypatch.setattr(run_breakeven_monitor, "get_position_details", lambda symbol: [])
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        run_breakeven_monitor,
+        "cancel_pending_orders",
+        lambda symbol: calls.append(symbol) or {"success": True, "canceled": 2, "reason": "OK"},
+    )
+
+    result = run_breakeven_monitor.run_monitor_once()
+
+    assert calls == [run_breakeven_monitor.SYMBOL]
+    assert result["success"] is True
+    assert result["checked_positions"] == 0

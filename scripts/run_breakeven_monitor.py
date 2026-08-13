@@ -11,7 +11,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from config import BREAKEVEN_MONITOR_TIMES, STAGE, SYMBOL
-from data.mt5_client import close_position, get_account_info, get_position_details
+from data.mt5_client import cancel_pending_orders, close_position, get_account_info, get_position_details
 from main import _append_trade_log, _is_weekend_flat_window, manage_breakeven_for_position
 
 LOGGER = logging.getLogger("gp_mate.breakeven_monitor")
@@ -177,15 +177,27 @@ def run_monitor_once() -> dict[str, Any]:
             "reason": str(exc),
         }
 
+    if _is_weekend_flat_window():
+        # Pending orders must not survive into (or through) the weekend either.
+        try:
+            cancel_result = cancel_pending_orders(SYMBOL)
+            if int(cancel_result.get("canceled", 0) or 0) > 0:
+                LOGGER.info(
+                    "Weekend flat: cancelled %s pending order(s)", cancel_result.get("canceled")
+                )
+        except Exception as exc:
+            LOGGER.warning("Weekend flat pending cancel failed: %s", exc)
+
+        if positions:
+            LOGGER.warning(
+                "Weekend flat window active: force-closing %d open position(s)", len(positions)
+            )
+            return _close_positions_for_weekend(positions)
+        return result
+
     if not positions:
         LOGGER.info("No open positions for %s", SYMBOL)
         return result
-
-    if _is_weekend_flat_window():
-        LOGGER.warning(
-            "Weekend flat window active: force-closing %d open position(s)", len(positions)
-        )
-        return _close_positions_for_weekend(positions)
 
     result["checked_positions"] = len(positions)
     for position_context in positions:

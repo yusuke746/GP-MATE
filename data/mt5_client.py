@@ -553,6 +553,161 @@ def send_order(symbol: str, action: str, lot: float, sl: float, tp: float) -> di
         disconnect()
 
 
+PENDING_ORDER_TYPES = ("BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT")
+
+
+def _pending_type_constant(order_type: str) -> int | None:
+    if mt5 is None:
+        return None
+    mapping = {
+        "BUY_LIMIT": mt5.ORDER_TYPE_BUY_LIMIT,
+        "BUY_STOP": mt5.ORDER_TYPE_BUY_STOP,
+        "SELL_LIMIT": mt5.ORDER_TYPE_SELL_LIMIT,
+        "SELL_STOP": mt5.ORDER_TYPE_SELL_STOP,
+    }
+    return mapping.get(order_type)
+
+
+def place_pending_order(
+    symbol: str,
+    order_type: str,
+    price: float,
+    lot: float,
+    sl: float,
+    tp: float,
+) -> dict[str, Any]:
+    """Place a pending (stop/limit) order. GTC; lifecycle is managed by the
+    caller (cancelled and re-planned at every judgment / weekend flat)."""
+    normalized_type = order_type.upper().strip()
+    if normalized_type not in PENDING_ORDER_TYPES:
+        return {
+            "success": False,
+            "action": normalized_type,
+            "reason": f"Invalid pending order type: {order_type}",
+            "retcode": None,
+        }
+
+    if lot <= 0 or price <= 0:
+        return {
+            "success": False,
+            "action": normalized_type,
+            "reason": "Lot and price must be positive",
+            "retcode": None,
+        }
+
+    if not connect():
+        return {
+            "success": False,
+            "action": normalized_type,
+            "reason": "MT5 connection failed",
+            "retcode": None,
+        }
+
+    try:
+        if mt5 is None:
+            return {
+                "success": False,
+                "action": normalized_type,
+                "reason": "MetaTrader5 package unavailable",
+                "retcode": None,
+            }
+
+        if not _ensure_symbol(symbol):
+            return {
+                "success": False,
+                "action": normalized_type,
+                "reason": f"Symbol unavailable: {symbol}",
+                "retcode": None,
+            }
+
+        type_constant = _pending_type_constant(normalized_type)
+        if type_constant is None:
+            return {
+                "success": False,
+                "action": normalized_type,
+                "reason": "Pending order type constant unavailable",
+                "retcode": None,
+            }
+
+        request: dict[str, Any] = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": float(lot),
+            "type": type_constant,
+            "price": float(price),
+            "sl": float(sl),
+            "tp": float(tp),
+            "deviation": ORDER_DEVIATION,
+            "magic": ORDER_MAGIC,
+            "comment": "GP-MATE pending",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        response = _submit_mt5_request(request, normalized_type)
+        response.update(
+            {
+                "volume": lot,
+                "price": price,
+                "sl": sl,
+                "tp": tp,
+            }
+        )
+        return response
+    except Exception as exc:
+        LOGGER.exception("place_pending_order exception: %s", exc)
+        return {
+            "success": False,
+            "action": normalized_type,
+            "reason": str(exc),
+            "retcode": None,
+        }
+    finally:
+        disconnect()
+
+
+def cancel_pending_orders(symbol: str) -> dict[str, Any]:
+    """Cancel all GP-MATE pending orders (matched by magic) for a symbol."""
+    if not connect():
+        return {"success": False, "canceled": 0, "reason": "MT5 connection failed"}
+
+    try:
+        if mt5 is None:
+            return {"success": False, "canceled": 0, "reason": "MetaTrader5 package unavailable"}
+
+        orders = mt5.orders_get(symbol=symbol)
+        if orders is None:
+            return {"success": False, "canceled": 0, "reason": f"orders_get failed: {mt5.last_error()}"}
+
+        canceled = 0
+        failed = 0
+        for order in orders:
+            order_dict = order._asdict()
+            if int(order_dict.get("magic") or 0) != ORDER_MAGIC:
+                continue
+            ticket = int(order_dict.get("ticket") or 0)
+            result = _submit_mt5_request(
+                {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket},
+                "CANCEL_PENDING",
+            )
+            if bool(result.get("success", False)):
+                canceled += 1
+            else:
+                failed += 1
+                LOGGER.warning(
+                    "cancel_pending_orders failed for ticket=%s retcode=%s",
+                    ticket,
+                    result.get("retcode"),
+                )
+
+        return {"success": failed == 0, "canceled": canceled, "reason": "OK" if failed == 0 else f"{failed} cancel(s) failed"}
+    except Exception as exc:
+        LOGGER.exception("cancel_pending_orders exception: %s", exc)
+        return {"success": False, "canceled": 0, "reason": str(exc)}
+    finally:
+        disconnect()
+
+
 def close_position(ticket: int) -> dict[str, Any]:
     """Close an open position by ticket with an opposing market order."""
     if ticket <= 0:

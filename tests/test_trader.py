@@ -215,3 +215,100 @@ def test_decide_trade_passes_recent_context_to_model() -> None:
     assert "recent_context" in user_prompt
     assert "-8468" in user_prompt
     assert "LOSS" in user_prompt
+
+
+def _decide_with_payload(payload: dict) -> dict:
+    from unittest.mock import Mock, patch
+
+    from agents.trader import decide_trade
+
+    fake_result = Mock()
+    fake_result.ok = True
+    fake_result.payload = payload
+    fake_result.model = "gpt-5.6-sol"
+    fake_result.error = ""
+    fake_result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    fake_client = Mock()
+    fake_client.call_function.return_value = fake_result
+
+    technical_report = {"direction_context": {"h1": {"close": 4404.0}}, "signal": "BUY"}
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        return decide_trade(
+            technical_report=technical_report,
+            sentiment_report={"score": 0.1},
+            debate_report={},
+        )
+
+
+def test_pending_orders_validated_on_hold_with_bias() -> None:
+    result = _decide_with_payload(
+        {
+            "action": "HOLD",
+            "symbol": "GOLD#",
+            "confidence": 0.65,
+            "reasoning": "伸び切りのため押し目待ち",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.7,
+            "pending_orders": [
+                {"type": "BUY_LIMIT", "price": 4382.45, "basis": "D1サポート押し目"},
+                {"type": "BUY_STOP", "price": 4436.0, "basis": "前日高値ブレイク"},
+            ],
+        }
+    )
+
+    # Valid orders retained, capped at 1 (the first).
+    assert len(result["pending_orders"]) == 1
+    assert result["pending_orders"][0]["type"] == "BUY_LIMIT"
+    assert result["pending_orders"][0]["price"] == 4382.45
+
+
+def test_pending_orders_dropped_when_wrong_side_or_direction() -> None:
+    result = _decide_with_payload(
+        {
+            "action": "HOLD",
+            "symbol": "GOLD#",
+            "confidence": 0.65,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.7,
+            "pending_orders": [
+                {"type": "SELL_STOP", "price": 4380.0},  # against bias
+                {"type": "BUY_LIMIT", "price": 4500.0},  # above current price
+                {"type": "BUY_STOP", "price": 4380.0},  # below current price
+            ],
+        }
+    )
+
+    assert result["pending_orders"] == []
+
+
+def test_pending_orders_cleared_on_market_action_or_weak_bias() -> None:
+    on_buy = _decide_with_payload(
+        {
+            "action": "BUY",
+            "symbol": "GOLD#",
+            "confidence": 0.9,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.9,
+            "pending_orders": [{"type": "BUY_LIMIT", "price": 4382.45}],
+        }
+    )
+    assert on_buy["pending_orders"] == []
+
+    weak_bias = _decide_with_payload(
+        {
+            "action": "HOLD",
+            "symbol": "GOLD#",
+            "confidence": 0.6,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.4,
+            "pending_orders": [{"type": "BUY_LIMIT", "price": 4382.45}],
+        }
+    )
+    assert weak_bias["pending_orders"] == []

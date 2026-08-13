@@ -223,8 +223,11 @@ def link_decisions_to_outcomes(raw_df: pd.DataFrame) -> pd.DataFrame:
     reasoning = _col(raw_df, "reasoning").str.strip()
     order_success = _col(raw_df, "order_success").str.lower() == "true"
 
+    # Pending orders that were successfully placed count as decisions too;
+    # unfilled ones simply stay in the open_or_unmatched column.
+    decision_actions = ["BUY", "SELL", "BUY_LIMIT", "BUY_STOP", "SELL_LIMIT", "SELL_STOP"]
     decisions = raw_df[
-        action.isin(["BUY", "SELL"]) & order_success & (reasoning != "closed_trade_sync")
+        action.isin(decision_actions) & order_success & (reasoning != "closed_trade_sync")
     ].copy()
     outcomes = raw_df[
         (reasoning == "closed_trade_sync")
