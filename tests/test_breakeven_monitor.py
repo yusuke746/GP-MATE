@@ -62,7 +62,8 @@ def test_run_monitor_once_moves_breakeven_at_1r(tmp_path: Path, monkeypatch: pyt
     assert rows[0]["breakeven_reason"] == "MOVED"
 
 
-def test_run_monitor_once_does_not_move_before_1r(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_monitor_once_does_not_move_before_1r(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
     monkeypatch.setattr(
         run_breakeven_monitor,
         "get_position_details",

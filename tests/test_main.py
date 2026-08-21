@@ -1059,3 +1059,47 @@ def test_is_pending_flat_window_good_for_day() -> None:
     assert not main._is_pending_flat_window(
         reference=datetime(2026, 8, 13, 3, 7, tzinfo=main.MARKET_TZ)
     )
+
+
+def test_update_position_excursions_tracks_high_low(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+
+    position = {
+        "ticket": 555,
+        "type": "BUY",
+        "price_open": 100.0,
+        "price_current": 102.0,
+    }
+    main.update_position_excursions([position])
+    main.update_position_excursions([{**position, "price_current": 105.0}])
+    main.update_position_excursions([{**position, "price_current": 98.0}])
+
+    state = main._load_excursions()
+    record = state["555"]
+    assert record["entry"] == 100.0
+    assert record["high"] == 105.0
+    assert record["low"] == 98.0
+
+    mfe, mae = main._excursion_metrics(record)
+    assert mfe == 5.0
+    assert mae == 2.0
+
+
+def test_excursion_metrics_for_sell_side() -> None:
+    mfe, mae = main._excursion_metrics(
+        {"entry": 100.0, "side": "SELL", "high": 103.0, "low": 94.0}
+    )
+    assert mfe == 6.0  # favorable = entry - low
+    assert mae == 3.0  # adverse = high - entry
+
+
+def test_pop_excursion_removes_record(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    main.update_position_excursions(
+        [{"ticket": 777, "type": "BUY", "price_open": 100.0, "price_current": 101.0}]
+    )
+
+    record = main._pop_excursion("777")
+    assert record is not None
+    assert main._load_excursions() == {}
+    assert main._pop_excursion("777") is None

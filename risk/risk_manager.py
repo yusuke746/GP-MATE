@@ -15,10 +15,10 @@ from config import (
 
 MIN_LOT = 0.01
 
-# Structural SL (suggested_sl) adoption bounds, in ATR units.
-# Too close = noise stop; too far = undersized lot and oversized time-risk.
+# Structural SL (suggested_sl) minimum distance in ATR units (noise-stop guard).
+# The maximum is the ATR default itself (atr * atr_mult): suggested values may
+# only tighten the baseline, never widen it.
 SUGGESTED_SL_MIN_ATR = 1.0
-SUGGESTED_SL_MAX_ATR = 2.5
 
 
 @dataclass(frozen=True)
@@ -140,12 +140,18 @@ def _resolve_structural_sl(
     action: str,
     entry_price: float,
     atr: float,
+    atr_mult: float,
     default_sl: float,
     suggested_sl: float | None,
 ) -> tuple[float, str]:
-    """Adopt the AI's structural SL when it is on the correct side and its
-    distance stays within [SUGGESTED_SL_MIN_ATR, SUGGESTED_SL_MAX_ATR] x ATR;
-    otherwise keep the ATR-based default."""
+    """Adopt the AI's structural SL only when it TIGHTENS the ATR baseline.
+
+    The baseline SL distance is atr * atr_mult (default ATR x 1.5). A suggested
+    SL is adopted when it sits on the correct side and its distance is inside
+    [SUGGESTED_SL_MIN_ATR x ATR, baseline]; anything wider (or noise-tight)
+    falls back to the baseline. Mirrors the suggested_tp rule: AI suggestions
+    may only shrink the geometry, never expand it.
+    """
     try:
         suggested = float(suggested_sl) if suggested_sl is not None else None
     except Exception:
@@ -160,7 +166,7 @@ def _resolve_structural_sl(
         return default_sl, "fallback_atr"
 
     distance = abs(entry_price - suggested)
-    if not (SUGGESTED_SL_MIN_ATR * atr <= distance <= SUGGESTED_SL_MAX_ATR * atr):
+    if not (SUGGESTED_SL_MIN_ATR * atr <= distance <= atr_mult * atr):
         return default_sl, "fallback_atr"
 
     return round(suggested, 5), "suggested"
@@ -194,7 +200,10 @@ def build_risk_plan(
         }
 
     try:
-        default_sl, _ = calc_sl_tp(
+        # The baseline geometry is always ATR-based: SL = ATR x atr_mult and
+        # TP = that distance x rr. AI suggestions (suggested_sl/suggested_tp)
+        # may only tighten this box, never widen it.
+        default_sl, tp_2r = calc_sl_tp(
             entry_price=entry_price,
             atr=atr,
             action=normalized_action,
@@ -206,17 +215,10 @@ def build_risk_plan(
             action=normalized_action,
             entry_price=entry_price,
             atr=atr,
+            atr_mult=atr_mult,
             default_sl=default_sl,
             suggested_sl=suggested_sl,
         )
-
-        # R (and hence the 2R cap) follows the actual SL distance, so a
-        # structural SL keeps risk/reward geometry consistent.
-        risk_distance = abs(entry_price - sl)
-        if normalized_action == "BUY":
-            tp_2r = round(entry_price + risk_distance * rr, 5)
-        else:
-            tp_2r = round(entry_price - risk_distance * rr, 5)
 
         # Default to legacy 2R TP when AI suggestion is unavailable/invalid.
         final_tp = tp_2r

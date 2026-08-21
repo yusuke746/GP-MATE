@@ -18,6 +18,7 @@ from main import (
     _is_pending_flat_window,
     _is_weekend_flat_window,
     manage_breakeven_for_position,
+    update_position_excursions,
 )
 
 LOGGER = logging.getLogger("gp_mate.breakeven_monitor")
@@ -182,6 +183,10 @@ def run_monitor_once() -> dict[str, Any]:
             "moved_positions": 0,
             "reason": str(exc),
         }
+
+    # Sample running high/low per position for MFE/MAE analysis (safe no-op
+    # when flat; never raises).
+    update_position_excursions(positions)
 
     if _is_weekend_flat_window():
         # Pending orders must not survive into (or through) the weekend either.
