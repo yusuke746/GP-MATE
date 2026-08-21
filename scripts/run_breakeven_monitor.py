@@ -10,8 +10,9 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from config import BREAKEVEN_MONITOR_TIMES, STAGE, SYMBOL
+from config import BREAKEVEN_MONITOR_TIMES, NEWS_FILTER_MINUTES, STAGE, SYMBOL
 from data.mt5_client import cancel_pending_orders, close_position, get_account_info, get_position_details
+from data.news_client import is_high_impact_soon
 from main import (
     _append_trade_log,
     _is_pending_flat_window,
@@ -213,6 +214,21 @@ def run_monitor_once() -> dict[str, Any]:
                 )
         except Exception as exc:
             LOGGER.warning("Daily pending cutoff cancel failed: %s", exc)
+    elif is_high_impact_soon(minutes=NEWS_FILTER_MINUTES):
+        # The judgment-time news filter blocks new entries, but an armed
+        # pending order would otherwise sit through the event and can be
+        # filled by the news spike itself. Cancel; the next judgment re-plans.
+        # (is_high_impact_soon fails closed, so calendar-fetch failures also
+        # cancel — conservative by design.)
+        try:
+            cancel_result = cancel_pending_orders(SYMBOL)
+            if int(cancel_result.get("canceled", 0) or 0) > 0:
+                LOGGER.warning(
+                    "High-impact news window: cancelled %s pending order(s)",
+                    cancel_result.get("canceled"),
+                )
+        except Exception as exc:
+            LOGGER.warning("News-window pending cancel failed: %s", exc)
 
     if not positions:
         LOGGER.info("No open positions for %s", SYMBOL)

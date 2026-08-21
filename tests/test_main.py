@@ -12,12 +12,22 @@ import pandas as pd
 import pytest
 
 
-def test_is_trading_session_allowed_blocks_monday() -> None:
-    allowed, reason = main._is_trading_session_allowed(
+def test_is_trading_session_allowed_monday_pre_ny_only() -> None:
+    blocked, reason = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 6, 7, 59, tzinfo=main.MARKET_TZ)
+    )
+    assert not blocked
+    assert reason == "Monday pre-NY session paused"
+
+    # From the NY session open (default 08:00 NY), Monday judgments are allowed.
+    allowed_open, _ = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 6, 8, 0, tzinfo=main.MARKET_TZ)
+    )
+    allowed_noon, _ = main._is_trading_session_allowed(
         reference=datetime(2026, 7, 6, 12, 0, tzinfo=main.MARKET_TZ)
     )
-    assert not allowed
-    assert reason == "Monday trading paused"
+    assert allowed_open
+    assert allowed_noon
 
 
 def test_is_trading_session_allowed_blocks_weekend_close_window() -> None:
@@ -56,7 +66,11 @@ def test_is_weekend_flat_window_covers_friday_cutoff_to_monday() -> None:
     assert main._is_weekend_flat_window(
         reference=datetime(2026, 8, 9, 18, 0, tzinfo=main.MARKET_TZ)
     )
+    # Monday: leftover cleanup only before the NY session opens.
     assert main._is_weekend_flat_window(
+        reference=datetime(2026, 8, 10, 7, 0, tzinfo=main.MARKET_TZ)
+    )
+    assert not main._is_weekend_flat_window(
         reference=datetime(2026, 8, 10, 9, 0, tzinfo=main.MARKET_TZ)
     )
     # Tuesday-Thursday: normal operation.
@@ -234,7 +248,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
             "ok": True,
             "action": "BUY",
             "lot": 0.01,
@@ -982,7 +996,7 @@ def test_run_once_places_pending_order_on_hold_with_plan(tmp_path: Path, monkeyp
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
             "ok": action in {"BUY", "SELL"},
             "action": action if action in {"BUY", "SELL"} else "HOLD",
             "lot": 0.01,

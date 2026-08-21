@@ -288,6 +288,52 @@ def link_decisions_to_outcomes(raw_df: pd.DataFrame) -> pd.DataFrame:
     return linked.reset_index(drop=True)
 
 
+def slot_summary(linked: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate realized results per judgment slot (NY time).
+
+    Rows are labeled by the decision timestamp rounded down to the half hour
+    in America/New_York, matching the judgment schedule (03:00/08:00/09:30/10:30).
+    """
+    columns = ["slot_ny", "decisions", "settled", "wins", "win_rate", "total_pnl", "profit_factor"]
+    if linked.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = linked.copy()
+    work = work[work["timestamp_utc"].notna()]
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    ny_times = work["timestamp_utc"].dt.tz_convert("America/New_York")
+    work["slot_ny"] = ny_times.dt.strftime("%H:") + ny_times.dt.minute.map(
+        lambda m: "30" if m >= 30 else "00"
+    )
+
+    rows: list[dict[str, Any]] = []
+    for slot, slot_df in work.groupby("slot_ny"):
+        settled = slot_df[slot_df["realized_pnl"].notna()]
+        pnl = settled["realized_pnl"]
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl < 0]
+        if float(losses.sum()) < 0:
+            pf: float | None = float(wins.sum()) / abs(float(losses.sum()))
+        elif float(wins.sum()) > 0:
+            pf = float("inf")
+        else:
+            pf = None
+        rows.append(
+            {
+                "slot_ny": slot,
+                "decisions": int(len(slot_df)),
+                "settled": int(len(settled)),
+                "wins": int(len(wins)),
+                "win_rate": (len(wins) / len(settled) * 100.0) if len(settled) else 0.0,
+                "total_pnl": float(pnl.sum()) if len(settled) else 0.0,
+                "profit_factor": pf,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns).sort_values("slot_ny").reset_index(drop=True)
+
+
 def _band_label(low: float, high: float) -> str:
     return f"[{low:.2f}-{high:.2f})"
 
@@ -410,6 +456,18 @@ def print_confidence_report(csv_path: str) -> None:
             lambda v: "N/A" if v is None or pd.isna(v) else ("inf" if v == float("inf") else f"{v:.2f}")
         )
         print(display.to_string(index=False))
+    print("")
+    print("[Realized results by judgment slot (NY time)]")
+    slots = slot_summary(linked)
+    if slots.empty or slots["decisions"].sum() == 0:
+        print("No executed decisions yet")
+    else:
+        slot_display = slots.copy()
+        slot_display["win_rate"] = slot_display["win_rate"].map(lambda v: f"{v:.1f}%")
+        slot_display["profit_factor"] = slot_display["profit_factor"].map(
+            lambda v: "N/A" if v is None or pd.isna(v) else ("inf" if v == float("inf") else f"{v:.2f}")
+        )
+        print(slot_display.to_string(index=False))
     print("")
     print("[HOLD decisions by confidence band]")
     if blocked.empty or blocked["holds"].sum() == 0:

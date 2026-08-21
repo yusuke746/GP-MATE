@@ -103,7 +103,7 @@ def test_run_once_holds_when_spread_exceeds_multiplier(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
             "ok": True,
             "action": "BUY",
             "lot": 0.1,

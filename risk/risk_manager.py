@@ -15,6 +15,11 @@ from config import (
 
 MIN_LOT = 0.01
 
+# Structural SL (suggested_sl) adoption bounds, in ATR units.
+# Too close = noise stop; too far = undersized lot and oversized time-risk.
+SUGGESTED_SL_MIN_ATR = 1.0
+SUGGESTED_SL_MAX_ATR = 2.5
+
 
 @dataclass(frozen=True)
 class FilterCheckResult:
@@ -131,12 +136,43 @@ def check_filters(
     return FilterCheckResult(True, "OK")
 
 
+def _resolve_structural_sl(
+    action: str,
+    entry_price: float,
+    atr: float,
+    default_sl: float,
+    suggested_sl: float | None,
+) -> tuple[float, str]:
+    """Adopt the AI's structural SL when it is on the correct side and its
+    distance stays within [SUGGESTED_SL_MIN_ATR, SUGGESTED_SL_MAX_ATR] x ATR;
+    otherwise keep the ATR-based default."""
+    try:
+        suggested = float(suggested_sl) if suggested_sl is not None else None
+    except Exception:
+        suggested = None
+
+    if suggested is None or suggested <= 0 or atr <= 0:
+        return default_sl, "fallback_atr"
+
+    if action == "BUY" and suggested >= entry_price:
+        return default_sl, "fallback_atr"
+    if action == "SELL" and suggested <= entry_price:
+        return default_sl, "fallback_atr"
+
+    distance = abs(entry_price - suggested)
+    if not (SUGGESTED_SL_MIN_ATR * atr <= distance <= SUGGESTED_SL_MAX_ATR * atr):
+        return default_sl, "fallback_atr"
+
+    return round(suggested, 5), "suggested"
+
+
 def build_risk_plan(
     action: str,
     entry_price: float,
     atr: float,
     balance_jpy: float,
     suggested_tp: float | None = None,
+    suggested_sl: float | None = None,
     risk_pct: float = RISK_PERCENT,
     atr_mult: float = ATR_MULTIPLIER_SL,
     rr: float = RISK_REWARD_RATIO,
@@ -158,13 +194,29 @@ def build_risk_plan(
         }
 
     try:
-        sl, tp_2r = calc_sl_tp(
+        default_sl, _ = calc_sl_tp(
             entry_price=entry_price,
             atr=atr,
             action=normalized_action,
             atr_mult=atr_mult,
             rr=rr,
         )
+
+        sl, sl_source = _resolve_structural_sl(
+            action=normalized_action,
+            entry_price=entry_price,
+            atr=atr,
+            default_sl=default_sl,
+            suggested_sl=suggested_sl,
+        )
+
+        # R (and hence the 2R cap) follows the actual SL distance, so a
+        # structural SL keeps risk/reward geometry consistent.
+        risk_distance = abs(entry_price - sl)
+        if normalized_action == "BUY":
+            tp_2r = round(entry_price + risk_distance * rr, 5)
+        else:
+            tp_2r = round(entry_price - risk_distance * rr, 5)
 
         # Default to legacy 2R TP when AI suggestion is unavailable/invalid.
         final_tp = tp_2r
@@ -218,6 +270,7 @@ def build_risk_plan(
             "action": normalized_action,
             "lot": lot,
             "sl": sl,
+            "sl_source": sl_source,
             "tp": final_tp,
             "tp_2r": tp_2r,
             "tp_source": tp_source,

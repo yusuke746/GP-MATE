@@ -953,7 +953,7 @@ def test_run_once_falls_back_to_hold_when_debate_graph_fails(tmp_path: Path, mon
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
             "ok": True,
             "action": "BUY",
             "lot": 0.1,

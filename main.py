@@ -34,6 +34,7 @@ from config import (
     MARKET_TZ,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
+    MONDAY_OPEN_NY,
     NEWS_FILTER_MINUTES,
     NY_RUN_TIMES,
     SPREAD_SAMPLE_INTERVAL,
@@ -416,15 +417,17 @@ def _is_trading_session_allowed(reference: datetime | None = None) -> tuple[bool
     """Return whether trading is allowed under NY-time session policy.
 
     Policy:
-    - Block all Monday (weekday=0) trades.
+    - Block Monday before the NY session opens (default 08:00 NY): weekend
+      gaps and the thin Monday Asia/London hours are skipped, but Monday NY
+      judgments are allowed.
     - Block new entries from the Friday weekend-flat cutoff (default 16:30 NY)
       through Sun 16:59 (America/New_York).
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
     weekday = now_market.weekday()
 
-    if weekday == 0:
-        return False, "Monday trading paused"
+    if weekday == 0 and (now_market.hour, now_market.minute) < MONDAY_OPEN_NY:
+        return False, "Monday pre-NY session paused"
 
     if weekday == 4 and (now_market.hour, now_market.minute) >= FRIDAY_FLAT_TIME_NY:
         return False, "Friday weekend-flat window"
@@ -461,16 +464,19 @@ def _is_weekend_flat_window(reference: datetime | None = None) -> bool:
 
     Window (America/New_York):
     - Friday from the flat cutoff (default 16:30) onward.
-    - Saturday/Sunday/Monday: no legitimate position can exist there (entries
-      are blocked), so anything still open is a weekend leftover — close it as
-      soon as the market lets us (Sunday 17:00 reopen or Monday).
+    - Saturday/Sunday, and Monday before the NY session opens: no legitimate
+      position can exist there (entries are blocked), so anything still open
+      is a weekend leftover — close it as soon as the market lets us.
+      From Monday NY open onward trading resumes, so positions are legitimate.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
     weekday = now_market.weekday()
 
     if weekday == 4:
         return (now_market.hour, now_market.minute) >= FRIDAY_FLAT_TIME_NY
-    return weekday in {5, 6, 0}
+    if weekday == 0:
+        return (now_market.hour, now_market.minute) < MONDAY_OPEN_NY
+    return weekday in {5, 6}
 
 
 def _build_round_numbers(current_price: float, scan_range: float = TP_ROUND_SCAN_RANGE) -> list[float]:
@@ -922,6 +928,7 @@ def _handle_pending_orders(
             atr=atr,
             balance_jpy=balance,
             suggested_tp=pending.get("tp"),
+            suggested_sl=pending.get("sl"),
             jpy_usd_rate=jpy_usd_rate,
         )
         if not bool(risk_plan.get("ok")):
@@ -1404,6 +1411,7 @@ def run_once(
             atr=atr,
             balance_jpy=balance,
             suggested_tp=trader_report.get("suggested_tp"),
+            suggested_sl=trader_report.get("suggested_sl"),
             jpy_usd_rate=jpy_usd_rate,
         )
 

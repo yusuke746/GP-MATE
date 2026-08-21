@@ -271,3 +271,48 @@ def test_build_risk_plan_sl_is_unchanged_with_suggested_tp() -> None:
     )
     assert baseline["ok"] and adjusted["ok"]
     assert float(baseline["sl"]) == float(adjusted["sl"])
+
+
+def test_build_risk_plan_adopts_structural_sl_within_bounds() -> None:
+    # entry 4465, suggested SL 4446 -> distance 19 with ATR 15 (=1.27 ATR, in [1.0, 2.5]).
+    plan = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4446.0
+    )
+    assert plan["ok"]
+    assert plan["sl"] == 4446.0
+    assert plan["sl_source"] == "suggested"
+    # 2R follows the actual SL distance: 4465 + 19*2 = 4503.
+    assert float(plan["tp_2r"]) == 4503.0
+
+
+def test_build_risk_plan_rejects_structural_sl_outside_bounds() -> None:
+    # Too close: distance 10 < 1.0*ATR(15).
+    too_close = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4455.0
+    )
+    assert too_close["sl_source"] == "fallback_atr"
+    assert float(too_close["sl"]) == 4465.0 - 15.0 * 1.5
+
+    # Too far: distance 60 > 2.5*ATR(15).
+    too_far = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4405.0
+    )
+    assert too_far["sl_source"] == "fallback_atr"
+
+    # Wrong side for SELL.
+    wrong_side = build_risk_plan(
+        action="SELL", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4446.0
+    )
+    assert wrong_side["sl_source"] == "fallback_atr"
+
+
+def test_build_risk_plan_structural_sl_resizes_lot() -> None:
+    # Wider SL -> smaller lot at the same account risk.
+    narrow = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4448.0
+    )
+    wide = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4430.0
+    )
+    assert narrow["sl_source"] == "suggested" and wide["sl_source"] == "suggested"
+    assert float(wide["lot"]) < float(narrow["lot"])

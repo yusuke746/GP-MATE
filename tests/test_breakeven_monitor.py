@@ -15,6 +15,7 @@ def test_run_monitor_once_exits_cleanly_without_positions(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
     monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "is_high_impact_soon", lambda minutes: False)
     result = run_breakeven_monitor.run_monitor_once()
 
     assert result["success"] is True
@@ -48,6 +49,7 @@ def test_run_monitor_once_moves_breakeven_at_1r(tmp_path: Path, monkeypatch: pyt
 
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
     monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "is_high_impact_soon", lambda minutes: False)
     result = run_breakeven_monitor.run_monitor_once()
 
     assert result["success"] is True
@@ -82,6 +84,7 @@ def test_run_monitor_once_does_not_move_before_1r(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
     monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "is_high_impact_soon", lambda minutes: False)
     result = run_breakeven_monitor.run_monitor_once()
 
     assert result["success"] is True
@@ -94,6 +97,7 @@ def test_run_monitor_once_price_fetch_failure_exits_safely(monkeypatch: pytest.M
 
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
     monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "is_high_impact_soon", lambda minutes: False)
     result = run_breakeven_monitor.run_monitor_once()
 
     assert result["success"] is False
@@ -281,3 +285,22 @@ def test_run_monitor_once_cancels_pendings_at_daily_cutoff_but_keeps_breakeven(
     assert cancel_calls == [run_breakeven_monitor.SYMBOL]
     assert result["moved_positions"] == 1
     assert modify_calls == [(321, 100.0 + main.BREAKEVEN_BUFFER)]
+
+
+def test_run_monitor_once_cancels_pendings_before_high_impact_news(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "is_high_impact_soon", lambda minutes: True)
+    monkeypatch.setattr(run_breakeven_monitor, "get_position_details", lambda symbol: [])
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        run_breakeven_monitor,
+        "cancel_pending_orders",
+        lambda symbol: calls.append(symbol) or {"success": True, "canceled": 1, "reason": "OK"},
+    )
+
+    result = run_breakeven_monitor.run_monitor_once()
+
+    assert calls == [run_breakeven_monitor.SYMBOL]
+    assert result["success"] is True
