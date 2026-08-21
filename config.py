@@ -60,6 +60,7 @@ class Settings:
     friday_flat_time_ny: tuple[int, int]
     daily_pending_cutoff_ny: tuple[int, int]
     monday_open_ny: tuple[int, int]
+    sl_structure_buffer_usd: float
     spread_multiplier_limit: float
     spread_samples: int
     spread_sample_interval: float
@@ -253,6 +254,7 @@ def load_settings() -> Settings:
         friday_flat_time_ny=_parse_hhmm(_get_env_str("FRIDAY_FLAT_TIME_NY", "16:30"), (16, 30)),
         daily_pending_cutoff_ny=_parse_hhmm(_get_env_str("DAILY_PENDING_CUTOFF_NY", "16:45"), (16, 45)),
         monday_open_ny=_parse_hhmm(_get_env_str("MONDAY_OPEN_NY", "08:00"), (8, 0)),
+        sl_structure_buffer_usd=_get_env_float("SL_STRUCTURE_BUFFER_USD", 2.0),
         spread_multiplier_limit=2.0,
         spread_samples=20,
         spread_sample_interval=0.5,
@@ -301,6 +303,7 @@ JPY_USD_RATE_FALLBACK: Final[float] = settings.jpy_usd_rate_fallback
 FRIDAY_FLAT_TIME_NY: Final[tuple[int, int]] = settings.friday_flat_time_ny
 DAILY_PENDING_CUTOFF_NY: Final[tuple[int, int]] = settings.daily_pending_cutoff_ny
 MONDAY_OPEN_NY: Final[tuple[int, int]] = settings.monday_open_ny
+SL_STRUCTURE_BUFFER_USD: Final[float] = settings.sl_structure_buffer_usd
 SPREAD_MULTIPLIER_LIMIT: Final[float] = settings.spread_multiplier_limit
 SPREAD_SAMPLES: Final[int] = settings.spread_samples
 SPREAD_SAMPLE_INTERVAL: Final[float] = settings.spread_sample_interval

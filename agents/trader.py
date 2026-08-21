@@ -39,10 +39,11 @@ SYSTEM_PROMPT = (
     "suggested_tp_basisには、その価格にした根拠を簡潔な日本語で記すこと。"
     "actionがBUY/SELLの場合、suggested_slも設定すること。"
     "SLは単なる損切り幅ではなく『シナリオ否定点』である。"
-    "エントリー根拠が崩れる構造的な水準(BUYなら直下の強サポート帯の外側、"
-    "SELLなら直上の強レジスタンス帯の外側)に、0.3×H1 ATR程度のマージンを取って置くこと。"
-    "基準SLはATR×1.5であり、suggested_slはそれより内側(浅い)場合のみ採用される。"
-    "基準より深い水準や1.0×ATR未満の近すぎる水準はATR×1.5にフォールバックされるため、"
+    "suggested_slにはエントリー根拠が崩れる構造的な水準そのもの"
+    "(BUYなら直下の強サポート帯の価格、SELLなら直上の強レジスタンス帯の価格)を設定すること。"
+    "ヒゲ抜け対策のバッファはシステム側が自動付与するため、自分でマージンを足さないこと。"
+    "基準SLはATR×1.5であり、バッファ付与後の距離が基準より内側(浅い)場合のみ採用される。"
+    "基準より深い水準はATR×1.5にフォールバックされるため、"
     "基準SLより手前に明確な構造があるときだけ提案する意味がある。"
     "算出根拠が不十分ならsuggested_slはnullにすること(ATR×1.5が自動適用される)。"
     "suggested_sl_basisにはその水準にした根拠を簡潔な日本語で記すこと。"
@@ -82,7 +83,7 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
             },
             "suggested_sl": {
                 "type": ["number", "null"],
-                "description": "損切り価格=シナリオ否定点。構造的な水準の外側に置く。算出できなければnull",
+                "description": "シナリオ否定点となる構造水準そのもの(マージン不要、バッファはシステム付与)。算出できなければnull",
             },
             "suggested_sl_basis": {
                 "type": "string",
@@ -97,7 +98,7 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
                         "type": {"type": "string", "enum": ["BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT"]},
                         "price": {"type": "number", "description": "発動価格"},
                         "tp": {"type": ["number", "null"], "description": "任意の利確目標(2R上限適用)"},
-                        "sl": {"type": ["number", "null"], "description": "任意の損切り=シナリオ否定点(範囲外はATRベースに自動フォールバック)"},
+                        "sl": {"type": ["number", "null"], "description": "任意の損切り=シナリオ否定点の構造水準そのもの(バッファはシステム付与、範囲外はATRベースに自動フォールバック)"},
                         "basis": {"type": "string", "description": "この予約の根拠(日本語)"},
                     },
                     "required": ["type", "price"],
