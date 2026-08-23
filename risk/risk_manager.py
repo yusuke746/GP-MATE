@@ -10,10 +10,16 @@ from config import (
     MAX_DAILY_LOSS_PCT,
     RISK_PERCENT,
     RISK_REWARD_RATIO,
+    SL_STRUCTURE_BUFFER_USD,
     SPREAD_MULTIPLIER_LIMIT,
 )
 
 MIN_LOT = 0.01
+
+# Structural SL (suggested_sl) minimum distance in ATR units (noise-stop guard).
+# The maximum is the ATR default itself (atr * atr_mult): suggested values may
+# only tighten the baseline, never widen it.
+SUGGESTED_SL_MIN_ATR = 1.0
 
 
 @dataclass(frozen=True)
@@ -131,12 +137,55 @@ def check_filters(
     return FilterCheckResult(True, "OK")
 
 
+def _resolve_structural_sl(
+    action: str,
+    entry_price: float,
+    atr: float,
+    atr_mult: float,
+    default_sl: float,
+    suggested_sl: float | None,
+    structure_buffer_usd: float = SL_STRUCTURE_BUFFER_USD,
+) -> tuple[float, str]:
+    """Adopt the AI's structural SL only when it TIGHTENS the ATR baseline.
+
+    suggested_sl is treated as the structural LEVEL itself (e.g. the support
+    cluster price); the stop is placed a fixed buffer BEYOND it so a wick
+    through the level does not stop the trade out before the thesis is
+    actually invalidated. The buffered distance must land inside
+    [SUGGESTED_SL_MIN_ATR x ATR, atr * atr_mult]; anything wider (or
+    noise-tight) falls back to the ATR baseline. Mirrors the suggested_tp
+    rule: AI suggestions may only shrink the geometry, never expand it.
+    """
+    try:
+        suggested = float(suggested_sl) if suggested_sl is not None else None
+    except Exception:
+        suggested = None
+
+    if suggested is None or suggested <= 0 or atr <= 0:
+        return default_sl, "fallback_atr"
+
+    if action == "BUY" and suggested >= entry_price:
+        return default_sl, "fallback_atr"
+    if action == "SELL" and suggested <= entry_price:
+        return default_sl, "fallback_atr"
+
+    buffer = max(structure_buffer_usd, 0.0)
+    buffered = suggested - buffer if action == "BUY" else suggested + buffer
+
+    distance = abs(entry_price - buffered)
+    if not (SUGGESTED_SL_MIN_ATR * atr <= distance <= atr_mult * atr):
+        return default_sl, "fallback_atr"
+
+    return round(buffered, 5), "suggested"
+
+
 def build_risk_plan(
     action: str,
     entry_price: float,
     atr: float,
     balance_jpy: float,
     suggested_tp: float | None = None,
+    suggested_sl: float | None = None,
     risk_pct: float = RISK_PERCENT,
     atr_mult: float = ATR_MULTIPLIER_SL,
     rr: float = RISK_REWARD_RATIO,
@@ -158,12 +207,24 @@ def build_risk_plan(
         }
 
     try:
-        sl, tp_2r = calc_sl_tp(
+        # The baseline geometry is always ATR-based: SL = ATR x atr_mult and
+        # TP = that distance x rr. AI suggestions (suggested_sl/suggested_tp)
+        # may only tighten this box, never widen it.
+        default_sl, tp_2r = calc_sl_tp(
             entry_price=entry_price,
             atr=atr,
             action=normalized_action,
             atr_mult=atr_mult,
             rr=rr,
+        )
+
+        sl, sl_source = _resolve_structural_sl(
+            action=normalized_action,
+            entry_price=entry_price,
+            atr=atr,
+            atr_mult=atr_mult,
+            default_sl=default_sl,
+            suggested_sl=suggested_sl,
         )
 
         # Default to legacy 2R TP when AI suggestion is unavailable/invalid.
@@ -218,6 +279,7 @@ def build_risk_plan(
             "action": normalized_action,
             "lot": lot,
             "sl": sl,
+            "sl_source": sl_source,
             "tp": final_tp,
             "tp_2r": tp_2r,
             "tp_source": tp_source,

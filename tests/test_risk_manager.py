@@ -271,3 +271,62 @@ def test_build_risk_plan_sl_is_unchanged_with_suggested_tp() -> None:
     )
     assert baseline["ok"] and adjusted["ok"]
     assert float(baseline["sl"]) == float(adjusted["sl"])
+
+
+def test_build_risk_plan_adopts_structural_sl_with_wick_buffer() -> None:
+    # Baseline SL distance = ATR(15) x 1.5 = 22.5.
+    # suggested_sl is the structural LEVEL; the stop is placed
+    # SL_STRUCTURE_BUFFER_USD (default 2.0) beyond it: 4446 -> 4444.
+    # Buffered distance 21 is inside [15.0, 22.5] -> adopted.
+    plan = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4446.0
+    )
+    assert plan["ok"]
+    assert plan["sl"] == 4444.0
+    assert plan["sl_source"] == "suggested"
+    # The 2R box stays anchored to the ATR baseline, NOT the adopted SL:
+    # 4465 + 22.5*2 = 4510.
+    assert float(plan["tp_2r"]) == 4510.0
+
+
+def test_build_risk_plan_sell_buffer_extends_above_level() -> None:
+    # SELL: level 4484 -> stop at 4486 (level + buffer), distance 21.
+    plan = build_risk_plan(
+        action="SELL", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4484.0
+    )
+    assert plan["sl_source"] == "suggested"
+    assert plan["sl"] == 4486.0
+
+
+def test_build_risk_plan_rejects_structural_sl_outside_baseline() -> None:
+    # Too close even after buffer: 4455 -> 4453, distance 12 < 1.0*ATR(15).
+    too_close = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4455.0
+    )
+    assert too_close["sl_source"] == "fallback_atr"
+    assert float(too_close["sl"]) == 4465.0 - 15.0 * 1.5
+
+    # Deeper than the ATR baseline after buffer: 4444 -> 4442, distance 23 > 22.5.
+    deeper = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4444.0
+    )
+    assert deeper["sl_source"] == "fallback_atr"
+    assert float(deeper["sl"]) == 4465.0 - 15.0 * 1.5
+
+    # Wrong side for SELL.
+    wrong_side = build_risk_plan(
+        action="SELL", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4446.0
+    )
+    assert wrong_side["sl_source"] == "fallback_atr"
+
+
+def test_build_risk_plan_structural_sl_resizes_lot() -> None:
+    # Tighter SL -> larger lot at the same account risk (both inside baseline).
+    narrow = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4449.0
+    )
+    wide = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=5_000_000, suggested_sl=4445.0
+    )
+    assert narrow["sl_source"] == "suggested" and wide["sl_source"] == "suggested"
+    assert float(wide["lot"]) < float(narrow["lot"])

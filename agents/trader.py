@@ -37,6 +37,16 @@ SYSTEM_PROMPT = (
     "したがってsuggested_tpは原則2R以内で、最も反発が強そうなレベルの手前に置くこと。"
     "HOLDの場合や算出根拠が不十分な場合、suggested_tpはnullにすること。"
     "suggested_tp_basisには、その価格にした根拠を簡潔な日本語で記すこと。"
+    "actionがBUY/SELLの場合、suggested_slも設定すること。"
+    "SLは単なる損切り幅ではなく『シナリオ否定点』である。"
+    "suggested_slにはエントリー根拠が崩れる構造的な水準そのもの"
+    "(BUYなら直下の強サポート帯の価格、SELLなら直上の強レジスタンス帯の価格)を設定すること。"
+    "ヒゲ抜け対策のバッファはシステム側が自動付与するため、自分でマージンを足さないこと。"
+    "基準SLはATR×1.5であり、バッファ付与後の距離が基準より内側(浅い)場合のみ採用される。"
+    "基準より深い水準はATR×1.5にフォールバックされるため、"
+    "基準SLより手前に明確な構造があるときだけ提案する意味がある。"
+    "算出根拠が不十分ならsuggested_slはnullにすること(ATR×1.5が自動適用される)。"
+    "suggested_sl_basisにはその水準にした根拠を簡潔な日本語で記すこと。"
     "HOLDで見送る場合でも、directional_biasが明確でtrigger_conditionsに"
     "具体的な発動価格条件があるなら、その中で最も優位な1件をpending_ordersに"
     "構造化して返すこと。ブレイク待ちはBUY_STOP/SELL_STOP、"
@@ -71,6 +81,14 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": "suggested_tpの根拠(例: キリ番4000と前日安値が重なる4023の手前)",
             },
+            "suggested_sl": {
+                "type": ["number", "null"],
+                "description": "シナリオ否定点となる構造水準そのもの(マージン不要、バッファはシステム付与)。算出できなければnull",
+            },
+            "suggested_sl_basis": {
+                "type": "string",
+                "description": "suggested_slの根拠(例: 4450.70の支持帯割れはシナリオ否定のため4446)",
+            },
             "pending_orders": {
                 "type": "array",
                 "description": "HOLD時の条件付き予約注文(最大1件採用)。条件がなければ空配列",
@@ -80,6 +98,7 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
                         "type": {"type": "string", "enum": ["BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT"]},
                         "price": {"type": "number", "description": "発動価格"},
                         "tp": {"type": ["number", "null"], "description": "任意の利確目標(2R上限適用)"},
+                        "sl": {"type": ["number", "null"], "description": "任意の損切り=シナリオ否定点の構造水準そのもの(バッファはシステム付与、範囲外はATRベースに自動フォールバック)"},
                         "basis": {"type": "string", "description": "この予約の根拠(日本語)"},
                     },
                     "required": ["type", "price"],
@@ -175,11 +194,21 @@ def _validate_pending_orders(
             if order_type == "SELL_LIMIT" and price <= current_price:
                 continue
 
+        pending_sl = _safe_float_or_none(item.get("sl"))
+        if pending_sl is not None:
+            # SL must be on the loss side of the trigger price; drop it (not
+            # the whole order) when inverted — ATR fallback applies downstream.
+            if order_type.startswith("BUY") and pending_sl >= price:
+                pending_sl = None
+            elif order_type.startswith("SELL") and pending_sl <= price:
+                pending_sl = None
+
         valid.append(
             {
                 "type": order_type,
                 "price": round(price, 5),
                 "tp": _safe_float_or_none(item.get("tp")),
+                "sl": pending_sl,
                 "basis": str(item.get("basis", "") or ""),
             }
         )
@@ -281,6 +310,19 @@ def decide_trade(
     suggested_tp_basis = str(payload.get("suggested_tp_basis", "") or "")
     payload["suggested_tp"] = suggested_tp
     payload["suggested_tp_basis"] = suggested_tp_basis
+
+    suggested_sl = _safe_float_or_none(payload.get("suggested_sl"))
+    if action == "HOLD":
+        suggested_sl = None
+    elif suggested_sl is not None and current_price is not None:
+        # SL must sit on the loss side; inverted values are discarded here and
+        # the ATR fallback applies in build_risk_plan.
+        if action == "BUY" and suggested_sl >= current_price:
+            suggested_sl = None
+        elif action == "SELL" and suggested_sl <= current_price:
+            suggested_sl = None
+    payload["suggested_sl"] = suggested_sl
+    payload["suggested_sl_basis"] = str(payload.get("suggested_sl_basis", "") or "")
 
     payload["pending_orders"] = _validate_pending_orders(
         raw=payload.get("pending_orders"),

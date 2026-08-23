@@ -78,3 +78,48 @@ def test_sync_closed_trades_deduplicates_deal_id(tmp_path: Path, monkeypatch) ->
     rows = _read_rows(log_path)
     assert len(rows) == 1
     assert rows[0]["deal_id"] == "999"
+
+
+def test_sync_closed_trades_enriches_with_mfe_mae(tmp_path: Path, monkeypatch) -> None:
+    log_path = tmp_path / "trade_log.csv"
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+    monkeypatch.setattr(main, "CLOSED_DEAL_STATE_PATH", tmp_path / "closed_deal_state.json")
+
+    # Seed excursion state as if the monitor had sampled this position.
+    main.update_position_excursions(
+        [{"ticket": 971164071, "type": "BUY", "price_open": 4356.25, "price_current": 4372.0}]
+    )
+    main.update_position_excursions(
+        [{"ticket": 971164071, "type": "BUY", "price_open": 4356.25, "price_current": 4340.0}]
+    )
+
+    monkeypatch.setattr(
+        main,
+        "get_closed_deals",
+        lambda symbol, since: [
+            {
+                "deal_id": 999,
+                "position_id": 971164071,
+                "symbol": symbol,
+                "action": "SELL",
+                "entry_price": 4356.25,
+                "exit_price": 4342.0,
+                "lot": 0.02,
+                "profit": -4498.0,
+                "holding_seconds": 3600,
+                "time_utc": "2026-08-10T13:00:00+00:00",
+            }
+        ],
+    )
+
+    appended = main.sync_closed_trades()
+
+    assert appended == 1
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    row = rows[-1]
+    assert row["position_id"] == "971164071"
+    assert row["mfe_usd"] == "15.75"  # 4372.0 - 4356.25
+    assert row["mae_usd"] == "16.25"  # 4356.25 - 4340.0
+    # The excursion record is consumed on close.
+    assert main._load_excursions() == {}

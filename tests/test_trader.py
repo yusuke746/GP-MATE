@@ -312,3 +312,77 @@ def test_pending_orders_cleared_on_market_action_or_weak_bias() -> None:
         }
     )
     assert weak_bias["pending_orders"] == []
+
+
+def test_suggested_sl_passthrough_and_direction_check() -> None:
+    valid = _decide_with_payload(
+        {
+            "action": "BUY",
+            "symbol": "GOLD#",
+            "confidence": 0.9,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "suggested_sl": 4380.0,
+            "suggested_sl_basis": "4382サポート帯の外側",
+        }
+    )
+    assert valid["suggested_sl"] == 4380.0
+
+    inverted = _decide_with_payload(
+        {
+            "action": "BUY",
+            "symbol": "GOLD#",
+            "confidence": 0.9,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "suggested_sl": 4500.0,  # above current price for a BUY
+        }
+    )
+    assert inverted["suggested_sl"] is None
+
+    on_hold = _decide_with_payload(
+        {
+            "action": "HOLD",
+            "symbol": "GOLD#",
+            "confidence": 0.6,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "suggested_sl": 4380.0,
+        }
+    )
+    assert on_hold["suggested_sl"] is None
+
+
+def test_pending_order_sl_direction_check() -> None:
+    result = _decide_with_payload(
+        {
+            "action": "HOLD",
+            "symbol": "GOLD#",
+            "confidence": 0.65,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.7,
+            "pending_orders": [
+                {"type": "BUY_LIMIT", "price": 4382.45, "sl": 4370.0, "basis": "押し目"},
+            ],
+        }
+    )
+    assert result["pending_orders"][0]["sl"] == 4370.0
+
+    inverted = _decide_with_payload(
+        {
+            "action": "HOLD",
+            "symbol": "GOLD#",
+            "confidence": 0.65,
+            "reasoning": "test",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.7,
+            "pending_orders": [
+                {"type": "BUY_LIMIT", "price": 4382.45, "sl": 4390.0, "basis": "押し目"},
+            ],
+        }
+    )
+    # Inverted SL is dropped (order kept, ATR fallback applies downstream).
+    assert inverted["pending_orders"][0]["sl"] is None

@@ -34,6 +34,7 @@ from config import (
     MARKET_TZ,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
+    MONDAY_OPEN_NY,
     NEWS_FILTER_MINUTES,
     NY_RUN_TIMES,
     SPREAD_SAMPLE_INTERVAL,
@@ -67,6 +68,8 @@ LOGGER = logging.getLogger(__name__)
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 TRADE_LOG_PATH = LOG_DIR / "trade_log.csv"
 CLOSED_DEAL_STATE_PATH = LOG_DIR / "closed_deal_state.json"
+EXCURSION_STATE_FILENAME = "position_excursions.json"
+EXCURSION_STALE_DAYS = 14
 
 # TP reference proximity in USD. Used only for TP-target confluence labels.
 TP_PROXIMITY_ROUND_NUMBER = 5.0
@@ -154,6 +157,8 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "directional_bias",
     "bias_strength",
     "trigger_conditions",
+    "mfe_usd",
+    "mae_usd",
 )
 
 
@@ -250,6 +255,108 @@ def manage_breakeven_for_position(
     return breakeven_result, breakeven_log, "Position hold", True
 
 
+def _excursion_state_path() -> Path:
+    # Derived from LOG_DIR at call time so tests can redirect it.
+    return LOG_DIR / EXCURSION_STATE_FILENAME
+
+
+def _load_excursions() -> dict[str, dict[str, Any]]:
+    path = _excursion_state_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_excursions(state: dict[str, dict[str, Any]]) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _excursion_state_path().write_text(
+        json.dumps(state, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
+
+
+def update_position_excursions(positions: list[dict[str, Any]]) -> None:
+    """Track running high/low per open position for MFE/MAE analysis.
+
+    Sampled by the 15-minute monitor, so intrabar extremes between samples are
+    missed — the values are conservative approximations. Never raises.
+    """
+    if not positions:
+        return
+    try:
+        state = _load_excursions()
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+
+        for position in positions:
+            ticket = int(position.get("ticket", 0) or 0)
+            price = float(position.get("price_current", 0.0) or 0.0)
+            if ticket <= 0 or price <= 0:
+                continue
+            key = str(ticket)
+            record = state.get(key)
+            if not isinstance(record, dict):
+                record = {
+                    "entry": float(position.get("price_open", 0.0) or 0.0),
+                    "side": str(position.get("type", "") or ""),
+                    "high": price,
+                    "low": price,
+                }
+            record["high"] = max(float(record.get("high", price) or price), price)
+            record["low"] = min(float(record.get("low", price) or price), price)
+            record["updated_utc"] = now_iso
+            state[key] = record
+
+        # Prune records for positions that vanished without a matching close
+        # (manual trades, missed syncs) so the file cannot grow forever.
+        stale_cutoff = now - timedelta(days=EXCURSION_STALE_DAYS)
+        for key in list(state.keys()):
+            try:
+                updated = datetime.fromisoformat(str(state[key].get("updated_utc", "")))
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=UTC)
+                if updated < stale_cutoff:
+                    del state[key]
+            except Exception:
+                del state[key]
+
+        _save_excursions(state)
+    except Exception as exc:
+        LOGGER.warning("update_position_excursions failed safely: %s", exc)
+
+
+def _pop_excursion(position_id: str) -> dict[str, Any] | None:
+    try:
+        state = _load_excursions()
+        record = state.pop(str(position_id), None)
+        if record is not None:
+            _save_excursions(state)
+        return record if isinstance(record, dict) else None
+    except Exception:
+        return None
+
+
+def _excursion_metrics(record: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Return (mfe_usd, mae_usd) for a closed position's excursion record."""
+    try:
+        entry = float(record.get("entry", 0.0) or 0.0)
+        high = float(record.get("high", 0.0) or 0.0)
+        low = float(record.get("low", 0.0) or 0.0)
+        side = str(record.get("side", "") or "").upper()
+        if entry <= 0 or high <= 0 or low <= 0:
+            return None, None
+        if side == "BUY":
+            return round(max(high - entry, 0.0), 2), round(max(entry - low, 0.0), 2)
+        if side == "SELL":
+            return round(max(entry - low, 0.0), 2), round(max(high - entry, 0.0), 2)
+        return None, None
+    except Exception:
+        return None, None
+
+
 def _load_closed_deal_state() -> dict[str, Any]:
     if not CLOSED_DEAL_STATE_PATH.exists():
         return {"last_sync_utc": "", "deal_ids": []}
@@ -310,10 +417,20 @@ def sync_closed_trades() -> int:
         if not deal_id or deal_id in seen_ids:
             continue
 
+        mfe_usd: float | str = ""
+        mae_usd: float | str = ""
+        excursion = _pop_excursion(str(deal.get("position_id", "") or ""))
+        if excursion is not None:
+            mfe_value, mae_value = _excursion_metrics(excursion)
+            mfe_usd = mfe_value if mfe_value is not None else ""
+            mae_usd = mae_value if mae_value is not None else ""
+
         row = {
             "timestamp_utc": str(deal.get("time_utc", datetime.now(UTC).isoformat())),
             "deal_id": deal_id,
             "position_id": str(deal.get("position_id", "") or ""),
+            "mfe_usd": mfe_usd,
+            "mae_usd": mae_usd,
             "symbol": str(deal.get("symbol", SYMBOL)),
             "action": str(deal.get("action", "HOLD")),
             "entry_price": deal.get("entry_price", ""),
@@ -416,15 +533,17 @@ def _is_trading_session_allowed(reference: datetime | None = None) -> tuple[bool
     """Return whether trading is allowed under NY-time session policy.
 
     Policy:
-    - Block all Monday (weekday=0) trades.
+    - Block Monday before the NY session opens (default 08:00 NY): weekend
+      gaps and the thin Monday Asia/London hours are skipped, but Monday NY
+      judgments are allowed.
     - Block new entries from the Friday weekend-flat cutoff (default 16:30 NY)
       through Sun 16:59 (America/New_York).
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
     weekday = now_market.weekday()
 
-    if weekday == 0:
-        return False, "Monday trading paused"
+    if weekday == 0 and (now_market.hour, now_market.minute) < MONDAY_OPEN_NY:
+        return False, "Monday pre-NY session paused"
 
     if weekday == 4 and (now_market.hour, now_market.minute) >= FRIDAY_FLAT_TIME_NY:
         return False, "Friday weekend-flat window"
@@ -461,16 +580,19 @@ def _is_weekend_flat_window(reference: datetime | None = None) -> bool:
 
     Window (America/New_York):
     - Friday from the flat cutoff (default 16:30) onward.
-    - Saturday/Sunday/Monday: no legitimate position can exist there (entries
-      are blocked), so anything still open is a weekend leftover — close it as
-      soon as the market lets us (Sunday 17:00 reopen or Monday).
+    - Saturday/Sunday, and Monday before the NY session opens: no legitimate
+      position can exist there (entries are blocked), so anything still open
+      is a weekend leftover — close it as soon as the market lets us.
+      From Monday NY open onward trading resumes, so positions are legitimate.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
     weekday = now_market.weekday()
 
     if weekday == 4:
         return (now_market.hour, now_market.minute) >= FRIDAY_FLAT_TIME_NY
-    return weekday in {5, 6, 0}
+    if weekday == 0:
+        return (now_market.hour, now_market.minute) < MONDAY_OPEN_NY
+    return weekday in {5, 6}
 
 
 def _build_round_numbers(current_price: float, scan_range: float = TP_ROUND_SCAN_RANGE) -> list[float]:
@@ -922,6 +1044,7 @@ def _handle_pending_orders(
             atr=atr,
             balance_jpy=balance,
             suggested_tp=pending.get("tp"),
+            suggested_sl=pending.get("sl"),
             jpy_usd_rate=jpy_usd_rate,
         )
         if not bool(risk_plan.get("ok")):
@@ -1404,6 +1527,7 @@ def run_once(
             atr=atr,
             balance_jpy=balance,
             suggested_tp=trader_report.get("suggested_tp"),
+            suggested_sl=trader_report.get("suggested_sl"),
             jpy_usd_rate=jpy_usd_rate,
         )
 

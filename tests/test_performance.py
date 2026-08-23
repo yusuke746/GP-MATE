@@ -288,3 +288,31 @@ def test_threshold_blocked_summary_counts_biased_holds(tmp_path: Path) -> None:
     assert band_060["holds"] == 2
     assert band_060["with_bias"] == 1
     assert blocked["holds"].sum() == 2
+
+
+def test_slot_summary_groups_by_ny_judgment_slot() -> None:
+    from analysis.performance import slot_summary
+
+    linked = pd.DataFrame(
+        {
+            # 12:00 UTC = 08:00 NY (EDT), 14:30 UTC = 10:30 NY.
+            "timestamp_utc": pd.to_datetime(
+                ["2026-08-06T12:00:00Z", "2026-08-13T12:00:00Z", "2026-08-06T14:30:00Z"],
+                utc=True,
+            ),
+            "action": ["BUY", "BUY", "BUY"],
+            "confidence": [0.74, 0.7, 0.74],
+            "realized_pnl": [-8468.0, 5000.0, -10773.0],
+            "matched_by": ["position_id"] * 3,
+        }
+    )
+
+    slots = slot_summary(linked)
+
+    row_0800 = slots[slots["slot_ny"] == "08:00"].iloc[0]
+    row_1030 = slots[slots["slot_ny"] == "10:30"].iloc[0]
+    assert row_0800["decisions"] == 2
+    assert row_0800["wins"] == 1
+    assert row_0800["total_pnl"] == -3468.0
+    assert row_1030["decisions"] == 1
+    assert row_1030["win_rate"] == 0.0

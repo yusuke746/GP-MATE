@@ -12,12 +12,22 @@ import pandas as pd
 import pytest
 
 
-def test_is_trading_session_allowed_blocks_monday() -> None:
-    allowed, reason = main._is_trading_session_allowed(
+def test_is_trading_session_allowed_monday_pre_ny_only() -> None:
+    blocked, reason = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 6, 7, 59, tzinfo=main.MARKET_TZ)
+    )
+    assert not blocked
+    assert reason == "Monday pre-NY session paused"
+
+    # From the NY session open (default 08:00 NY), Monday judgments are allowed.
+    allowed_open, _ = main._is_trading_session_allowed(
+        reference=datetime(2026, 7, 6, 8, 0, tzinfo=main.MARKET_TZ)
+    )
+    allowed_noon, _ = main._is_trading_session_allowed(
         reference=datetime(2026, 7, 6, 12, 0, tzinfo=main.MARKET_TZ)
     )
-    assert not allowed
-    assert reason == "Monday trading paused"
+    assert allowed_open
+    assert allowed_noon
 
 
 def test_is_trading_session_allowed_blocks_weekend_close_window() -> None:
@@ -56,7 +66,11 @@ def test_is_weekend_flat_window_covers_friday_cutoff_to_monday() -> None:
     assert main._is_weekend_flat_window(
         reference=datetime(2026, 8, 9, 18, 0, tzinfo=main.MARKET_TZ)
     )
+    # Monday: leftover cleanup only before the NY session opens.
     assert main._is_weekend_flat_window(
+        reference=datetime(2026, 8, 10, 7, 0, tzinfo=main.MARKET_TZ)
+    )
+    assert not main._is_weekend_flat_window(
         reference=datetime(2026, 8, 10, 9, 0, tzinfo=main.MARKET_TZ)
     )
     # Tuesday-Thursday: normal operation.
@@ -234,7 +248,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
             "ok": True,
             "action": "BUY",
             "lot": 0.01,
@@ -982,7 +996,7 @@ def test_run_once_places_pending_order_on_hold_with_plan(tmp_path: Path, monkeyp
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
             "ok": action in {"BUY", "SELL"},
             "action": action if action in {"BUY", "SELL"} else "HOLD",
             "lot": 0.01,
@@ -1045,3 +1059,47 @@ def test_is_pending_flat_window_good_for_day() -> None:
     assert not main._is_pending_flat_window(
         reference=datetime(2026, 8, 13, 3, 7, tzinfo=main.MARKET_TZ)
     )
+
+
+def test_update_position_excursions_tracks_high_low(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+
+    position = {
+        "ticket": 555,
+        "type": "BUY",
+        "price_open": 100.0,
+        "price_current": 102.0,
+    }
+    main.update_position_excursions([position])
+    main.update_position_excursions([{**position, "price_current": 105.0}])
+    main.update_position_excursions([{**position, "price_current": 98.0}])
+
+    state = main._load_excursions()
+    record = state["555"]
+    assert record["entry"] == 100.0
+    assert record["high"] == 105.0
+    assert record["low"] == 98.0
+
+    mfe, mae = main._excursion_metrics(record)
+    assert mfe == 5.0
+    assert mae == 2.0
+
+
+def test_excursion_metrics_for_sell_side() -> None:
+    mfe, mae = main._excursion_metrics(
+        {"entry": 100.0, "side": "SELL", "high": 103.0, "low": 94.0}
+    )
+    assert mfe == 6.0  # favorable = entry - low
+    assert mae == 3.0  # adverse = high - entry
+
+
+def test_pop_excursion_removes_record(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    main.update_position_excursions(
+        [{"ticket": 777, "type": "BUY", "price_open": 100.0, "price_current": 101.0}]
+    )
+
+    record = main._pop_excursion("777")
+    assert record is not None
+    assert main._load_excursions() == {}
+    assert main._pop_excursion("777") is None
