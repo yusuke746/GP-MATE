@@ -15,6 +15,7 @@ from data.mt5_client import cancel_pending_orders, close_position, get_account_i
 from data.news_client import is_high_impact_soon
 from main import (
     _append_trade_log,
+    _is_market_closed_for_weekend,
     _is_pending_flat_window,
     _is_weekend_flat_window,
     manage_breakeven_for_position,
@@ -144,6 +145,18 @@ def _close_positions_for_weekend(positions: list[dict[str, Any]]) -> dict[str, A
         if bool(close_result.get("success", False)):
             result["closed_positions"] = int(result["closed_positions"]) + 1
             LOGGER.info("Weekend flat: closed position ticket=%s", ticket)
+            # Only successful closes are recorded: failed attempts retry every
+            # cycle and once flooded the trade log with identical rows.
+            try:
+                _append_trade_log(
+                    _build_weekend_flat_log_row(
+                        position_context=position_context,
+                        close_result=close_result,
+                        timestamp_utc=timestamp_utc,
+                    )
+                )
+            except Exception as exc:
+                LOGGER.warning("weekend flat log append failed: %s", exc)
         else:
             result["success"] = False
             LOGGER.warning(
@@ -151,17 +164,6 @@ def _close_positions_for_weekend(positions: list[dict[str, Any]]) -> dict[str, A
                 ticket,
                 close_result.get("reason", ""),
             )
-
-        try:
-            _append_trade_log(
-                _build_weekend_flat_log_row(
-                    position_context=position_context,
-                    close_result=close_result,
-                    timestamp_utc=timestamp_utc,
-                )
-            )
-        except Exception as exc:
-            LOGGER.warning("weekend flat log append failed: %s", exc)
 
     return result
 
@@ -189,6 +191,12 @@ def run_monitor_once() -> dict[str, Any]:
     update_position_excursions(positions)
 
     if _is_weekend_flat_window():
+        if _is_market_closed_for_weekend():
+            # Nothing can be closed or cancelled against a closed market;
+            # skip quietly and retry after the Sunday reopen.
+            LOGGER.info("Weekend flat window active but market closed; waiting for reopen")
+            result["reason"] = "WEEKEND_MARKET_CLOSED"
+            return result
         # Pending orders must not survive into (or through) the weekend either.
         try:
             cancel_result = cancel_pending_orders(SYMBOL)
