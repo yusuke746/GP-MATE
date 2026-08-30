@@ -567,11 +567,30 @@ def _is_pending_flat_window(reference: datetime | None = None) -> bool:
     16:55 daily close) until the first judgment of the next day re-plans.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
-    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (3, 0)
+    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (4, 0)
 
     if (now_market.hour, now_market.minute) >= DAILY_PENDING_CUTOFF_NY:
         return True
     return (now_market.hour, now_market.minute) < first_judgment
+
+
+def _is_market_closed_for_weekend(reference: datetime | None = None) -> bool:
+    """True while the market itself is closed (Fri 17:00 -> Sun 16:59 NY).
+
+    Weekend-flat close/cancel attempts are pointless then — they fail against
+    the closed market and spam the trade log; callers should skip and retry
+    once the market reopens.
+    """
+    now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    weekday = now_market.weekday()
+
+    if weekday == 4:
+        return now_market.hour >= NY_MARKET_CLOSE_HOUR
+    if weekday == 5:
+        return True
+    if weekday == 6:
+        return now_market.hour < NY_MARKET_CLOSE_HOUR
+    return False
 
 
 def _is_weekend_flat_window(reference: datetime | None = None) -> bool:

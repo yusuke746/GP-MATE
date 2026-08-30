@@ -145,6 +145,7 @@ def test_run_monitor_once_force_closes_positions_in_weekend_flat_window(
     monkeypatch.setattr(main, "LOG_DIR", tmp_path)
     monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: True)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_market_closed_for_weekend", lambda: False)
     monkeypatch.setattr(
         run_breakeven_monitor,
         "get_position_details",
@@ -193,6 +194,7 @@ def test_run_monitor_once_reports_failure_when_weekend_close_fails(
     monkeypatch.setattr(main, "LOG_DIR", tmp_path)
     monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: True)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_market_closed_for_weekend", lambda: False)
     monkeypatch.setattr(
         run_breakeven_monitor,
         "get_position_details",
@@ -220,13 +222,58 @@ def test_run_monitor_once_reports_failure_when_weekend_close_fails(
 
     assert result["success"] is False
     assert result["closed_positions"] == 0
-    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
-    assert rows[0]["order_success"] == "False"
-    assert rows[0]["error"] == "market closed"
+    # Failed closes retry every cycle; they must NOT write log rows (once
+    # flooded the CSV with 100+ identical failure rows over a weekend).
+    assert not log_path.exists()
+
+
+def test_run_monitor_once_skips_weekend_close_while_market_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: True)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_market_closed_for_weekend", lambda: True)
+    monkeypatch.setattr(
+        run_breakeven_monitor,
+        "get_position_details",
+        lambda symbol: [
+            {
+                "ticket": 557,
+                "symbol": symbol,
+                "type": "BUY",
+                "volume": 0.01,
+                "price_open": 100.0,
+                "price_current": 101.0,
+                "sl": 95.0,
+                "tp": 110.0,
+                "profit": 10.0,
+            }
+        ],
+    )
+
+    close_calls: list[int] = []
+    monkeypatch.setattr(
+        run_breakeven_monitor,
+        "close_position",
+        lambda ticket: close_calls.append(ticket) or {"success": True, "retcode": 0},
+    )
+    cancel_calls: list[str] = []
+    monkeypatch.setattr(
+        run_breakeven_monitor,
+        "cancel_pending_orders",
+        lambda symbol: cancel_calls.append(symbol) or {"success": True, "canceled": 0},
+    )
+
+    result = run_breakeven_monitor.run_monitor_once()
+
+    assert result["success"] is True
+    assert result["reason"] == "WEEKEND_MARKET_CLOSED"
+    assert close_calls == []
+    assert cancel_calls == []
 
 
 def test_run_monitor_once_cancels_pendings_in_weekend_flat_window(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: True)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_market_closed_for_weekend", lambda: False)
     monkeypatch.setattr(run_breakeven_monitor, "get_position_details", lambda symbol: [])
 
     calls: list[str] = []

@@ -22,7 +22,13 @@ PNL_COLUMN_CANDIDATES: tuple[str, ...] = (
 
 
 def _safe_to_datetime(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce", utc=True)
+    # format="ISO8601" accepts mixed ISO variants (with/without microseconds,
+    # 'Z' suffix); without it pandas infers the format from the first row and
+    # coerces every differently-formatted row to NaT.
+    try:
+        return pd.to_datetime(series, errors="coerce", utc=True, format="ISO8601")
+    except (TypeError, ValueError):
+        return pd.to_datetime(series, errors="coerce", utc=True)
 
 
 def _resolve_pnl_column(df: pd.DataFrame) -> str | None:
