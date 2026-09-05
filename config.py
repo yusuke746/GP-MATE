@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 ENV_PATH: Final[Path] = BASE_DIR / ".env"
+# Runtime artefacts (trade_log.csv, excursions, holdings history). main.py
+# keeps an identical module-level LOG_DIR that tests monkeypatch.
+LOG_DIR: Final[Path] = BASE_DIR / "logs"
 
 # Default RSS sources. Google News aggregates Reuters/Bloomberg/CNBC headlines
 # behind a bot-tolerant endpoint, so it is the backbone; the rest are
@@ -354,9 +357,17 @@ COT_DATASET_URL: Final[str] = _get_env_str(
     "COT_DATASET_URL", "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
 )
 COT_MARKET_NAME: Final[str] = _get_env_str("COT_MARKET_NAME", "GOLD - COMMODITY EXCHANGE INC.")
-# SPDR Gold Shares daily holdings archive (CSV).
-GLD_HOLDINGS_URL: Final[str] = _get_env_str(
-    "GLD_HOLDINGS_URL", "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
+# SPDR Gold Shares holdings. Candidates are tried in order: the legacy CSV
+# archive (full history) and SSGA's daily holdings workbook (today's level;
+# history is then accumulated locally in logs/gld_holdings_history.json).
+# Comma-separated override via GLD_HOLDINGS_URL.
+DEFAULT_GLD_HOLDINGS_URLS: Final[tuple[str, ...]] = (
+    "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv",
+    "https://www.ssga.com/us/en/intermediary/library-content/products/fund-data/etfs/us/holdings-daily-us-en-gld.xlsx",
+    "https://www.ssga.com/us/en/individual/library-content/products/fund-data/etfs/us/holdings-daily-us-en-gld.xlsx",
+)
+GLD_HOLDINGS_URLS: Final[tuple[str, ...]] = tuple(
+    s.strip() for s in _get_env_str("GLD_HOLDINGS_URL", ",".join(DEFAULT_GLD_HOLDINGS_URLS)).split(",") if s.strip()
 )
 # Broker symbol candidates for a tradable dollar index; when none exists the
 # index is synthesised from the major USD pairs (see mt5_client).

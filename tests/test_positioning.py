@@ -88,10 +88,12 @@ def test_get_positioning_is_ok_when_either_source_works(monkeypatch) -> None:
     assert cached["gld"]["tonnes"] == 900.0
 
 
-def test_fetch_gld_holdings_uses_browser_ua() -> None:
+def test_fetch_gld_holdings_uses_browser_ua(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(positioning, "LOG_DIR", tmp_path)
     response = Mock()
     response.raise_for_status = Mock()
     response.text = GLD_CSV
+    response.content = GLD_CSV.encode("utf-8")
     with patch("agents.data.positioning.requests.get", return_value=response) as mock_get:
         result = positioning.fetch_gld_holdings()
     assert result["_meta"]["ok"] is True
