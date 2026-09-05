@@ -109,3 +109,22 @@ def test_dollar_index_snapshot_reports_symbol_sample_when_nothing_matches(monkey
     snap = mt5_client.get_dollar_index_snapshot(candidates=("USDX",))
     assert snap["_meta"]["ok"] is False
     assert "GOLD#" in snap["_meta"]["error"]
+
+
+def test_parse_gld_csv_handles_bom_and_two_digit_years() -> None:
+    text = "﻿\"Date\",\"GLD Close\",\"Total Net Asset Value Tonnes in the Trust as at 4.15 p.m. NYT\"\n"
+    text += "\n".join(f"\"{d:02d}-Aug-26\",\"300.0\",\"{900 + d}.5\"" for d in range(1, 12)) + "\n"
+    result = positioning.parse_gld_csv(text)
+    assert result["_meta"]["ok"] is True
+    assert result["as_of"] == "2026-08-11"
+    assert result["tonnes"] == 911.5
+
+
+def test_parse_gld_csv_error_includes_file_sample() -> None:
+    result = positioning.parse_gld_csv("Some totally different page\nsecond line\n")
+    assert result["_meta"]["ok"] is False
+    assert "file starts: Some totally different page" in result["_meta"]["error"]
+
+    header_only = "Date,Tonnes\nnot-a-date,abc\n"
+    result = positioning.parse_gld_csv(header_only)
+    assert "header found but no parsable rows" in result["_meta"]["error"]
