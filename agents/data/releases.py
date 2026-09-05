@@ -84,6 +84,15 @@ def parse_calendar_number(text: Any) -> tuple[float | None, str]:
     return float(match.group(1)), match.group(2).upper()
 
 
+def _decimals(text: Any, default: int) -> int:
+    """Number of decimals in a calendar figure ('0.3%' -> 1, '55K' -> 0)."""
+    match = _NUMBER_RE.match(str(text or ""))
+    if not match:
+        return default
+    number = match.group(1)
+    return len(number.split(".")[1]) if "." in number else 0
+
+
 def match_spec(title: str) -> ReleaseSpec | None:
     lowered = title.strip().lower()
     for spec in RELEASE_SPECS:
@@ -132,6 +141,11 @@ def build_release_record(
             if actual is not None:
                 source = f"fred:{spec.series_id}"
                 unit = unit or spec.unit
+
+    # Report the actual at the calendar's precision ("0.3%" -> 1 decimal) so a
+    # FRED-derived 0.27 does not read as a -0.03 miss against a 0.3 consensus.
+    if actual is not None and source.startswith("fred:"):
+        actual = round(actual, _decimals(event.get("forecast"), default=1 if unit == "%" else 0))
 
     surprise = round(actual - forecast, 2) if actual is not None and forecast is not None else None
     read = ""

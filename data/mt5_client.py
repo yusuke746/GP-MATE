@@ -1070,11 +1070,29 @@ def synthesize_dollar_index(closes_by_pair: dict[str, list[tuple[date, float]]])
     return index
 
 
+def _normalize_symbol(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def find_symbol_variants(all_names: list[str], wanted: str) -> list[str]:
+    """Broker symbols that are ``wanted`` plus an optional suffix/prefix.
+
+    XM uses 'EURUSD#', others 'EURUSDm', 'EURUSD.r', 'EURUSD.pro'; matching on
+    the normalised name (letters/digits only) starting with the pair covers all
+    of them, shortest first so the plain symbol wins when present.
+    """
+    target = _normalize_symbol(wanted)
+    hits = [name for name in all_names if _normalize_symbol(name).startswith(target)]
+    return sorted(hits, key=len)
+
+
 def get_dollar_index_snapshot(candidates: tuple[str, ...] | None = None) -> dict[str, Any]:
     """Live dollar-index snapshot in the FRED MacroSeriesSnapshot shape.
 
     Prefers a broker dollar-index symbol (USDX etc.); otherwise synthesises the
-    index from the major pairs. Returns {"_meta": {"ok": False, ...}} on failure.
+    index from the major pairs. Symbol names are discovered from the broker's
+    full symbol list so suffixed variants (EURUSD#, EURUSDm) are found.
+    Returns {"_meta": {"ok": False, ...}} on failure.
     """
     from agents.data.fred_client import snapshot_from_points  # local: avoid import cycle at module load
     from config import DXY_SYMBOL_CANDIDATES
@@ -1086,32 +1104,43 @@ def get_dollar_index_snapshot(candidates: tuple[str, ...] | None = None) -> dict
         if mt5 is None:
             return {"_meta": {"ok": False, "source": "mt5", "error": "MetaTrader5 unavailable"}}
 
-        for name in names:
-            info = mt5.symbol_info(name)
-            if info is None:
-                continue
-            points = _d1_closes(name, DXY_HISTORY_BARS)
-            snapshot = snapshot_from_points(points)
-            if snapshot is not None:
-                snapshot["source"] = f"mt5:{name}"
-                snapshot["_meta"] = {"ok": True, "source": f"mt5:{name}", "error": ""}
-                return dict(snapshot)
+        symbols = mt5.symbols_get() or []
+        all_names = [str(getattr(sym, "name", "") or "") for sym in symbols]
+        all_names = [name for name in all_names if name]
+
+        for wanted in names:
+            for name in find_symbol_variants(all_names, wanted) or [wanted]:
+                if mt5.symbol_info(name) is None:
+                    continue
+                snapshot = snapshot_from_points(_d1_closes(name, DXY_HISTORY_BARS))
+                if snapshot is not None:
+                    snapshot["source"] = f"mt5:{name}"
+                    snapshot["_meta"] = {"ok": True, "source": f"mt5:{name}", "error": ""}
+                    return dict(snapshot)
 
         closes: dict[str, list[tuple[date, float]]] = {}
+        used_names: list[str] = []
         for pair in DXY_WEIGHTS:
-            for variant in (pair, f"{pair}#", f"{pair}m", f"{pair}.r"):
-                if mt5.symbol_info(variant) is None:
+            for name in find_symbol_variants(all_names, pair) or [pair]:
+                if mt5.symbol_info(name) is None:
                     continue
-                pts = _d1_closes(variant, DXY_HISTORY_BARS)
+                pts = _d1_closes(name, DXY_HISTORY_BARS)
                 if pts:
                     closes[pair] = pts
+                    used_names.append(name)
                     break
         index = synthesize_dollar_index(closes)
         snapshot = snapshot_from_points(index)
         if snapshot is None:
-            return {"_meta": {"ok": False, "source": "mt5", "error": "no dollar index symbol or constituent pairs"}}
-        used = ",".join(sorted(closes))
-        snapshot["source"] = f"mt5:synthetic({used})"
+            sample = ", ".join(all_names[:15])
+            return {
+                "_meta": {
+                    "ok": False,
+                    "source": "mt5",
+                    "error": f"no dollar index symbol or constituent pairs among {len(all_names)} symbols (e.g. {sample})",
+                }
+            }
+        snapshot["source"] = f"mt5:synthetic({','.join(used_names)})"
         snapshot["_meta"] = {"ok": True, "source": snapshot["source"], "error": ""}
         return dict(snapshot)
     except Exception as exc:

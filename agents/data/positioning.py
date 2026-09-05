@@ -154,7 +154,10 @@ def parse_gld_csv(text: str) -> dict[str, Any]:
     first row containing a 'Date' cell, and the tonnes column is the one whose
     header mentions 'Tonnes'.
     """
-    reader = csv.reader(io.StringIO(text))
+    # The archive is served with bare CR line endings (and occasionally CRLF
+    # inside quoted cells); the csv module rejects that unless normalised.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    reader = csv.reader(io.StringIO(normalized, newline=""))
     header: list[str] | None = None
     date_idx = tonnes_idx = -1
     points: list[tuple[date, float]] = []

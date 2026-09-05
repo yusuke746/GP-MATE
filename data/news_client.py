@@ -100,16 +100,45 @@ def check_rss_feeds_health(feeds: tuple[str, ...] = RSS_FEEDS) -> list[dict[str,
     return results
 
 
+_PLAIN_DATETIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",  # investing.com style: "2026-09-04 22:51:00" (no zone)
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%d %b %Y %H:%M:%S",
+)
+
+
 def _parse_datetime(value: str) -> datetime | None:
-    if not value:
+    """RFC 822 (RSS), ISO 8601 (Atom) or a bare 'YYYY-MM-DD HH:MM:SS'.
+
+    Naive timestamps are taken as UTC. Publishers that omit the zone were
+    previously dropped entirely (their whole feed counted as undated).
+    """
+    text = (value or "").strip()
+    if not text:
         return None
+    dt: datetime | None = None
     try:
-        dt = parsedate_to_datetime(value)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=UTC)
-        return dt.astimezone(UTC)
+        dt = parsedate_to_datetime(text)
     except Exception:
+        dt = None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            dt = None
+    if dt is None:
+        for fmt in _PLAIN_DATETIME_FORMATS:
+            try:
+                dt = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None:
         return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _contains_keywords(text: str, keywords: tuple[str, ...]) -> bool:
