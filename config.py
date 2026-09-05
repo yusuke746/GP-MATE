@@ -101,10 +101,16 @@ class Settings:
 
 
 def _get_env_str(name: str, default: str = "") -> str:
+    """Read an env var; a missing OR blank value means 'use the default'.
+
+    .env.example lists every key as ``KEY=`` so users can fill in only what
+    they need; a blank line must not turn a URL/model/symbol default into "".
+    """
     value = os.getenv(name)
     if value is None:
         return default
-    return value.strip()
+    stripped = value.strip()
+    return stripped if stripped else default
 
 
 def _get_env_int(name: str, default: int) -> int:
