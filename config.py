@@ -12,12 +12,24 @@ from dotenv import load_dotenv
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 ENV_PATH: Final[Path] = BASE_DIR / ".env"
 
-# Keep RSS sources in code to simplify deployment and avoid extra env keys.
+# Default RSS sources. Google News aggregates Reuters/Bloomberg/CNBC headlines
+# behind a bot-tolerant endpoint, so it is the backbone; the rest are
+# gold/FX specialists. Override with RSS_FEEDS=url1,url2 in .env after checking
+# scripts/check_data_sources.py (marketwatch topstories was dropped: it rarely
+# carried a gold headline and investing.com intermittently blocks scrapers).
 DEFAULT_RSS_FEEDS: Final[tuple[str, ...]] = (
+    "https://news.google.com/rss/search?q=gold+price+OR+XAUUSD+OR+bullion&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=Fed+OR+%22treasury+yields%22+OR+%22dollar+index%22&hl=en-US&gl=US&ceid=US:en",
+    "https://www.kitco.com/rss/category/commodities",
+    "https://www.fxstreet.com/rss/news",
     "https://www.forexlive.com/feed/news",
     "https://www.investing.com/rss/news_285.rss",
-    "https://www.marketwatch.com/rss/topstories",
 )
+
+
+def _parse_feed_list(value: str) -> tuple[str, ...]:
+    feeds = tuple(item.strip() for item in value.split(",") if item.strip())
+    return feeds if feeds else DEFAULT_RSS_FEEDS
 
 load_dotenv(ENV_PATH)
 
@@ -267,7 +279,7 @@ def load_settings() -> Settings:
         model_decision=_get_env_str("MODEL_DECISION", "gpt-5.6-sol"),
         model_debate=_get_env_str("MODEL_DEBATE", "gpt-5.6-terra"),
         max_news_items=_get_env_int("MAX_NEWS_ITEMS", 15),
-        rss_feeds=DEFAULT_RSS_FEEDS,
+        rss_feeds=_parse_feed_list(_get_env_str("RSS_FEEDS", "")),
         stage=_get_env_int("STAGE", 1),
         mt5_login=mt5_login,
         mt5_password=mt5_password,
@@ -329,3 +341,24 @@ MT5_SERVER_TIMEZONE: Final[str] = settings.mt5_server_timezone
 OPENAI_API_KEY: Final[str] = settings.openai_api_key
 NEWS_API_KEY: Final[str] = settings.news_api_key
 FRED_API_KEY: Final[str] = settings.fred_api_key
+
+# --------------------------------------------------------------------------- #
+# Gold-specific external data (all optional; every fetcher fails safe)
+# --------------------------------------------------------------------------- #
+# CFTC Disaggregated Futures-Only report via the public Socrata API.
+COT_DATASET_URL: Final[str] = _get_env_str(
+    "COT_DATASET_URL", "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
+)
+COT_MARKET_NAME: Final[str] = _get_env_str("COT_MARKET_NAME", "GOLD - COMMODITY EXCHANGE INC.")
+# SPDR Gold Shares daily holdings archive (CSV).
+GLD_HOLDINGS_URL: Final[str] = _get_env_str(
+    "GLD_HOLDINGS_URL", "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
+)
+# Broker symbol candidates for a tradable dollar index; when none exists the
+# index is synthesised from the major USD pairs (see mt5_client).
+DXY_SYMBOL_CANDIDATES: Final[tuple[str, ...]] = tuple(
+    s.strip() for s in _get_env_str("DXY_SYMBOL_CANDIDATES", "USDX,USDX#,DXY,USDOLLAR,DX").split(",") if s.strip()
+)
+# Hours of economic releases (back) and scheduled events (ahead) handed to the analysts.
+RELEASES_LOOKBACK_HOURS: Final[int] = _get_env_int("RELEASES_LOOKBACK_HOURS", 48)
+EVENTS_LOOKAHEAD_HOURS: Final[int] = _get_env_int("EVENTS_LOOKAHEAD_HOURS", 24)

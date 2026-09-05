@@ -24,33 +24,52 @@ SERIES_MAP: Final[dict[str, str]] = {
     "dxy": "DTWEXBGS",
     "real_rate": "DFII10",
     "us10y": "DGS10",
+    "us2y": "DGS2",
     "breakeven": "T10YIE",
     "fed_funds": "FEDFUNDS",
 }
+# Series without which the macro picture is unusable. The others degrade to an
+# empty snapshot (with a warning) instead of failing the whole fetch.
+CORE_SERIES: Final[frozenset[str]] = frozenset({"dxy", "real_rate", "breakeven"})
+# Observations spaced wider than this are not daily; the 5-day change is only
+# meaningful for daily series.
+DAILY_SPACING_MAX_DAYS: Final[int] = 4
+SHORT_WINDOW_OBS: Final[int] = 5
 
 
-class MacroSeriesSnapshot(TypedDict):
+class MacroSeriesSnapshot(TypedDict, total=False):
     value: float | None
     change_30d: float | None
     direction: Literal["UP", "DOWN", "FLAT"]
+    change_5d: float | None
+    direction_5d: Literal["UP", "DOWN", "FLAT"]
+    as_of: str
+    source: str
 
 
-class MacroMeta(TypedDict):
+class MacroMeta(TypedDict, total=False):
     ok: bool
     source: str
     cached: bool
     fetched_at: str
     error: str
+    warnings: list[str]
 
 
-class MacroData(TypedDict):
+class MacroData(TypedDict, total=False):
     dxy: MacroSeriesSnapshot
     real_rate: MacroSeriesSnapshot
     us10y: MacroSeriesSnapshot
+    us2y: MacroSeriesSnapshot
     breakeven: MacroSeriesSnapshot
     fed_funds: MacroSeriesSnapshot
     as_of: str
     _meta: MacroMeta
+    # Enrichment attached by agents.data.macro_inputs (all optional).
+    dxy_fred: MacroSeriesSnapshot
+    positioning: dict[str, Any]
+    recent_releases: list[dict[str, Any]]
+    upcoming_events: list[dict[str, Any]]
 
 
 class AlphaVantageFxResult(TypedDict):
@@ -75,6 +94,9 @@ def _empty_snapshot() -> MacroSeriesSnapshot:
         "value": None,
         "change_30d": None,
         "direction": "FLAT",
+        "change_5d": None,
+        "direction_5d": "FLAT",
+        "as_of": "",
     }
 
 
@@ -83,6 +105,7 @@ def _empty_macro_data(as_of: str, source: str, error: str, cached: bool = False)
         "dxy": _empty_snapshot(),
         "real_rate": _empty_snapshot(),
         "us10y": _empty_snapshot(),
+        "us2y": _empty_snapshot(),
         "breakeven": _empty_snapshot(),
         "fed_funds": _empty_snapshot(),
         "as_of": as_of,
@@ -92,6 +115,7 @@ def _empty_macro_data(as_of: str, source: str, error: str, cached: bool = False)
             "cached": cached,
             "fetched_at": as_of,
             "error": error,
+            "warnings": [],
         },
     }
 
@@ -158,7 +182,8 @@ def _direction_from_change(change_30d: float | None) -> Literal["UP", "DOWN", "F
     return "FLAT"
 
 
-def _series_to_snapshot(observations: list[dict[str, Any]]) -> MacroSeriesSnapshot | None:
+def parse_observations(observations: list[dict[str, Any]]) -> list[tuple[date, float]]:
+    """FRED observation rows -> sorted (date, value) pairs; '.' placeholders dropped."""
     parsed: list[tuple[date, float]] = []
     for row in observations:
         obs_date_raw = str(row.get("date") or "").strip()
@@ -170,52 +195,84 @@ def _series_to_snapshot(observations: list[dict[str, Any]]) -> MacroSeriesSnapsh
         except Exception:
             continue
         parsed.append((obs_date, value))
+    parsed.sort(key=lambda item: item[0])
+    return parsed
 
-    if not parsed:
+
+def snapshot_from_points(points: list[tuple[date, float]]) -> MacroSeriesSnapshot | None:
+    """Build the 30-day / 5-observation change snapshot from sorted points.
+
+    Shared by FRED series and the MT5 dollar-index proxy so both carry the
+    same shape (value, change_30d, direction, change_5d, direction_5d).
+    """
+    if not points:
         return None
 
-    parsed.sort(key=lambda item: item[0])
-    latest_date, latest_value = parsed[-1]
+    latest_date, latest_value = points[-1]
     target_date = latest_date - timedelta(days=30)
 
     target_value: float | None = None
-    for obs_date, value in parsed:
+    for obs_date, value in points:
         if obs_date <= target_date:
             target_value = value
 
-    change_30d: float | None
-    if target_value is None:
-        change_30d = None
-    else:
-        change_30d = latest_value - target_value
+    change_30d: float | None = None if target_value is None else latest_value - target_value
+
+    change_5d: float | None = None
+    if len(points) > SHORT_WINDOW_OBS:
+        recent = points[-(SHORT_WINDOW_OBS + 1):]
+        gaps = [(recent[i + 1][0] - recent[i][0]).days for i in range(len(recent) - 1)]
+        if max(gaps) <= DAILY_SPACING_MAX_DAYS:
+            change_5d = latest_value - recent[0][1]
 
     return {
         "value": latest_value,
         "change_30d": change_30d,
         "direction": _direction_from_change(change_30d),
+        "change_5d": change_5d,
+        "direction_5d": _direction_from_change(change_5d),
+        "as_of": latest_date.isoformat(),
     }
 
 
-def _fetch_fred_series(series_id: str, api_key: str) -> MacroSeriesSnapshot | None:
+def _series_to_snapshot(observations: list[dict[str, Any]]) -> MacroSeriesSnapshot | None:
+    return snapshot_from_points(parse_observations(observations))
+
+
+def fetch_fred_observations(
+    series_id: str,
+    api_key: str | None = None,
+    limit: int = 200,
+) -> list[tuple[date, float]]:
+    """Public helper: latest ``limit`` observations of a FRED series as
+    sorted (date, value) pairs. Empty list on any failure or missing key."""
+    resolved_key = (api_key or os.getenv("FRED_API_KEY", "")).strip()
+    if not resolved_key or not series_id:
+        return []
     payload = _safe_get_json(
         FRED_BASE_URL,
         {
             "series_id": series_id,
-            "api_key": api_key,
+            "api_key": resolved_key,
             "file_type": "json",
             "sort_order": "desc",
-            "limit": 200,
+            "limit": limit,
         },
         context=f"series_id={series_id}",
     )
     if payload is None:
-        return None
-
+        return []
     observations = payload.get("observations", [])
     if not isinstance(observations, list):
-        return None
+        return []
+    return parse_observations(cast(list[dict[str, Any]], observations))
 
-    return _series_to_snapshot(cast(list[dict[str, Any]], observations))
+
+def _fetch_fred_series(series_id: str, api_key: str) -> MacroSeriesSnapshot | None:
+    points = fetch_fred_observations(series_id=series_id, api_key=api_key, limit=200)
+    if not points:
+        return None
+    return snapshot_from_points(points)
 
 
 def _build_macro_data(api_key: str) -> MacroData:
@@ -227,16 +284,22 @@ def _build_macro_data(api_key: str) -> MacroData:
         return result
 
     fetched: dict[str, MacroSeriesSnapshot] = {}
+    warnings: list[str] = []
     for key, series_id in SERIES_MAP.items():
         snapshot = _fetch_fred_series(series_id=series_id, api_key=api_key)
         if snapshot is None:
-            result["_meta"]["error"] = f"failed to fetch series_id={series_id}"
-            return result
+            if key in CORE_SERIES:
+                result["_meta"]["error"] = f"failed to fetch series_id={series_id}"
+                return result
+            warnings.append(f"{key} ({series_id}) unavailable; treated as FLAT")
+            snapshot = _empty_snapshot()
+        snapshot["source"] = f"fred:{series_id}"
         fetched[key] = snapshot
 
-    result.update(fetched)
+    result.update(fetched)  # type: ignore[typeddict-item]
     result["_meta"]["ok"] = True
     result["_meta"]["error"] = ""
+    result["_meta"]["warnings"] = warnings
     return result
 
 

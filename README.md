@@ -39,6 +39,8 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 
 1. Connection check (no trading):
    - `python scripts/check_connection.py`
+   - Data-source health (RSS feeds, economic calendar, FRED, CFTC COT, GLD holdings, MT5 dollar index):
+     `python scripts/check_data_sources.py`
 2. Manual single run (with order confirmation):
    - `python scripts/run_manual.py`
 3. Automated schedule run:

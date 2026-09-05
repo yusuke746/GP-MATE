@@ -119,4 +119,4 @@ def test_get_macro_data_uses_same_day_cache(monkeypatch) -> None:
 
     assert first["_meta"]["ok"] is True
     assert second["_meta"]["cached"] is True
-    assert call_count["count"] == 5
+    assert call_count["count"] == len(fred_client.SERIES_MAP)

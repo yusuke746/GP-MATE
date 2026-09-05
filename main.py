@@ -19,6 +19,8 @@ warnings.filterwarnings(
 
 from agents.debate_graph import build_skipped_debate_report, run_debate_graph, should_execute_debate
 from agents.data.fred_client import get_macro_data
+from agents.data.macro_inputs import build_macro_inputs
+from agents.data.releases import releases_as_news_items
 from agents.evaluate_position import evaluate_position
 from agents.macro_analyst import analyze_macro_environment
 from agents.sentiment import analyze_sentiment
@@ -56,7 +58,7 @@ from data.mt5_client import (
     place_pending_order,
     send_order,
 )
-from data.news_client import fetch_news, is_high_impact_soon
+from data.news_client import fetch_news_with_meta, is_high_impact_soon
 from agents.technical import EXTENSION_ATR_CAUTION, calc_extension_atr
 from indicators.ta_calc import add_indicators
 from indicators.horizontal_levels import build_horizontal_levels
@@ -160,6 +162,7 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "mfe_usd",
     "mae_usd",
     "pending_status",
+    "news_feeds_live",
 )
 
 
@@ -883,9 +886,15 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
         current_price=float(h1_latest.get("close", 0.0) or 0.0),
     )
 
-    news_items = fetch_news(hours=24)
-    macro_data = get_macro_data(force_refresh=False)
+    news_items, feed_meta = fetch_news_with_meta(hours=24)
+    # FRED series + live dollar index + positioning + calendar surprises.
+    macro_data = build_macro_inputs(get_macro_data(force_refresh=False))
     macro_report = analyze_macro_environment(macro_data)
+    # Structured prints are the highest-signal headlines a gold trader gets and
+    # keep the sentiment input alive on release days when RSS feeds are thin.
+    release_items = releases_as_news_items(macro_data.get("recent_releases", []) or [])
+    if release_items:
+        news_items = release_items + list(news_items)
     technical_report = analyze_technical(
         {
             "direction_context": direction_context,
@@ -893,7 +902,17 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
         }
     )
     sentiment_report = analyze_sentiment(news_items)
+    if isinstance(sentiment_report, dict):
+        sentiment_report["feed_meta"] = feed_meta
     return d1, h4, h1, news_items, macro_report, technical_report, sentiment_report
+
+
+def _feed_health_text(sentiment_report: Any) -> str:
+    """'live/total' RSS feed count for the trade log ('' when unknown)."""
+    meta = sentiment_report.get("feed_meta") if isinstance(sentiment_report, dict) else None
+    if not isinstance(meta, dict):
+        return ""
+    return f"{meta.get('feeds_live', 0)}/{meta.get('feeds_total', 0)}"
 
 
 def _build_debate_and_decision_reports(
@@ -1499,6 +1518,7 @@ def run_once(
                 "analysis_model": _extract_model_name(technical_report),
                 "decision_model": _extract_model_name(evaluation_report),
                 "news_count": len(news_items),
+                "news_feeds_live": _feed_health_text(sentiment_report),
                 "error": str(execution_result.get("reason", "")),
                 **debate_log_fields,
                 "position_direction": position_direction,
@@ -1607,6 +1627,7 @@ def run_once(
             "analysis_model": _extract_model_name(technical_report),
             "decision_model": _extract_model_name(trader_report),
             "news_count": len(news_items),
+                "news_feeds_live": _feed_health_text(sentiment_report),
             "error": str(order_result.get("reason", "")),
             "directional_bias": str(trader_report.get("directional_bias", "") or ""),
             "bias_strength": trader_report.get("bias_strength", ""),

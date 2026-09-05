@@ -193,8 +193,9 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(main, "get_rates", lambda symbol, tf, bars: rates)
     monkeypatch.setattr(main, "add_indicators", lambda df: df)
 
-    monkeypatch.setattr(main, "fetch_news", lambda hours: [])
+    monkeypatch.setattr(main, "fetch_news_with_meta", lambda hours: ([], {"feeds_total": 3, "feeds_live": 2}))
     monkeypatch.setattr(main, "get_macro_data", lambda force_refresh=False: {})
+    monkeypatch.setattr(main, "build_macro_inputs", lambda macro_data: macro_data)
     monkeypatch.setattr(
         main,
         "analyze_macro_environment",
@@ -812,8 +813,9 @@ def test_build_market_reports_generates_tp_reference_only_and_adx(monkeypatch: p
             "resistances": [{"price": 4100.0, "score": 4.0, "source": "cluster", "timeframe": "H4", "touch_count": 6}],
         },
     )
-    monkeypatch.setattr(main, "fetch_news", lambda hours=24: [])
+    monkeypatch.setattr(main, "fetch_news_with_meta", lambda hours=24: ([], {"feeds_total": 3, "feeds_live": 3}))
     monkeypatch.setattr(main, "get_macro_data", lambda force_refresh=False: {})
+    monkeypatch.setattr(main, "build_macro_inputs", lambda macro_data: macro_data)
     monkeypatch.setattr(main, "analyze_macro_environment", lambda macro_data: {"macro_bias": "NEUTRAL", "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}})
     monkeypatch.setattr(main, "analyze_sentiment", lambda news: {"sentiment": "NEUTRAL", "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}})
 
