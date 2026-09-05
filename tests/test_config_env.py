@@ -18,8 +18,7 @@ def test_blank_env_values_fall_back_to_defaults(monkeypatch) -> None:
         reloaded = importlib.reload(config)
         assert reloaded.COT_DATASET_URL.startswith("https://publicreporting.cftc.gov/")
         assert reloaded.COT_MARKET_NAME == "GOLD - COMMODITY EXCHANGE INC."
-        assert reloaded.GLD_HOLDINGS_URLS[0].startswith("https://www.spdrgoldshares.com/")
-        assert len(reloaded.GLD_HOLDINGS_URLS) == 3
+        assert reloaded.GLD_HOLDINGS_URLS == ()  # GLD is opt-in
         assert reloaded.DXY_SYMBOL_CANDIDATES == ("USDX", "USDX#", "DXY", "USDOLLAR", "DX")
         assert reloaded.RSS_FEEDS == reloaded.DEFAULT_RSS_FEEDS
         assert reloaded.MODEL_ANALYSIS == "gpt-5.6-terra"

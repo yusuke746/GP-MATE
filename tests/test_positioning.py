@@ -95,6 +95,6 @@ def test_fetch_gld_holdings_uses_browser_ua(tmp_path, monkeypatch) -> None:
     response.text = GLD_CSV
     response.content = GLD_CSV.encode("utf-8")
     with patch("agents.data.positioning.requests.get", return_value=response) as mock_get:
-        result = positioning.fetch_gld_holdings()
+        result = positioning.fetch_gld_holdings(urls=("https://example/gld.csv",))
     assert result["_meta"]["ok"] is True
     assert "User-Agent" in mock_get.call_args.kwargs["headers"]

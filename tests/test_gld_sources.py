@@ -51,7 +51,8 @@ def test_fetch_skips_pdf_and_uses_csv_candidate(tmp_path, monkeypatch) -> None:
     assert result["change_5d"] == 5.0
     assert "returned pdf" in result["_meta"]["error"]
     saved = json.loads((tmp_path / "gld_holdings_history.json").read_text())
-    assert saved["2026-08-11"] == 911.0
+    assert saved["unit"] == "t"
+    assert saved["points"]["2026-08-11"] == 911.0
 
 
 def test_xlsx_point_reads_tonnes_and_as_of_date() -> None:
@@ -63,21 +64,23 @@ def test_xlsx_point_reads_tonnes_and_as_of_date() -> None:
             ["GOLD", "GLD", 100.0, 981.23],
         ]
     )
-    point, reason = positioning.gld_point_from_xlsx(content)
+    point, unit, reason = positioning.gld_point_from_xlsx(content)
     assert reason == ""
+    assert unit == "t"
     assert point == (date(2026, 9, 4), 981.23)
 
 
 def test_xlsx_point_converts_ounces_and_reads_datetime_cells() -> None:
     content = _xlsx([["As of", datetime(2026, 9, 4)], ["Ounces of Gold in the Trust", 31_539_000.0]])
-    point, _ = positioning.gld_point_from_xlsx(content)
+    point, unit, _ = positioning.gld_point_from_xlsx(content)
+    assert unit == "t"
     assert point is not None
     assert point[0] == date(2026, 9, 4)
     assert abs(point[1] - 981.0) < 0.5
 
 
 def test_xlsx_without_tonnes_reports_reason() -> None:
-    point, reason = positioning.gld_point_from_xlsx(_xlsx([["Name", "Weight"], ["GOLD", 100.0]]))
+    point, _, reason = positioning.gld_point_from_xlsx(_xlsx([["Name", "Weight"], ["GOLD", 100.0]]))
     assert point is None
     assert "no tonnes" in reason
 
@@ -117,3 +120,45 @@ def test_all_sources_down_without_history_fails_safe(tmp_path, monkeypatch) -> N
         result = positioning.fetch_gld_holdings(urls=("https://x",))
     assert result["_meta"]["ok"] is False
     assert "returned pdf" in result["_meta"]["error"]
+
+
+PRODUCT_DATA_ROWS = [
+    ["Past performance is not a reliable indicator of future performance."],
+    ["As of** ", "Ticker", "Name", "ISIN", "NAV", "Shares Outstanding", "Total Net Assets"],
+    [None, None, None, None, None, None, None],
+    ["Sep 03 2026", "GLDM®", "SPDR® Gold MiniShares®", "US98149E3036", "$88.50", "1,200.00 M", "$106,200.00 M"],
+    ["Sep 03 2026", "GLD®", "SPDR® Gold Shares", "US78463V1070", "$409.67", "369.20 M", "$151,250.23 M"],
+    ["Sep 03 2026", "SPY", "SPDR S&P 500", "US78462F1030", "$650.00", "900.00 M", "$585,000.00 M"],
+]
+
+
+def test_product_data_workbook_yields_gld_shares_outstanding() -> None:
+    point, unit, reason = positioning.gld_point_from_xlsx(_xlsx(PRODUCT_DATA_ROWS))
+    assert reason == ""
+    assert unit == "M shares"
+    assert point == (date(2026, 9, 3), 369.2)
+
+
+def test_product_data_level_accumulates_with_unit(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(positioning, "LOG_DIR", tmp_path)
+    (tmp_path / "gld_holdings_history.json").write_text(
+        json.dumps({"unit": "M shares", "points": {f"2026-08-{d:02d}": 360.0 + d * 0.5 for d in range(25, 31)}})
+    )
+    with patch("agents.data.positioning.requests.get", return_value=_response(_xlsx(PRODUCT_DATA_ROWS))):
+        result = positioning.fetch_gld_holdings(urls=("https://ssga/spdr-product-data-us-en.xlsx",))
+    assert result["_meta"]["ok"] is True
+    assert result["unit"] == "M shares"
+    assert result["level"] == 369.2
+    assert result["tonnes"] is None
+    assert result["change_5d"] == round(369.2 - 373.0, 2)
+    assert result["direction_5d"] == "DOWN"
+    assert result["history_points"] == 7
+
+
+def test_gld_disabled_by_default_returns_quietly(monkeypatch) -> None:
+    monkeypatch.setattr(positioning, "GLD_HOLDINGS_URLS", ())
+    with patch("agents.data.positioning.requests.get") as mock_get:
+        result = positioning.fetch_gld_holdings()
+    mock_get.assert_not_called()
+    assert result["disabled"] is True
+    assert result["_meta"]["ok"] is False

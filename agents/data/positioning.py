@@ -142,7 +142,7 @@ def fetch_cot_gold(weeks: int = COT_WEEKS) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 GLD_DATE_FORMATS = (
     "%d-%b-%Y", "%d-%B-%Y", "%d-%b-%y", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y",
-    "%m/%d/%y", "%b %d, %Y", "%d %b %Y", "%Y%m%d",
+    "%m/%d/%y", "%b %d, %Y", "%b %d %Y", "%d %b %Y", "%Y%m%d",
 )
 
 
@@ -202,7 +202,7 @@ def parse_gld_csv(text: str) -> dict[str, Any]:
     return summarize_gld_points(points, source="spdr_gld:csv")
 
 
-def summarize_gld_points(points: list[tuple[date, float]], source: str = "spdr_gld") -> dict[str, Any]:
+def summarize_gld_points(points: list[tuple[date, float]], source: str = "spdr_gld", unit: str = "t") -> dict[str, Any]:
     """(date, tonnes) points -> latest level with 5-observation / 30-day changes."""
     if not points:
         return {"_meta": _meta(False, source, "no points")}
@@ -222,7 +222,9 @@ def summarize_gld_points(points: list[tuple[date, float]], source: str = "spdr_g
 
     return {
         "as_of": latest_date.isoformat(),
-        "tonnes": round(latest, 2),
+        "level": round(latest, 2),
+        "unit": unit,
+        "tonnes": round(latest, 2) if unit == "t" else None,
         "change_5d": round(change_5d, 2) if change_5d is not None else None,
         "change_30d": round(change_30d, 2) if change_30d is not None else None,
         "direction_5d": _dir(change_5d),
@@ -265,25 +267,33 @@ def _gld_points_from_csv_rows(text: str) -> list[tuple[date, float]]:
 
 
 TROY_OUNCES_PER_TONNE = 32150.7466
-_XLSX_DATE_RE = re.compile(r"(\d{1,2}[-/ ][A-Za-z]{3}[-/ ]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]{3} \d{1,2}, \d{4})")
+_XLSX_DATE_RE = re.compile(r"(\d{1,2}[-/ ][A-Za-z]{3}[-/ ]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]{3} \d{1,2},? \d{4})")
 
 
-def gld_point_from_xlsx(content: bytes) -> tuple[tuple[date, float] | None, str]:
-    """Current tonnes from an SSGA-style daily holdings workbook.
+def gld_point_from_xlsx(content: bytes) -> tuple[tuple[date, float] | None, str, str]:
+    """Current GLD holdings level from an SSGA workbook -> (point, unit, reason).
 
-    Scans every cell: the tonnes figure is the first number on a row whose
-    label mentions 'tonnes' (or 'ounces', converted); the as-of date is the
-    first date-like value in the sheet (SSGA writes 'Holdings: 04-Sep-2026').
-    Returns (None, reason) when the workbook has no such cells.
+    Two layouts are understood:
+    * SSGA "SPDR Product Data" (all ETFs, one row each): the GLD row's
+      'Shares Outstanding' ("369.20 M") is the holdings proxy -- ETF shares are
+      created/redeemed against physical gold, so its change IS the flow.
+      unit = "M shares".
+    * A holdings sheet with a 'Tonnes' / 'Ounces' cell (ounces converted).
+      unit = "t".
+    Returns (None, "", reason) when neither is found.
     """
     try:
         import openpyxl  # type: ignore[import-not-found]
     except Exception:
-        return None, "openpyxl not installed"
+        return None, "", "openpyxl not installed"
     try:
         workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
     except Exception as exc:
-        return None, f"xlsx unreadable: {exc}"
+        return None, "", f"xlsx unreadable: {exc}"
+
+    product = _gld_point_from_product_data(workbook)
+    if product is not None:
+        return product, "M shares", ""
 
     as_of: date | None = None
     tonnes: float | None = None
@@ -334,39 +344,84 @@ def gld_point_from_xlsx(content: bytes) -> tuple[tuple[date, float] | None, str]
         if as_of is not None and tonnes is not None:
             break
     if tonnes is None:
-        return None, "no tonnes/ounces cell in workbook"
+        return None, "", "no GLD product row and no tonnes/ounces cell in workbook"
     if as_of is None:
         as_of = datetime.now().date()
-    return (as_of, round(tonnes, 2)), ""
+    return (as_of, round(tonnes, 2)), "t", ""
+
+
+def _parse_scaled_number(text: Any) -> float | None:
+    """'369.20 M' -> 369.2 ; '$151,250.23 M' -> 151250.23 ; '2,512,799' -> 2512799."""
+    raw = str(text or "").replace("$", "").replace(",", "").strip()
+    match = re.match(r"^(-?\d+(?:\.\d+)?)\s*([KMB])?$", raw, re.IGNORECASE)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def _gld_point_from_product_data(workbook: Any) -> tuple[date, float] | None:
+    """SSGA product-data workbook: GLD row -> (as_of, shares outstanding in millions)."""
+    for sheet in workbook.worksheets:
+        ticker_idx = shares_idx = asof_idx = None
+        for row in sheet.iter_rows(values_only=True):
+            if ticker_idx is None:
+                labels = [str(c).strip().lower() if isinstance(c, str) else "" for c in row]
+                if "ticker" in labels and any(l.startswith("shares outstanding") for l in labels):
+                    ticker_idx = labels.index("ticker")
+                    shares_idx = next(i for i, l in enumerate(labels) if l.startswith("shares outstanding"))
+                    asof_idx = next((i for i, l in enumerate(labels) if l.startswith("as of")), None)
+                continue
+            ticker = str(row[ticker_idx] or "").replace("®", "").strip().upper() if ticker_idx < len(row) else ""
+            if ticker != "GLD":
+                continue
+            shares = _parse_scaled_number(row[shares_idx]) if shares_idx is not None and shares_idx < len(row) else None
+            if shares is None:
+                return None
+            as_of: date | None = None
+            if asof_idx is not None and asof_idx < len(row):
+                cell = row[asof_idx]
+                if isinstance(cell, datetime):
+                    as_of = cell.date()
+                elif isinstance(cell, str):
+                    as_of = _parse_gld_date(cell) or (_XLSX_DATE_RE.search(cell) and _parse_gld_date(_XLSX_DATE_RE.search(cell).group(1)))
+            return (as_of or datetime.now().date(), round(shares, 2))
+    return None
 
 
 def _history_path() -> Path:
     return Path(LOG_DIR) / "gld_holdings_history.json"
 
 
-def _load_history() -> list[tuple[date, float]]:
+def _load_history() -> tuple[list[tuple[date, float]], str]:
+    """-> (points, unit). File format: {"unit": "t"|"M shares", "points": {date: value}}
+    (a bare {date: value} mapping from the first version is read as tonnes)."""
     try:
         raw = json.loads(_history_path().read_text(encoding="utf-8"))
     except Exception:
-        return []
+        return [], ""
+    if not isinstance(raw, dict):
+        return [], ""
+    unit = str(raw.get("unit") or "t") if "points" in raw else "t"
+    mapping = raw.get("points", raw) if "points" in raw else raw
     points: list[tuple[date, float]] = []
-    for key, value in (raw.items() if isinstance(raw, dict) else []):
+    for key, value in (mapping.items() if isinstance(mapping, dict) else []):
         try:
             points.append((date.fromisoformat(str(key)), float(value)))
         except (TypeError, ValueError):
             continue
-    return points
+    return points, unit
 
 
-def _save_history(points: list[tuple[date, float]], keep_days: int = 400) -> None:
+def _save_history(points: list[tuple[date, float]], unit: str = "t", keep_days: int = 400) -> None:
     try:
         merged = dict(sorted(dict(points).items()))
         if merged:
-            cutoff = max(merged) .toordinal() - keep_days
+            cutoff = max(merged).toordinal() - keep_days
             merged = {d: v for d, v in merged.items() if d.toordinal() >= cutoff}
         path = _history_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({d.isoformat(): v for d, v in merged.items()}, indent=0), encoding="utf-8")
+        payload = {"unit": unit, "points": {d.isoformat(): v for d, v in merged.items()}}
+        path.write_text(json.dumps(payload, indent=0), encoding="utf-8")
     except Exception as exc:  # pragma: no cover - disk problems must not break trading
         LOGGER.warning("GLD history save failed: %s", exc)
 
@@ -389,9 +444,12 @@ def fetch_gld_holdings(urls: tuple[str, ...] | None = None) -> dict[str, Any]:
     level); merge into the on-disk history so 5d/30d changes survive a source
     that only publishes the current value."""
     candidates = urls if urls is not None else GLD_HOLDINGS_URLS
+    if not candidates:
+        return {"_meta": _meta(False, "spdr_gld", "disabled (set GLD_HOLDINGS_URL to enable)"), "disabled": True}
     failures: list[str] = []
     new_points: list[tuple[date, float]] = []
     source = ""
+    unit = "t"
     for url in candidates:
         try:
             response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -404,11 +462,11 @@ def fetch_gld_holdings(urls: tuple[str, ...] | None = None) -> dict[str, Any]:
             failures.append(f"{url}: returned {kind}, not data")
             continue
         if kind == "xlsx":
-            point, reason = gld_point_from_xlsx(response.content)
+            point, point_unit, reason = gld_point_from_xlsx(response.content)
             if point is None:
                 failures.append(f"{url}: {reason}")
                 continue
-            new_points, source = [point], f"spdr_gld:xlsx({url.rsplit('/', 1)[-1]})"
+            new_points, source, unit = [point], f"spdr_gld:xlsx({url.rsplit('/', 1)[-1]})", point_unit
             break
         points = _gld_points_from_csv_rows(response.text)
         if not points:
@@ -417,18 +475,20 @@ def fetch_gld_holdings(urls: tuple[str, ...] | None = None) -> dict[str, Any]:
         new_points, source = points, "spdr_gld:csv"
         break
 
-    history = _load_history()
+    history, stored_unit = _load_history()
     if new_points:
+        if history and stored_unit and stored_unit != unit:
+            history = []  # unit changed with the source; a mixed series is meaningless
         history = sorted(dict(history + new_points).items())
-        _save_history(history)
+        _save_history(history, unit)
     elif history:
-        source = "spdr_gld:history_only"
+        source, unit = "spdr_gld:history_only", stored_unit or unit
         LOGGER.warning("GLD holdings: all sources failed, using on-disk history: %s", "; ".join(failures))
     else:
         LOGGER.warning("GLD holdings fetch failed: %s", "; ".join(failures))
         return {"_meta": _meta(False, "spdr_gld", "; ".join(failures) or "no candidate URLs")}
 
-    result = summarize_gld_points(history, source=source)
+    result = summarize_gld_points(history, source=source, unit=unit)
     if failures:
         result["_meta"]["error"] = "; ".join(failures)
     return result
