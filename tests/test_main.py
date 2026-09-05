@@ -926,7 +926,7 @@ def _pending_common(monkeypatch, tmp_path: Path) -> tuple[Path, list[dict[str, A
 def test_handle_pending_orders_places_and_logs(tmp_path: Path, monkeypatch) -> None:
     log_path, placed = _pending_common(monkeypatch, tmp_path)
 
-    main._handle_pending_orders(
+    outcome = main._handle_pending_orders(
         pendings=[{"type": "BUY_LIMIT", "price": 4382.45, "tp": None, "basis": "D1サポート押し目"}],
         current_price=4404.0,
         atr=15.0,
@@ -939,6 +939,8 @@ def test_handle_pending_orders_places_and_logs(tmp_path: Path, monkeypatch) -> N
         now_iso="2026-08-12T12:00:00+00:00",
     )
 
+    assert outcome["status"] == "placed"
+    main._append_trade_log(outcome["log_row"])
     assert len(placed) == 1
     assert placed[0]["order_type"] == "BUY_LIMIT"
     assert placed[0]["price"] == 4382.45
@@ -953,7 +955,7 @@ def test_handle_pending_orders_places_and_logs(tmp_path: Path, monkeypatch) -> N
 def test_handle_pending_orders_respects_risk_filters(tmp_path: Path, monkeypatch) -> None:
     _, placed = _pending_common(monkeypatch, tmp_path)
 
-    main._handle_pending_orders(
+    outcome = main._handle_pending_orders(
         pendings=[{"type": "BUY_LIMIT", "price": 4382.45, "tp": None, "basis": "x"}],
         current_price=4404.0,
         atr=15.0,
@@ -967,12 +969,14 @@ def test_handle_pending_orders_respects_risk_filters(tmp_path: Path, monkeypatch
     )
 
     assert placed == []
+    assert outcome["status"].startswith("skipped_risk_filter:")
+    assert outcome["log_row"] is None
 
 
 def test_handle_pending_orders_skips_far_triggers(tmp_path: Path, monkeypatch) -> None:
     _, placed = _pending_common(monkeypatch, tmp_path)
 
-    main._handle_pending_orders(
+    outcome = main._handle_pending_orders(
         pendings=[{"type": "BUY_LIMIT", "price": 4300.0, "tp": None, "basis": "遠すぎ"}],
         current_price=4404.0,
         atr=15.0,  # distance 104 > 3*15
@@ -986,6 +990,8 @@ def test_handle_pending_orders_skips_far_triggers(tmp_path: Path, monkeypatch) -
     )
 
     assert placed == []
+    assert outcome["status"] == "skipped_distance:6.93atr"
+    assert outcome["log_row"] is None
 
 
 def test_run_once_places_pending_order_on_hold_with_plan(tmp_path: Path, monkeypatch) -> None:
@@ -1034,6 +1040,45 @@ def test_run_once_places_pending_order_on_hold_with_plan(tmp_path: Path, monkeyp
     rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
     actions = [row["action"] for row in rows]
     assert actions == ["HOLD", "BUY_LIMIT"]
+    assert rows[0]["pending_status"] == "placed"
+    assert rows[1]["pending_status"] == ""
+
+
+def test_run_once_records_none_proposed_when_hold_has_no_pending_plan(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "build_risk_plan",
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+            "ok": False,
+            "action": "HOLD",
+            "lot": 0.0,
+            "sl": 0.0,
+            "tp": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+            "action": "HOLD",
+            "confidence": 0.7,
+            "reasoning": "様子見",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.7,
+            "pending_orders": [],
+            "_meta": {"model": "t", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert result["pending_status"] == "none_proposed"
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert [row["action"] for row in rows] == ["HOLD"]
+    assert rows[0]["pending_status"] == "none_proposed"
 
 
 def test_is_pending_flat_window_good_for_day() -> None:
