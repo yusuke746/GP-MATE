@@ -20,7 +20,6 @@ ENV_PATH: Final[Path] = BASE_DIR / ".env"
 DEFAULT_RSS_FEEDS: Final[tuple[str, ...]] = (
     "https://news.google.com/rss/search?q=gold+price+OR+XAUUSD+OR+bullion&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=Fed+OR+%22treasury+yields%22+OR+%22dollar+index%22&hl=en-US&gl=US&ceid=US:en",
-    "https://www.kitco.com/rss/category/commodities",
     "https://www.fxstreet.com/rss/news",
     "https://www.forexlive.com/feed/news",
     "https://www.investing.com/rss/news_285.rss",
@@ -101,10 +100,16 @@ class Settings:
 
 
 def _get_env_str(name: str, default: str = "") -> str:
+    """Read an env var; a missing OR blank value means 'use the default'.
+
+    .env.example lists every key as ``KEY=`` so users can fill in only what
+    they need; a blank line must not turn a URL/model/symbol default into "".
+    """
     value = os.getenv(name)
     if value is None:
         return default
-    return value.strip()
+    stripped = value.strip()
+    return stripped if stripped else default
 
 
 def _get_env_int(name: str, default: int) -> int:
