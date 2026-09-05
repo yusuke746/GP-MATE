@@ -22,7 +22,6 @@ DEFAULT_RSS_FEEDS: Final[tuple[str, ...]] = (
     "https://news.google.com/rss/search?q=Fed+OR+%22treasury+yields%22+OR+%22dollar+index%22&hl=en-US&gl=US&ceid=US:en",
     "https://www.fxstreet.com/rss/news",
     "https://www.forexlive.com/feed/news",
-    "https://www.investing.com/rss/news_285.rss",
 )
 
 

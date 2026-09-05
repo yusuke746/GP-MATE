@@ -137,14 +137,25 @@ def fetch_cot_gold(weeks: int = COT_WEEKS) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # SPDR Gold Shares (GLD) holdings
 # --------------------------------------------------------------------------- #
+GLD_DATE_FORMATS = (
+    "%d-%b-%Y", "%d-%B-%Y", "%d-%b-%y", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y",
+    "%m/%d/%y", "%b %d, %Y", "%d %b %Y", "%Y%m%d",
+)
+
+
 def _parse_gld_date(text: str) -> date | None:
-    text = text.strip().strip('"')
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+    text = text.strip().strip('"').strip()
+    for fmt in GLD_DATE_FORMATS:
         try:
             return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
     return None
+
+
+def _sample_lines(text: str, count: int = 3, width: int = 160) -> str:
+    lines = [line for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip()]
+    return " | ".join(line[:width] for line in lines[:count])
 
 
 def parse_gld_csv(text: str) -> dict[str, Any]:
@@ -156,20 +167,21 @@ def parse_gld_csv(text: str) -> dict[str, Any]:
     """
     # The archive is served with bare CR line endings (and occasionally CRLF
     # inside quoted cells); the csv module rejects that unless normalised.
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     reader = csv.reader(io.StringIO(normalized, newline=""))
     header: list[str] | None = None
     date_idx = tonnes_idx = -1
     points: list[tuple[date, float]] = []
     for row in reader:
         if header is None:
-            lowered = [cell.strip().lower() for cell in row]
-            if any(cell == "date" for cell in lowered):
+            lowered = [cell.strip().strip("\ufeff").lower() for cell in row]
+            # Header = a row with a 'Date' cell AND a 'Tonnes' cell; preamble
+            # rows may mention "date" in prose without being the header.
+            date_cells = [i for i, cell in enumerate(lowered) if cell == "date" or cell.startswith("date")]
+            tonnes_candidates = [i for i, cell in enumerate(lowered) if "tonne" in cell]
+            if date_cells and tonnes_candidates:
                 header = row
-                date_idx = next(i for i, cell in enumerate(lowered) if cell == "date")
-                tonnes_candidates = [i for i, cell in enumerate(lowered) if "tonnes" in cell]
-                if not tonnes_candidates:
-                    return {"_meta": _meta(False, "spdr_gld", "no tonnes column in header")}
+                date_idx = date_cells[0]
                 tonnes_idx = tonnes_candidates[0]
             continue
         if len(row) <= max(date_idx, tonnes_idx):
@@ -180,8 +192,10 @@ def parse_gld_csv(text: str) -> dict[str, Any]:
             continue
         points.append((parsed_date, tonnes))
 
+    if header is None:
+        return {"_meta": _meta(False, "spdr_gld", f"no Date/Tonnes header found; file starts: {_sample_lines(text)}")}
     if not points:
-        return {"_meta": _meta(False, "spdr_gld", "no parsable rows")}
+        return {"_meta": _meta(False, "spdr_gld", f"header found but no parsable rows; file starts: {_sample_lines(text, 4)}")}
     points.sort(key=lambda p: p[0])
     latest_date, latest = points[-1]
     change_5d = latest - points[-6][1] if len(points) >= 6 else None
