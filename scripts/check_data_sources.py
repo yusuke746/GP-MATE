@@ -84,7 +84,7 @@ def check_positioning() -> None:
           f"report={cot.get('report_date')} net={cot.get('managed_money_net')} 4w={cot.get('net_change_4w')} pct={cot.get('net_percentile_window')} {cot.get('crowding', cot.get('_meta', {}).get('error'))}")
     gld = fetch_gld_holdings()
     _line("SPDR GLD holdings", bool(gld.get("_meta", {}).get("ok")),
-          f"as_of={gld.get('as_of')} tonnes={gld.get('tonnes')} 5d={gld.get('change_5d')} 30d={gld.get('change_30d')} {gld.get('_meta', {}).get('error') or ''}")
+          f"as_of={gld.get('as_of')} tonnes={gld.get('tonnes')} 5d={gld.get('change_5d')} 30d={gld.get('change_30d')} points={gld.get('history_points')} src={gld.get('_meta', {}).get('source')} {gld.get('_meta', {}).get('error') or ''}")
 
 
 def check_mt5_dollar_index() -> None:
