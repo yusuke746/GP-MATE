@@ -12,22 +12,36 @@ from dotenv import load_dotenv
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 ENV_PATH: Final[Path] = BASE_DIR / ".env"
 
-# Keep RSS sources in code to simplify deployment and avoid extra env keys.
+# Default RSS sources. Google News aggregates Reuters/Bloomberg/CNBC headlines
+# behind a bot-tolerant endpoint, so it is the backbone; the rest are
+# gold/FX specialists. Override with RSS_FEEDS=url1,url2 in .env after checking
+# scripts/check_data_sources.py (marketwatch topstories was dropped: it rarely
+# carried a gold headline and investing.com intermittently blocks scrapers).
 DEFAULT_RSS_FEEDS: Final[tuple[str, ...]] = (
+    "https://news.google.com/rss/search?q=gold+price+OR+XAUUSD+OR+bullion&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=Fed+OR+%22treasury+yields%22+OR+%22dollar+index%22&hl=en-US&gl=US&ceid=US:en",
+    "https://www.kitco.com/rss/category/commodities",
+    "https://www.fxstreet.com/rss/news",
     "https://www.forexlive.com/feed/news",
     "https://www.investing.com/rss/news_285.rss",
-    "https://www.marketwatch.com/rss/topstories",
 )
+
+
+def _parse_feed_list(value: str) -> tuple[str, ...]:
+    feeds = tuple(item.strip() for item in value.split(",") if item.strip())
+    return feeds if feeds else DEFAULT_RSS_FEEDS
 
 load_dotenv(ENV_PATH)
 
 MARKET_TIMEZONE_NAME: Final[str] = "America/New_York"
 JST_TIMEZONE_NAME: Final[str] = "Asia/Tokyo"
-# Judgment slots (America/New_York). The London slot was moved 03:00 -> 04:00
-# after slot-level stats showed 03:00 (right at the London open whipsaw hour)
-# was the only losing slot: 12 settled, 25% win rate, PF 0.42.
+# Judgment slots (America/New_York). NY session only: the London-open slot
+# (03:00, later 04:00) was retired after 10 weeks of live data showed it was
+# the sole losing slot -- 14 settled, 21% win rate, -44,533 JPY, PF 0.26 --
+# while the three NY slots combined ran 36 settled, 58% win rate, PF 1.81.
+# Positions opened in London were repeatedly stopped out during the NY open
+# (08:00-09:30) before the next judgment could re-evaluate them.
 NY_RUN_TIMES: Final[tuple[tuple[int, int], ...]] = (
-    (4, 0),
     (8, 0),
     (9, 30),
     (10, 30),
@@ -265,7 +279,7 @@ def load_settings() -> Settings:
         model_decision=_get_env_str("MODEL_DECISION", "gpt-5.6-sol"),
         model_debate=_get_env_str("MODEL_DEBATE", "gpt-5.6-terra"),
         max_news_items=_get_env_int("MAX_NEWS_ITEMS", 15),
-        rss_feeds=DEFAULT_RSS_FEEDS,
+        rss_feeds=_parse_feed_list(_get_env_str("RSS_FEEDS", "")),
         stage=_get_env_int("STAGE", 1),
         mt5_login=mt5_login,
         mt5_password=mt5_password,
@@ -327,3 +341,24 @@ MT5_SERVER_TIMEZONE: Final[str] = settings.mt5_server_timezone
 OPENAI_API_KEY: Final[str] = settings.openai_api_key
 NEWS_API_KEY: Final[str] = settings.news_api_key
 FRED_API_KEY: Final[str] = settings.fred_api_key
+
+# --------------------------------------------------------------------------- #
+# Gold-specific external data (all optional; every fetcher fails safe)
+# --------------------------------------------------------------------------- #
+# CFTC Disaggregated Futures-Only report via the public Socrata API.
+COT_DATASET_URL: Final[str] = _get_env_str(
+    "COT_DATASET_URL", "https://publicreporting.cftc.gov/resource/72hh-3qpy.json"
+)
+COT_MARKET_NAME: Final[str] = _get_env_str("COT_MARKET_NAME", "GOLD - COMMODITY EXCHANGE INC.")
+# SPDR Gold Shares daily holdings archive (CSV).
+GLD_HOLDINGS_URL: Final[str] = _get_env_str(
+    "GLD_HOLDINGS_URL", "https://www.spdrgoldshares.com/assets/dynamic/GLD/GLD_US_archive_EN.csv"
+)
+# Broker symbol candidates for a tradable dollar index; when none exists the
+# index is synthesised from the major USD pairs (see mt5_client).
+DXY_SYMBOL_CANDIDATES: Final[tuple[str, ...]] = tuple(
+    s.strip() for s in _get_env_str("DXY_SYMBOL_CANDIDATES", "USDX,USDX#,DXY,USDOLLAR,DX").split(",") if s.strip()
+)
+# Hours of economic releases (back) and scheduled events (ahead) handed to the analysts.
+RELEASES_LOOKBACK_HOURS: Final[int] = _get_env_int("RELEASES_LOOKBACK_HOURS", 48)
+EVENTS_LOOKAHEAD_HOURS: Final[int] = _get_env_int("EVENTS_LOOKAHEAD_HOURS", 24)

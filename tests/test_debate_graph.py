@@ -915,7 +915,8 @@ def test_run_once_falls_back_to_hold_when_debate_graph_fails(tmp_path: Path, mon
 
     monkeypatch.setattr(main, "get_rates", lambda symbol, tf, count: _dummy_df())
     monkeypatch.setattr(main, "add_indicators", lambda df: df)
-    monkeypatch.setattr(main, "fetch_news", lambda hours=24: [])
+    monkeypatch.setattr(main, "fetch_news_with_meta", lambda hours=24: ([], {"feeds_total": 3, "feeds_live": 3}))
+    monkeypatch.setattr(main, "build_macro_inputs", lambda macro_data: macro_data)
     monkeypatch.setattr(
         main,
         "analyze_technical",

@@ -89,19 +89,19 @@ def test_cron_trigger_next_fire_time_tracks_dst_boundaries() -> None:
     cases = (
         (
             datetime(2026, 10, 31, 0, 0, tzinfo=run_scheduler.MARKET_TZ),
-            ("17:00", "21:00", "22:30", "23:30"),
+            ("21:00", "22:30", "23:30"),
         ),
         (
             datetime(2026, 11, 2, 0, 0, tzinfo=run_scheduler.MARKET_TZ),
-            ("18:00", "22:00", "23:30", "00:30"),
+            ("22:00", "23:30", "00:30"),
         ),
         (
             datetime(2026, 3, 7, 0, 0, tzinfo=run_scheduler.MARKET_TZ),
-            ("18:00", "22:00", "23:30", "00:30"),
+            ("22:00", "23:30", "00:30"),
         ),
         (
             datetime(2026, 3, 9, 0, 0, tzinfo=run_scheduler.MARKET_TZ),
-            ("17:00", "21:00", "22:30", "23:30"),
+            ("21:00", "22:30", "23:30"),
         ),
     )
 
@@ -117,9 +117,9 @@ def test_cron_trigger_next_fire_time_tracks_dst_boundaries() -> None:
 def test_cron_trigger_emits_one_occurrence_per_day_across_dst_end() -> None:
     start = datetime(2026, 10, 31, 0, 0, tzinfo=run_scheduler.MARKET_TZ)
     expected_by_day = (
-        ("2026-10-31", "EDT", ("17:00", "21:00", "22:30", "23:30")),
-        ("2026-11-01", "EST", ("18:00", "22:00", "23:30", "00:30")),
-        ("2026-11-02", "EST", ("18:00", "22:00", "23:30", "00:30")),
+        ("2026-10-31", "EDT", ("21:00", "22:30", "23:30")),
+        ("2026-11-01", "EST", ("22:00", "23:30", "00:30")),
+        ("2026-11-02", "EST", ("22:00", "23:30", "00:30")),
     )
 
     actual_by_day: dict[str, list[tuple[str, str]]] = {}

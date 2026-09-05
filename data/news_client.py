@@ -43,15 +43,29 @@ GOLD_KEYWORDS: tuple[str, ...] = (
     "treasury",
     "yield",
     "geopolitical",
+    "bullion",
+    "precious metal",
+    "safe haven",
+    "safe-haven",
+    "tariff",
+    "payrolls",
+    "nonfarm",
+    "jobs report",
+    "central bank",
+    "etf",
 )
 
 CALENDAR_XML_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 REQUEST_TIMEOUT = 10
+# Several publishers answer the default python-requests UA with 403; a
+# browser-like UA is what their own readers send.
+REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GP-MATE/1.0"}
+CALENDAR_CURRENCIES = {"USD", "XAU"}
 
 
 def _safe_get(url: str, params: dict[str, Any] | None = None) -> requests.Response | None:
     try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers=REQUEST_HEADERS)
         response.raise_for_status()
         return response
     except Exception as exc:
@@ -162,13 +176,24 @@ def _deduplicate_by_title(news_items: list[dict[str, Any]]) -> list[dict[str, An
     return unique_items
 
 
-def fetch_news(hours: int = 24, max_items: int = MAX_NEWS_ITEMS) -> list[dict[str, Any]]:
-    """Fetch and filter gold-related headlines from configured RSS feeds.
+def fetch_news_with_meta(
+    hours: int = 24, max_items: int = MAX_NEWS_ITEMS
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """fetch_news plus feed-health metadata.
 
-    Returns empty list on failure to preserve safe caller behavior.
+    meta = {"feeds_total", "feeds_live", "raw_items", "keyword_items", "dead_feeds"}
+    so a starving pipeline (dead feeds vs. nothing matching the keywords) is
+    diagnosable from the trade log instead of only from process logs.
     """
+    meta: dict[str, Any] = {
+        "feeds_total": len(RSS_FEEDS),
+        "feeds_live": 0,
+        "raw_items": 0,
+        "keyword_items": 0,
+        "dead_feeds": [],
+    }
     if hours <= 0 or max_items <= 0:
-        return []
+        return [], meta
 
     now_utc = datetime.now(UTC)
     oldest = now_utc - timedelta(hours=hours)
@@ -186,6 +211,9 @@ def fetch_news(hours: int = 24, max_items: int = MAX_NEWS_ITEMS) -> list[dict[st
 
     if skipped_feeds:
         LOGGER.warning("RSS feed skipped this cycle: %s", ", ".join(skipped_feeds))
+    meta["feeds_live"] = live_feed_count
+    meta["dead_feeds"] = skipped_feeds
+    meta["raw_items"] = len(all_items)
 
     filtered: list[dict[str, Any]] = []
     dropped_undated = 0
@@ -193,6 +221,7 @@ def fetch_news(hours: int = 24, max_items: int = MAX_NEWS_ITEMS) -> list[dict[st
         title = str(item.get("title") or "")
         if not _contains_keywords(title, GOLD_KEYWORDS):
             continue
+        meta["keyword_items"] = int(meta["keyword_items"]) + 1
 
         published_at_raw = str(item.get("published_at") or "")
         published_at = datetime.fromisoformat(published_at_raw) if published_at_raw else None
@@ -219,9 +248,23 @@ def fetch_news(hours: int = 24, max_items: int = MAX_NEWS_ITEMS) -> list[dict[st
     if live_feed_count == 0:
         LOGGER.warning("All RSS feeds are unavailable in this cycle. news_count=0")
     elif len(result) == 0:
-        LOGGER.warning("No valid news items after filtering. news_count=0")
+        LOGGER.warning(
+            "No valid news items after filtering. news_count=0 (feeds_live=%d raw=%d keyword=%d)",
+            live_feed_count,
+            meta["raw_items"],
+            meta["keyword_items"],
+        )
 
-    return result
+    return result, meta
+
+
+def fetch_news(hours: int = 24, max_items: int = MAX_NEWS_ITEMS) -> list[dict[str, Any]]:
+    """Fetch and filter gold-related headlines from configured RSS feeds.
+
+    Returns empty list on failure to preserve safe caller behavior.
+    """
+    items, _ = fetch_news_with_meta(hours=hours, max_items=max_items)
+    return items
 
 
 def _parse_calendar_event_datetime(date_text: str, time_text: str) -> datetime | None:
@@ -245,6 +288,56 @@ def _parse_calendar_event_datetime(date_text: str, time_text: str) -> datetime |
     return None
 
 
+def parse_calendar_events(xml_text: str) -> list[dict[str, Any]]:
+    """ForexFactory weekly XML -> event dicts.
+
+    Each dict: title, currency, impact (lowercase), datetime_utc (aware or None),
+    forecast, previous, actual (raw strings; actual is usually absent in this feed).
+    Raises on malformed XML so callers can decide the fail-safe direction.
+    """
+    root = ElementTree.fromstring(xml_text)
+    events: list[dict[str, Any]] = []
+    for event in root.findall(".//event"):
+        date_text = (event.findtext("date") or "").strip()
+        time_text = (event.findtext("time") or "").strip()
+        events.append(
+            {
+                "title": (event.findtext("title") or "").strip(),
+                "currency": (event.findtext("currency") or event.findtext("country") or "").strip().upper(),
+                "impact": (event.findtext("impact") or "").strip().lower(),
+                "datetime_utc": _parse_calendar_event_datetime(date_text, time_text),
+                "forecast": (event.findtext("forecast") or "").strip(),
+                "previous": (event.findtext("previous") or "").strip(),
+                "actual": (event.findtext("actual") or "").strip(),
+            }
+        )
+    return events
+
+
+def fetch_calendar_events(
+    currencies: set[str] | None = None,
+    high_impact_only: bool = True,
+) -> list[dict[str, Any]] | None:
+    """This week's calendar events for the given currencies (default USD/XAU).
+
+    Returns None when the feed is unreachable or unparsable so callers can
+    fail safe; an empty list means the feed answered with nothing relevant.
+    """
+    response = _safe_get(CALENDAR_XML_URL)
+    if response is None:
+        return None
+    try:
+        events = parse_calendar_events(response.text)
+    except Exception as exc:
+        LOGGER.warning("Calendar parse failed: %s", exc)
+        return None
+    wanted = currencies or CALENDAR_CURRENCIES
+    selected = [e for e in events if e["currency"] in wanted]
+    if high_impact_only:
+        selected = [e for e in selected if "high" in e["impact"]]
+    return selected
+
+
 def is_high_impact_soon(minutes: int = NEWS_FILTER_MINUTES) -> bool:
     """Return True if high-impact USD/XAU event is near now.
 
@@ -253,40 +346,27 @@ def is_high_impact_soon(minutes: int = NEWS_FILTER_MINUTES) -> bool:
     if minutes <= 0:
         return False
 
-    response = _safe_get(CALENDAR_XML_URL)
-    if response is None:
+    events = fetch_calendar_events()
+    if events is None:
+        return True
+    # A week with zero parsable events is far likelier a feed problem than a
+    # genuinely empty calendar; keep the legacy fail-safe.
+    if not events and _calendar_has_no_events_at_all():
         return True
 
-    try:
-        root = ElementTree.fromstring(response.text)
-        now_utc = datetime.now(UTC)
-        threshold = timedelta(minutes=minutes)
-
-        events = root.findall(".//event")
-        if not events:
+    now_utc = datetime.now(UTC)
+    threshold = timedelta(minutes=minutes)
+    for event in events:
+        event_dt = event.get("datetime_utc")
+        if event_dt is None:
+            continue
+        if abs(event_dt - now_utc) <= threshold:
             return True
+    return False
 
-        for event in events:
-            currency = (event.findtext("currency") or "").strip().upper()
-            impact = (event.findtext("impact") or "").strip().lower()
-            date_text = (event.findtext("date") or "").strip()
-            time_text = (event.findtext("time") or "").strip()
 
-            if currency not in {"USD", "XAU"}:
-                continue
-            if "high" not in impact:
-                continue
-
-            event_dt = _parse_calendar_event_datetime(date_text, time_text)
-            if event_dt is None:
-                continue
-
-            if abs(event_dt - now_utc) <= threshold:
-                return True
-
-        return False
-    except Exception as exc:
-        LOGGER.warning("Calendar parse failed: %s", exc)
-        return True
+def _calendar_has_no_events_at_all() -> bool:
+    all_events = fetch_calendar_events(currencies={"USD", "XAU", "EUR", "GBP", "JPY", "CAD", "AUD", "NZD", "CHF", "CNY"}, high_impact_only=False)
+    return not all_events
 
 

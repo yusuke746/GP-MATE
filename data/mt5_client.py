@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -1005,5 +1005,117 @@ def get_account_info() -> dict[str, Any]:
             "success": False,
             "reason": str(exc),
         }
+    finally:
+        disconnect()
+
+
+# --------------------------------------------------------------------------- #
+# Dollar index proxy (replaces the week-lagged FRED DTWEXBGS as the live read)
+# --------------------------------------------------------------------------- #
+# ICE DXY constituents and weights; the index is a geometric mean scaled by
+# 50.14348112. Pairs quoted USD/XXX enter with positive weight, XXX/USD negative.
+DXY_WEIGHTS: dict[str, float] = {
+    "EURUSD": -0.576,
+    "USDJPY": 0.136,
+    "GBPUSD": -0.119,
+    "USDCAD": 0.091,
+    "USDSEK": 0.042,
+    "USDCHF": 0.036,
+}
+DXY_SCALE = 50.14348112
+DXY_HISTORY_BARS = 45
+
+
+def _d1_closes(symbol: str, count: int) -> list[tuple[date, float]]:
+    """Daily closes for an available symbol inside an open MT5 session."""
+    if mt5 is None or not _ensure_symbol(symbol):
+        return []
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, count)
+    if rates is None:
+        return []
+    points: list[tuple[date, float]] = []
+    for rate in rates:
+        try:
+            bar_time = _deal_epoch_to_utc(int(rate["time"]))
+            points.append((bar_time.date(), float(rate["close"])))
+        except Exception:
+            continue
+    return points
+
+
+def synthesize_dollar_index(closes_by_pair: dict[str, list[tuple[date, float]]]) -> list[tuple[date, float]]:
+    """Geometric DXY from whichever constituent pairs are available.
+
+    Missing pairs have their weight redistributed proportionally so the level is
+    only approximate, but the day-to-day direction (all we use) is preserved.
+    """
+    available = {pair: pts for pair, pts in closes_by_pair.items() if pts and pair in DXY_WEIGHTS}
+    if not available:
+        return []
+    total_abs = sum(abs(DXY_WEIGHTS[p]) for p in available)
+    scale = sum(abs(w) for w in DXY_WEIGHTS.values()) / total_abs
+    weights = {p: DXY_WEIGHTS[p] * scale for p in available}
+
+    common_dates = set.intersection(*(set(d for d, _ in pts) for pts in available.values()))
+    by_pair = {p: dict(pts) for p, pts in available.items()}
+    index: list[tuple[date, float]] = []
+    for day in sorted(common_dates):
+        value = DXY_SCALE
+        try:
+            for pair, weight in weights.items():
+                value *= by_pair[pair][day] ** weight
+        except (KeyError, ZeroDivisionError, OverflowError):
+            continue
+        index.append((day, value))
+    return index
+
+
+def get_dollar_index_snapshot(candidates: tuple[str, ...] | None = None) -> dict[str, Any]:
+    """Live dollar-index snapshot in the FRED MacroSeriesSnapshot shape.
+
+    Prefers a broker dollar-index symbol (USDX etc.); otherwise synthesises the
+    index from the major pairs. Returns {"_meta": {"ok": False, ...}} on failure.
+    """
+    from agents.data.fred_client import snapshot_from_points  # local: avoid import cycle at module load
+    from config import DXY_SYMBOL_CANDIDATES
+
+    names = candidates if candidates is not None else DXY_SYMBOL_CANDIDATES
+    if not connect():
+        return {"_meta": {"ok": False, "source": "mt5", "error": "connect failed"}}
+    try:
+        if mt5 is None:
+            return {"_meta": {"ok": False, "source": "mt5", "error": "MetaTrader5 unavailable"}}
+
+        for name in names:
+            info = mt5.symbol_info(name)
+            if info is None:
+                continue
+            points = _d1_closes(name, DXY_HISTORY_BARS)
+            snapshot = snapshot_from_points(points)
+            if snapshot is not None:
+                snapshot["source"] = f"mt5:{name}"
+                snapshot["_meta"] = {"ok": True, "source": f"mt5:{name}", "error": ""}
+                return dict(snapshot)
+
+        closes: dict[str, list[tuple[date, float]]] = {}
+        for pair in DXY_WEIGHTS:
+            for variant in (pair, f"{pair}#", f"{pair}m", f"{pair}.r"):
+                if mt5.symbol_info(variant) is None:
+                    continue
+                pts = _d1_closes(variant, DXY_HISTORY_BARS)
+                if pts:
+                    closes[pair] = pts
+                    break
+        index = synthesize_dollar_index(closes)
+        snapshot = snapshot_from_points(index)
+        if snapshot is None:
+            return {"_meta": {"ok": False, "source": "mt5", "error": "no dollar index symbol or constituent pairs"}}
+        used = ",".join(sorted(closes))
+        snapshot["source"] = f"mt5:synthetic({used})"
+        snapshot["_meta"] = {"ok": True, "source": snapshot["source"], "error": ""}
+        return dict(snapshot)
+    except Exception as exc:
+        LOGGER.exception("get_dollar_index_snapshot exception: %s", exc)
+        return {"_meta": {"ok": False, "source": "mt5", "error": str(exc)}}
     finally:
         disconnect()

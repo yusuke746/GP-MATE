@@ -19,6 +19,8 @@ warnings.filterwarnings(
 
 from agents.debate_graph import build_skipped_debate_report, run_debate_graph, should_execute_debate
 from agents.data.fred_client import get_macro_data
+from agents.data.macro_inputs import build_macro_inputs
+from agents.data.releases import releases_as_news_items
 from agents.evaluate_position import evaluate_position
 from agents.macro_analyst import analyze_macro_environment
 from agents.sentiment import analyze_sentiment
@@ -56,7 +58,7 @@ from data.mt5_client import (
     place_pending_order,
     send_order,
 )
-from data.news_client import fetch_news, is_high_impact_soon
+from data.news_client import fetch_news_with_meta, is_high_impact_soon
 from agents.technical import EXTENSION_ATR_CAUTION, calc_extension_atr
 from indicators.ta_calc import add_indicators
 from indicators.horizontal_levels import build_horizontal_levels
@@ -159,6 +161,8 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "trigger_conditions",
     "mfe_usd",
     "mae_usd",
+    "pending_status",
+    "news_feeds_live",
 )
 
 
@@ -567,7 +571,7 @@ def _is_pending_flat_window(reference: datetime | None = None) -> bool:
     16:55 daily close) until the first judgment of the next day re-plans.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
-    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (4, 0)
+    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (8, 0)
 
     if (now_market.hour, now_market.minute) >= DAILY_PENDING_CUTOFF_NY:
         return True
@@ -882,9 +886,15 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
         current_price=float(h1_latest.get("close", 0.0) or 0.0),
     )
 
-    news_items = fetch_news(hours=24)
-    macro_data = get_macro_data(force_refresh=False)
+    news_items, feed_meta = fetch_news_with_meta(hours=24)
+    # FRED series + live dollar index + positioning + calendar surprises.
+    macro_data = build_macro_inputs(get_macro_data(force_refresh=False))
     macro_report = analyze_macro_environment(macro_data)
+    # Structured prints are the highest-signal headlines a gold trader gets and
+    # keep the sentiment input alive on release days when RSS feeds are thin.
+    release_items = releases_as_news_items(macro_data.get("recent_releases", []) or [])
+    if release_items:
+        news_items = release_items + list(news_items)
     technical_report = analyze_technical(
         {
             "direction_context": direction_context,
@@ -892,7 +902,17 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
         }
     )
     sentiment_report = analyze_sentiment(news_items)
+    if isinstance(sentiment_report, dict):
+        sentiment_report["feed_meta"] = feed_meta
     return d1, h4, h1, news_items, macro_report, technical_report, sentiment_report
+
+
+def _feed_health_text(sentiment_report: Any) -> str:
+    """'live/total' RSS feed count for the trade log ('' when unknown)."""
+    meta = sentiment_report.get("feed_meta") if isinstance(sentiment_report, dict) else None
+    if not isinstance(meta, dict):
+        return ""
+    return f"{meta.get('feeds_live', 0)}/{meta.get('feeds_total', 0)}"
 
 
 def _build_debate_and_decision_reports(
@@ -1009,12 +1029,17 @@ def _handle_pending_orders(
     balance: float,
     trader_confidence: float,
     now_iso: str,
-) -> None:
+) -> dict[str, Any]:
     """Place the trader's conditional entry as a broker-side pending order.
 
     Runs only on trader-intent HOLD with a validated pending plan. All risk
     filters except the confidence threshold apply (a pending order fills only
     after the market confirms the price condition). Never raises.
+
+    Returns {"status": <str>, "log_row": <dict | None>}. ``status`` is
+    recorded on the parent HOLD row so unplaced plans stay auditable in the
+    CSV; ``log_row`` is the pending-order row for the caller to append after
+    the HOLD row (keeps the CSV in decision order).
     """
     try:
         gate = check_filters(
@@ -1027,16 +1052,16 @@ def _handle_pending_orders(
         )
         if not gate.ok:
             LOGGER.info("Pending order skipped by risk filters: %s", gate.reason)
-            return
+            return {"status": f"skipped_risk_filter:{gate.reason}", "log_row": None}
 
         pending = pendings[0] if pendings and isinstance(pendings[0], dict) else None
         if pending is None:
-            return
+            return {"status": "skipped_invalid", "log_row": None}
 
         order_type = str(pending.get("type", "") or "")
         price = float(pending.get("price", 0.0) or 0.0)
         if price <= 0 or atr <= 0 or current_price <= 0:
-            return
+            return {"status": "skipped_invalid", "log_row": None}
 
         distance = abs(price - current_price)
         if not (PENDING_MIN_DISTANCE_ATR * atr <= distance <= PENDING_MAX_DISTANCE_ATR * atr):
@@ -1046,7 +1071,10 @@ def _handle_pending_orders(
                 PENDING_MIN_DISTANCE_ATR * atr,
                 PENDING_MAX_DISTANCE_ATR * atr,
             )
-            return
+            return {
+                "status": f"skipped_distance:{distance / atr:.2f}atr",
+                "log_row": None,
+            }
 
         jpy_usd_rate = get_usd_jpy_rate()
         if jpy_usd_rate is None:
@@ -1068,7 +1096,7 @@ def _handle_pending_orders(
         )
         if not bool(risk_plan.get("ok")):
             LOGGER.info("Pending order skipped: risk plan failed (%s)", risk_plan.get("reason"))
-            return
+            return {"status": f"skipped_risk_plan:{risk_plan.get('reason', '')}", "log_row": None}
 
         order_result = place_pending_order(
             symbol=SYMBOL,
@@ -1079,30 +1107,29 @@ def _handle_pending_orders(
             tp=float(risk_plan["tp"]),
         )
 
+        placed = bool(order_result.get("success", False))
         basis = str(pending.get("basis", "") or "")
-        _append_trade_log(
-            {
-                "timestamp_utc": now_iso,
-                "deal_id": "",
-                "position_id": str(order_result.get("order", "") or ""),
-                "symbol": SYMBOL,
-                "action": order_type,
-                "entry_price": price,
-                "pnl": "",
-                "confidence": trader_confidence,
-                "reasoning": f"pending_order: {basis}" if basis else "pending_order",
-                "risk_level": "",
-                "allowed": bool(order_result.get("success", False)),
-                "filter_reason": "Pending order placed" if order_result.get("success") else "Pending order failed",
-                "lot": float(risk_plan.get("lot", 0.0) or 0.0),
-                "sl": float(risk_plan.get("sl", 0.0) or 0.0),
-                "tp": float(risk_plan.get("tp", 0.0) or 0.0),
-                "order_success": bool(order_result.get("success", False)),
-                "retcode": order_result.get("retcode", ""),
-                "error": str(order_result.get("reason", "")),
-            }
-        )
-        if bool(order_result.get("success", False)):
+        log_row = {
+            "timestamp_utc": now_iso,
+            "deal_id": "",
+            "position_id": str(order_result.get("order", "") or ""),
+            "symbol": SYMBOL,
+            "action": order_type,
+            "entry_price": price,
+            "pnl": "",
+            "confidence": trader_confidence,
+            "reasoning": f"pending_order: {basis}" if basis else "pending_order",
+            "risk_level": "",
+            "allowed": placed,
+            "filter_reason": "Pending order placed" if placed else "Pending order failed",
+            "lot": float(risk_plan.get("lot", 0.0) or 0.0),
+            "sl": float(risk_plan.get("sl", 0.0) or 0.0),
+            "tp": float(risk_plan.get("tp", 0.0) or 0.0),
+            "order_success": placed,
+            "retcode": order_result.get("retcode", ""),
+            "error": str(order_result.get("reason", "")),
+        }
+        if placed:
             LOGGER.info(
                 "Pending order placed: %s @ %.2f lot=%.2f sl=%.2f tp=%.2f",
                 order_type,
@@ -1111,8 +1138,10 @@ def _handle_pending_orders(
                 float(risk_plan["sl"]),
                 float(risk_plan["tp"]),
             )
+        return {"status": "placed" if placed else "order_failed", "log_row": log_row}
     except Exception as exc:
         LOGGER.warning("_handle_pending_orders failed safely: %s", exc)
+        return {"status": f"error:{exc}", "log_row": None}
 
 
 RECENT_CONTEXT_HOURS = 24
@@ -1489,6 +1518,7 @@ def run_once(
                 "analysis_model": _extract_model_name(technical_report),
                 "decision_model": _extract_model_name(evaluation_report),
                 "news_count": len(news_items),
+                "news_feeds_live": _feed_health_text(sentiment_report),
                 "error": str(execution_result.get("reason", "")),
                 **debate_log_fields,
                 "position_direction": position_direction,
@@ -1597,28 +1627,36 @@ def run_once(
             "analysis_model": _extract_model_name(technical_report),
             "decision_model": _extract_model_name(trader_report),
             "news_count": len(news_items),
+                "news_feeds_live": _feed_health_text(sentiment_report),
             "error": str(order_result.get("reason", "")),
             "directional_bias": str(trader_report.get("directional_bias", "") or ""),
             "bias_strength": trader_report.get("bias_strength", ""),
             "trigger_conditions": _safe_json_dumps(trader_report.get("trigger_conditions", []), default="[]"),
             **debate_log_fields,
         }
-        _append_trade_log(result)
-
+        pending_outcome: dict[str, Any] = {"status": "", "log_row": None}
         pendings = trader_report.get("pending_orders") if isinstance(trader_report, dict) else None
-        if final_action == "HOLD" and isinstance(pendings, list) and pendings:
-            _handle_pending_orders(
-                pendings=pendings,
-                current_price=entry_price,
-                atr=atr,
-                spread=spread,
-                baseline_spread=calibrated_baseline,
-                consecutive_losses=effective_consecutive_losses,
-                daily_loss_pct=effective_daily_loss_pct,
-                balance=balance,
-                trader_confidence=float(trader_report.get("confidence", 0.0) or 0.0),
-                now_iso=now_iso,
-            )
+        if final_action == "HOLD":
+            if isinstance(pendings, list) and pendings:
+                pending_outcome = _handle_pending_orders(
+                    pendings=pendings,
+                    current_price=entry_price,
+                    atr=atr,
+                    spread=spread,
+                    baseline_spread=calibrated_baseline,
+                    consecutive_losses=effective_consecutive_losses,
+                    daily_loss_pct=effective_daily_loss_pct,
+                    balance=balance,
+                    trader_confidence=float(trader_report.get("confidence", 0.0) or 0.0),
+                    now_iso=now_iso,
+                )
+            else:
+                pending_outcome = {"status": "none_proposed", "log_row": None}
+        result["pending_status"] = str(pending_outcome.get("status", "") or "")
+        _append_trade_log(result)
+        pending_row = pending_outcome.get("log_row")
+        if isinstance(pending_row, dict):
+            _append_trade_log(pending_row)
 
         return result
     except Exception as exc:
