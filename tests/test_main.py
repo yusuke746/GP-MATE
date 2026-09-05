@@ -1096,13 +1096,17 @@ def test_is_pending_flat_window_good_for_day() -> None:
     assert main._is_pending_flat_window(
         reference=datetime(2026, 8, 12, 23, 0, tzinfo=main.MARKET_TZ)
     )
-    # Overnight until the first judgment (4:00 NY): still cancelled.
+    # Overnight and through London until the first judgment (8:00 NY):
+    # still cancelled -- no London-slot pendings exist any more.
     assert main._is_pending_flat_window(
         reference=datetime(2026, 8, 13, 3, 59, tzinfo=main.MARKET_TZ)
     )
+    assert main._is_pending_flat_window(
+        reference=datetime(2026, 8, 13, 7, 59, tzinfo=main.MARKET_TZ)
+    )
     # After the first judgment re-plans, fresh pendings must survive.
     assert not main._is_pending_flat_window(
-        reference=datetime(2026, 8, 13, 4, 7, tzinfo=main.MARKET_TZ)
+        reference=datetime(2026, 8, 13, 8, 7, tzinfo=main.MARKET_TZ)
     )
 
 

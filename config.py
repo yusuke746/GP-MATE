@@ -23,11 +23,13 @@ load_dotenv(ENV_PATH)
 
 MARKET_TIMEZONE_NAME: Final[str] = "America/New_York"
 JST_TIMEZONE_NAME: Final[str] = "Asia/Tokyo"
-# Judgment slots (America/New_York). The London slot was moved 03:00 -> 04:00
-# after slot-level stats showed 03:00 (right at the London open whipsaw hour)
-# was the only losing slot: 12 settled, 25% win rate, PF 0.42.
+# Judgment slots (America/New_York). NY session only: the London-open slot
+# (03:00, later 04:00) was retired after 10 weeks of live data showed it was
+# the sole losing slot -- 14 settled, 21% win rate, -44,533 JPY, PF 0.26 --
+# while the three NY slots combined ran 36 settled, 58% win rate, PF 1.81.
+# Positions opened in London were repeatedly stopped out during the NY open
+# (08:00-09:30) before the next judgment could re-evaluate them.
 NY_RUN_TIMES: Final[tuple[tuple[int, int], ...]] = (
-    (4, 0),
     (8, 0),
     (9, 30),
     (10, 30),

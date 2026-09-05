@@ -568,7 +568,7 @@ def _is_pending_flat_window(reference: datetime | None = None) -> bool:
     16:55 daily close) until the first judgment of the next day re-plans.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
-    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (4, 0)
+    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (8, 0)
 
     if (now_market.hour, now_market.minute) >= DAILY_PENDING_CUTOFF_NY:
         return True

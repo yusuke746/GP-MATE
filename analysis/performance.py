@@ -298,7 +298,7 @@ def slot_summary(linked: pd.DataFrame) -> pd.DataFrame:
     """Aggregate realized results per judgment slot (NY time).
 
     Rows are labeled by the decision timestamp rounded down to the half hour
-    in America/New_York, matching the judgment schedule (03:00/08:00/09:30/10:30).
+    in America/New_York, matching the judgment schedule (08:00/09:30/10:30 NY; retired slots still appear for historical rows).
     """
     columns = ["slot_ny", "decisions", "settled", "wins", "win_rate", "total_pnl", "profit_factor"]
     if linked.empty:
