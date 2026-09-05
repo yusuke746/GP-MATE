@@ -157,10 +157,10 @@ def _score_positioning(positioning: Any, key_drivers: list[str]) -> float:
         direction = str(gld.get("direction_5d", "FLAT"))
         if direction == "UP":
             score += GLD_FLOW_WEIGHT
-            key_drivers.append(f"GLD保有量が5日で増加({gld.get('change_5d')}t)、ETF資金流入")
+            key_drivers.append(f"GLD保有量が5日で増加({gld.get('change_5d')}{gld.get('unit', 't')})、ETF資金流入")
         elif direction == "DOWN":
             score -= GLD_FLOW_WEIGHT
-            key_drivers.append(f"GLD保有量が5日で減少({gld.get('change_5d')}t)、ETF資金流出")
+            key_drivers.append(f"GLD保有量が5日で減少({gld.get('change_5d')}{gld.get('unit', 't')})、ETF資金流出")
         else:
             key_drivers.append("GLD保有量は5日で横ばい")
     return score
