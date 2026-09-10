@@ -144,3 +144,88 @@ def test_macro_analyst_llm_failure_returns_neutral_fallback() -> None:
     assert result["confidence"] == 0.5
     assert result["_meta"]["ok"] is False
     assert result["_meta"]["error"] == "boom"
+
+
+# --------------------------------------------------------------------------- #
+# LLM confidence merge: downshift only, bounded by MACRO_LLM_CONF_MAX_DOWNSHIFT
+# --------------------------------------------------------------------------- #
+def _run_with_llm(llm_bias: str, llm_confidence: float, fred_data: MacroData | None = None):
+    from agents.macro_analyst import _score_macro_environment
+
+    data = fred_data or _base_fred_data()
+    baseline_bias, baseline_conf, _, _ = _score_macro_environment(data)
+
+    fake_result = Mock()
+    fake_result.ok = True
+    fake_result.payload = {
+        "macro_bias": llm_bias,
+        "confidence": llm_confidence,
+        "key_drivers": ["LLM"],
+        "reasoning": "確信度は中程度に抑制する",
+    }
+    fake_result.model = "gpt-5.6-terra"
+    fake_result.error = ""
+    fake_result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    fake_client = Mock()
+    fake_client.call_json.return_value = fake_result
+    with patch("agents.macro_analyst.get_default_client", return_value=fake_client):
+        result = analyze_macro_environment(data)
+    return result, baseline_bias, baseline_conf
+
+
+def test_llm_confidence_below_baseline_is_adopted_within_band() -> None:
+    result, bias, baseline_conf = _run_with_llm("BULLISH", 0.58)
+    assert bias == "BULLISH"
+    assert baseline_conf > 0.58
+    # Adopted as-is when within the 0.15 band, otherwise clamped to baseline - 0.15.
+    assert result["confidence"] == round(max(baseline_conf - 0.15, 0.58), 4)
+    assert result["confidence"] < baseline_conf
+    assert result["_meta"]["confidence_source"] == "llm_downshift"
+    assert result["_meta"]["llm_confidence"] == 0.58
+    assert result["reasoning"] == "確信度は中程度に抑制する"
+
+
+def test_llm_confidence_far_below_baseline_is_capped_at_max_downshift() -> None:
+    result, _, baseline_conf = _run_with_llm("BULLISH", 0.40)
+    assert result["confidence"] == round(baseline_conf - 0.15, 4)
+    assert result["_meta"]["confidence_source"] == "llm_downshift"
+    assert result["_meta"]["llm_confidence"] == 0.40
+
+
+def test_llm_confidence_above_baseline_is_ignored() -> None:
+    result, _, baseline_conf = _run_with_llm("BULLISH", 0.90)
+    assert result["confidence"] == round(baseline_conf, 4)
+    assert result["_meta"]["confidence_source"] == "rule_based"
+    assert result["_meta"]["llm_confidence"] == 0.90
+
+
+def test_llm_bias_mismatch_keeps_rule_based_confidence_and_reasoning() -> None:
+    result, _, baseline_conf = _run_with_llm("BEARISH", 0.40)
+    assert result["confidence"] == round(baseline_conf, 4)
+    assert result["_meta"]["confidence_source"] == "rule_based"
+    assert result["_meta"]["llm_confidence"] == 0.40
+    assert result["reasoning"] != "確信度は中程度に抑制する"
+
+
+def test_review_case_0689_to_058() -> None:
+    # 2026-09-09: rule-based 0.689, LLM 0.58 (2y yield up, PPI ahead) -> 0.58.
+    from agents.macro_analyst import _merge_llm_result
+
+    baseline = {
+        "macro_bias": "BULLISH",
+        "confidence": 0.689,
+        "key_drivers": ["rule"],
+        "reasoning": "rule reasoning",
+        "_meta": {"ok": True, "model": "rule_based", "usage": {}, "error": ""},
+    }
+    merged = _merge_llm_result(baseline, {"macro_bias": "BULLISH", "confidence": 0.58, "reasoning": "PPI前で抑制"})
+    assert merged["confidence"] == 0.58
+    assert merged["_meta"]["confidence_source"] == "llm_downshift"
+    merged = _merge_llm_result(baseline, {"macro_bias": "BULLISH", "confidence": 0.40, "reasoning": "x"})
+    assert merged["confidence"] == 0.539
+    merged = _merge_llm_result(baseline, {"macro_bias": "BULLISH", "confidence": 0.90, "reasoning": "x"})
+    assert merged["confidence"] == 0.689 and merged["_meta"]["confidence_source"] == "rule_based"
+    merged = _merge_llm_result(baseline, {"macro_bias": "BEARISH", "confidence": 0.40, "reasoning": "x"})
+    assert merged["confidence"] == 0.689 and merged["_meta"]["confidence_source"] == "rule_based"
+    merged = _merge_llm_result(baseline, {"macro_bias": "BULLISH", "confidence": "n/a", "reasoning": "x"})
+    assert merged["confidence"] == 0.689 and merged["_meta"]["llm_confidence"] is None

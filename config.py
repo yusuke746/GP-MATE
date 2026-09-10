@@ -376,3 +376,31 @@ DXY_SYMBOL_CANDIDATES: Final[tuple[str, ...]] = tuple(
 # Hours of economic releases (back) and scheduled events (ahead) handed to the analysts.
 RELEASES_LOOKBACK_HOURS: Final[int] = _get_env_int("RELEASES_LOOKBACK_HOURS", 48)
 EVENTS_LOOKAHEAD_HOURS: Final[int] = _get_env_int("EVENTS_LOOKAHEAD_HOURS", 24)
+
+# --------------------------------------------------------------------------- #
+# Order geometry guard
+# --------------------------------------------------------------------------- #
+# Minimum effective reward/risk (|tp-entry| / |sl-entry|) after the final SL
+# and TP are fixed. When the AI's structural SL is rejected (too tight) and
+# falls back to ATR x 1.5 while its resistance-anchored TP stays, the trade
+# the system would send is not the one the AI reasoned about; below this
+# ratio the order is skipped and logged instead of silently re-shaped.
+MIN_RISK_REWARD_RATIO: Final[float] = _get_env_float("MIN_RISK_REWARD_RATIO", 1.5)
+
+# --------------------------------------------------------------------------- #
+# Macro analyst confidence merge
+# --------------------------------------------------------------------------- #
+# The LLM may only LOWER the rule-based macro confidence (never raise it), and
+# by at most this much, so its narrative and the number handed downstream
+# (debate gate, trader) cannot disagree by more than one notch.
+MACRO_LLM_CONF_MAX_DOWNSHIFT: Final[float] = _get_env_float("MACRO_LLM_CONF_MAX_DOWNSHIFT", 0.15)
+
+# --------------------------------------------------------------------------- #
+# Pending-order placement window
+# --------------------------------------------------------------------------- #
+# NY time (HH:MM) from which judgments no longer place pending orders. A
+# pending placed late in the session can fill in the afternoon and then be
+# carried to the next morning's judgment without any LLM re-evaluation.
+PENDING_ORDER_LAST_PLACEMENT_NY: Final[tuple[int, int]] = _parse_hhmm(
+    _get_env_str("PENDING_ORDER_LAST_PLACEMENT_NY", "11:00"), (11, 0)
+)

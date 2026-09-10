@@ -386,3 +386,46 @@ def test_pending_order_sl_direction_check() -> None:
     )
     # Inverted SL is dropped (order kept, ATR fallback applies downstream).
     assert inverted["pending_orders"][0]["sl"] is None
+
+
+def test_trader_payload_excludes_debater_self_confidence() -> None:
+    import json
+
+    fake_client = Mock()
+    fake_client.call_function.return_value = _fake_result({"action": "HOLD", "confidence": 0.5, "reasoning": "x"})
+    debate_report = {
+        "bull_confidence": 0.81,
+        "bear_confidence": 0.76,
+        "prev_bull_confidence": 0.77,
+        "bull_confidence_history": [0.5, 0.77, 0.81],
+        "bear_confidence_history": [0.5, 0.71, 0.76],
+        "bull_arguments": ["momentum"],
+        "judge_summary": {
+            "agreements": ["ドル安"],
+            "conflicts": ["エントリー方向"],
+            "confidence_shift": {"bull": [0.5, 0.77, 0.81], "bear": [0.5, 0.71, 0.76]},
+            "stronger_side": "bear",
+        },
+        "_meta": {"ok": True, "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
+    }
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        decide_trade(
+            technical_report={"signal": "BUY"},
+            sentiment_report={"score": 0.1},
+            debate_report=debate_report,
+            confidence_threshold=0.1,
+        )
+
+    sent = json.loads(fake_client.call_function.call_args.kwargs["user_prompt"])
+    debate = sent["debate"]
+    for key in ("bull_confidence", "bear_confidence", "prev_bull_confidence", "bull_confidence_history", "bear_confidence_history"):
+        assert key not in debate
+    assert "confidence_shift" not in debate["judge_summary"]
+    assert "confidence_shift" not in sent["judge_summary"]
+    assert sent["judge_summary"]["stronger_side"] == "bear"
+    assert sent["judge_summary"]["agreements"] == ["ドル安"]
+    assert sent["judge_summary"]["conflicts"] == ["エントリー方向"]
+    assert debate["bull_arguments"] == ["momentum"]
+    # The caller's report object is untouched (the log still records the shift).
+    assert "confidence_shift" in debate_report["judge_summary"]
+    assert debate_report["bull_confidence"] == 0.81

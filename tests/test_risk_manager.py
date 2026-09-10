@@ -168,10 +168,10 @@ def test_build_risk_plan_buy_uses_suggested_when_inside_2r() -> None:
         entry_price=2300.0,
         atr=10.0,
         balance_jpy=500_000,
-        suggested_tp=2320.0,
+        suggested_tp=2325.0,  # RR 25/15 = 1.67 (>= MIN_RISK_REWARD_RATIO 1.5), inside 2R
     )
     assert plan["ok"]
-    assert float(plan["tp"]) == 2320.0
+    assert float(plan["tp"]) == 2325.0
     assert plan["tp_source"] == "suggested"
 
 
@@ -195,10 +195,10 @@ def test_build_risk_plan_sell_uses_suggested_when_inside_2r() -> None:
         entry_price=2300.0,
         atr=10.0,
         balance_jpy=500_000,
-        suggested_tp=2280.0,
+        suggested_tp=2275.0,  # RR 1.67, inside 2R
     )
     assert plan["ok"]
-    assert float(plan["tp"]) == 2280.0
+    assert float(plan["tp"]) == 2275.0
     assert plan["tp_source"] == "suggested"
 
 
@@ -267,7 +267,7 @@ def test_build_risk_plan_sl_is_unchanged_with_suggested_tp() -> None:
         entry_price=2300.0,
         atr=10.0,
         balance_jpy=500_000,
-        suggested_tp=2320.0,
+        suggested_tp=2325.0,  # RR 1.67, above the MIN_RISK_REWARD_RATIO floor
     )
     assert baseline["ok"] and adjusted["ok"]
     assert float(baseline["sl"]) == float(adjusted["sl"])
@@ -330,3 +330,63 @@ def test_build_risk_plan_structural_sl_resizes_lot() -> None:
     )
     assert narrow["sl_source"] == "suggested" and wide["sl_source"] == "suggested"
     assert float(wide["lot"]) < float(narrow["lot"])
+
+
+# --------------------------------------------------------------------------- #
+# Effective RR guard (2026-09-09 BUY_LIMIT case: structural SL floored to
+# ATR x 1.5 while the resistance-anchored suggested_tp stayed -> RR ~1.07)
+# --------------------------------------------------------------------------- #
+CASE_ENTRY, CASE_ATR, CASE_SL, CASE_TP = 4414.08, 17.3, 4405.32, 4442.0
+
+
+def test_build_risk_plan_skips_low_rr_and_leaves_tp_untouched() -> None:
+    plan = build_risk_plan(
+        action="BUY", entry_price=CASE_ENTRY, atr=CASE_ATR, balance_jpy=1_000_000,
+        suggested_sl=CASE_SL, suggested_tp=CASE_TP, min_rr=1.5,
+    )
+    assert plan["ok"] is False
+    assert plan["reason"] == "low_rr"
+    assert plan["lot"] == 0.0
+    # SL floored to ATR x 1.5 (buffered structural distance 10.76 < 1.0 ATR).
+    assert plan["sl_source"] == "fallback_atr"
+    assert plan["sl"] == pytest.approx(CASE_ENTRY - CASE_ATR * 1.5, abs=1e-4)
+    # TP is the AI's resistance-anchored level, not moved to 2R.
+    assert plan["tp"] == CASE_TP
+    assert plan["tp_source"] == "suggested"
+    assert plan["effective_rr"] == pytest.approx(1.076, abs=0.001)
+
+
+def test_build_risk_plan_same_case_passes_with_min_rr_one() -> None:
+    plan = build_risk_plan(
+        action="BUY", entry_price=CASE_ENTRY, atr=CASE_ATR, balance_jpy=1_000_000,
+        suggested_sl=CASE_SL, suggested_tp=CASE_TP, min_rr=1.0,
+    )
+    assert plan["ok"] is True
+    assert plan["action"] == "BUY"
+    assert plan["tp"] == CASE_TP
+    assert plan["effective_rr"] == pytest.approx(1.076, abs=0.001)
+    assert plan["lot"] > 0
+
+
+def test_build_risk_plan_keeps_valid_structural_sl_and_tp_above_min_rr() -> None:
+    # SL level 4446 -> stop 4444 (distance 21, inside [15, 22.5]);
+    # TP 4500 (distance 35 < 2R box 45) -> RR 1.67 >= 1.5: both adopted as-is.
+    plan = build_risk_plan(
+        action="BUY", entry_price=4465.0, atr=15.0, balance_jpy=1_000_000,
+        suggested_sl=4446.0, suggested_tp=4500.0, min_rr=1.5,
+    )
+    assert plan["ok"] is True
+    assert plan["sl"] == 4444.0 and plan["sl_source"] == "suggested"
+    assert plan["tp"] == 4500.0 and plan["tp_source"] == "suggested"
+    assert plan["effective_rr"] == pytest.approx(35 / 21, abs=1e-3)
+
+
+def test_build_risk_plan_null_suggested_tp_keeps_2r_fallback() -> None:
+    plan = build_risk_plan(
+        action="SELL", entry_price=CASE_ENTRY, atr=CASE_ATR, balance_jpy=1_000_000,
+        suggested_sl=None, suggested_tp=None, min_rr=1.5,
+    )
+    assert plan["ok"] is True
+    assert plan["tp_source"] == "fallback_2r"
+    assert plan["sl_source"] == "fallback_atr"
+    assert plan["effective_rr"] == pytest.approx(2.0, abs=1e-6)

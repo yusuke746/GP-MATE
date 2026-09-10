@@ -6,6 +6,7 @@ from typing import Any, Final, Literal, TypedDict
 
 from agents.base import analysis_model, get_default_client
 from agents.data.fred_client import MacroData
+from config import MACRO_LLM_CONF_MAX_DOWNSHIFT
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +37,8 @@ SYSTEM_PROMPT = (
     "現在のレジーム(例: 弱いデータで利下げ期待が高まり金が買われる)に照らして解釈してください。"
     "upcoming_eventsは今後24時間の予定で、直前なら方向感を強く出さない理由になります。"
     "絶対に例外を投げず、安全側の判断を優先してください。"
+    "confidenceはルールベースの暫定値を上限とし、下げる理由(直近指標サプライズ、イベント直前、"
+    "時間軸の逆行など)がある場合のみ低い値を返すこと。上げる理由はreasoningに書くだけでよい。"
 )
 
 FALLBACK_REASONING = "FREDまたはLLMの利用に失敗したため、安全側で中立判定。"
@@ -298,13 +301,47 @@ def _merge_llm_result(
     key_drivers_raw = llm_payload.get("key_drivers", baseline["key_drivers"])
     key_drivers = [str(item) for item in key_drivers_raw] if isinstance(key_drivers_raw, list) else baseline["key_drivers"]
 
+    # Confidence: the LLM may only pull the rule-based value DOWN (by at most
+    # MACRO_LLM_CONF_MAX_DOWNSHIFT) and only when its bias agrees with the
+    # rule-based one. Upward revisions are ignored. This keeps the number the
+    # debate gate / trader see consistent with the narrative they also see.
+    llm_confidence = _parse_confidence(llm_payload.get("confidence"))
+    baseline_confidence = float(baseline["confidence"])
+    confidence = baseline_confidence
+    confidence_source = "rule_based"
+    if llm_confidence is not None and llm_bias == baseline["macro_bias"] and llm_confidence < baseline_confidence:
+        confidence = max(baseline_confidence - MACRO_LLM_CONF_MAX_DOWNSHIFT, llm_confidence)
+        confidence_source = "llm_downshift"
+        LOGGER.info(
+            "macro_analyst: LLM confidence %.3f below rule-based %.3f; using %.3f",
+            llm_confidence,
+            baseline_confidence,
+            confidence,
+        )
+
+    meta = dict(baseline["_meta"])
+    meta["llm_confidence"] = llm_confidence
+    meta["confidence_source"] = confidence_source
     return {
         "macro_bias": baseline["macro_bias"],
-        "confidence": baseline["confidence"],
+        "confidence": _clamp_confidence(round(confidence, 4)),
         "key_drivers": key_drivers,
         "reasoning": reasoning or baseline["reasoning"],
-        "_meta": baseline["_meta"],
+        "_meta": meta,  # type: ignore[typeddict-item]
     }
+
+
+def _parse_confidence(value: Any) -> float | None:
+    """LLM confidence as float in [0, 1]; None when missing or malformed."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed < 0.0 or parsed > 1.0:
+        return None
+    return parsed
 
 
 def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
@@ -371,6 +408,7 @@ def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
 
     payload = dict(result.payload)
     merged = _merge_llm_result(baseline, payload)
+    merge_meta = merged.get("_meta", {})
     merged["_meta"] = {
         "ok": True,
         "model": result.model,
@@ -380,8 +418,11 @@ def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
             "total_tokens": result.usage.total_tokens,
         },
         "error": "",
-    }
+        "llm_confidence": merge_meta.get("llm_confidence"),
+        "confidence_source": merge_meta.get("confidence_source", "rule_based"),
+    }  # type: ignore[typeddict-item]
     merged["macro_bias"] = baseline_bias
-    merged["confidence"] = baseline_confidence
+    # merged["confidence"] already carries the rule-based value or the
+    # bounded LLM downshift decided in _merge_llm_result.
     merged["key_drivers"] = key_drivers
     return merged

@@ -54,6 +54,10 @@ SYSTEM_PROMPT = (
     "伸び切り警戒中の順方向エントリーは、ブレイク追随ではなく押し目/戻りのLIMIT型を優先すること。"
     "pending_ordersのtpは任意で、設定時は2R上限が適用される。"
     "予約に値する明確な条件がなければpending_ordersは空配列にすること。"
+    "システム側の構造SLはH1 ATR×1.0が最小距離であり、それより近い水準はATR×1.5に置き換えられる。"
+    "suggested_tpと最終SLの比がMIN_RISK_REWARD_RATIO(既定1.5)を下回る注文はシステムが発注しない。"
+    "抵抗が近く損切り幅が取れない局面では、TPを遠ざけるのではなく、"
+    "より有利な価格の押し目/戻りをpending_ordersに置くか、pending_ordersを空にすること。"
 )
 
 PENDING_ORDER_TYPES = ("BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT")
@@ -217,6 +221,28 @@ def _validate_pending_orders(
     return valid
 
 
+# Self-reported bull/bear confidence rises monotonically on BOTH sides during
+# a debate (e.g. bull 0.5->0.77->0.81, bear 0.5->0.71->0.76), so it carries no
+# directional information and can even contradict the judge's stronger_side.
+# It stays in the debate report / trade log but is not shown to the trader.
+DEBATER_CONFIDENCE_KEYS = frozenset(
+    {"confidence_shift", "bull_confidence", "bear_confidence", "prev_bull_confidence", "prev_bear_confidence"}
+)
+
+
+def _strip_debater_confidence(payload: Any) -> Any:
+    """Deep-copy ``payload`` without debater self-confidence fields."""
+    if isinstance(payload, dict):
+        return {
+            key: _strip_debater_confidence(value)
+            for key, value in payload.items()
+            if key not in DEBATER_CONFIDENCE_KEYS and not str(key).endswith("_confidence_history")
+        }
+    if isinstance(payload, list):
+        return [_strip_debater_confidence(item) for item in payload]
+    return payload
+
+
 def decide_trade(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
@@ -233,15 +259,14 @@ def decide_trade(
         judge_summary = {
             "agreements": [],
             "conflicts": [str(raw_judge_summary)] if raw_judge_summary else [],
-            "confidence_shift": {"bull": [], "bear": []},
             "stronger_side": "neutral",
         }
     user_payload = {
         "technical": technical_report,
         "sentiment": sentiment_report,
         "macro": macro_report or {},
-        "debate": debate_report,
-        "judge_summary": judge_summary,
+        "debate": _strip_debater_confidence(debate_report),
+        "judge_summary": _strip_debater_confidence(judge_summary),
         "recent_context": recent_context or {"decisions": [], "recent_closed": []},
         # The confidence threshold is intentionally NOT exposed to the model:
         # it is enforced in code below, and telling the model the cutoff lets
