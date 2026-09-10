@@ -38,6 +38,7 @@ from config import (
     MAX_POSITIONS,
     MONDAY_OPEN_NY,
     NEWS_FILTER_MINUTES,
+    PENDING_ORDER_LAST_PLACEMENT_NY,
     NY_RUN_TIMES,
     SPREAD_SAMPLE_INTERVAL,
     SPREAD_SAMPLES,
@@ -1021,6 +1022,18 @@ PENDING_MIN_DISTANCE_ATR = 0.1
 PENDING_MAX_DISTANCE_ATR = 3.0
 
 
+def _is_past_pending_placement_cutoff(reference: datetime | None = None) -> bool:
+    """True from PENDING_ORDER_LAST_PLACEMENT_NY (NY time) onwards.
+
+    Pending orders placed after this time can fill late in the session and
+    then be held overnight until the next judgment with no re-evaluation, so
+    late judgments keep their plan in the log but do not send it to the broker.
+    """
+    now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    cutoff_hour, cutoff_minute = PENDING_ORDER_LAST_PLACEMENT_NY
+    return (now_market.hour, now_market.minute) >= (cutoff_hour, cutoff_minute)
+
+
 def _risk_plan_log_fields(risk_plan: dict[str, Any]) -> dict[str, Any]:
     """sl_source / tp_source / effective_rr for the trade log ('' when absent)."""
     rr = risk_plan.get("effective_rr", "")
@@ -1055,6 +1068,13 @@ def _handle_pending_orders(
     the HOLD row (keeps the CSV in decision order).
     """
     try:
+        if _is_past_pending_placement_cutoff():
+            LOGGER.info(
+                "Pending order skipped: judgment is at/after the placement cutoff %02d:%02d NY",
+                *PENDING_ORDER_LAST_PLACEMENT_NY,
+            )
+            return {"status": "skipped_late_placement", "log_row": None}
+
         gate = check_filters(
             confidence=1.0,
             spread=spread,

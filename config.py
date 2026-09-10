@@ -394,3 +394,13 @@ MIN_RISK_REWARD_RATIO: Final[float] = _get_env_float("MIN_RISK_REWARD_RATIO", 1.
 # by at most this much, so its narrative and the number handed downstream
 # (debate gate, trader) cannot disagree by more than one notch.
 MACRO_LLM_CONF_MAX_DOWNSHIFT: Final[float] = _get_env_float("MACRO_LLM_CONF_MAX_DOWNSHIFT", 0.15)
+
+# --------------------------------------------------------------------------- #
+# Pending-order placement window
+# --------------------------------------------------------------------------- #
+# NY time (HH:MM) from which judgments no longer place pending orders. A
+# pending placed late in the session can fill in the afternoon and then be
+# carried to the next morning's judgment without any LLM re-evaluation.
+PENDING_ORDER_LAST_PLACEMENT_NY: Final[tuple[int, int]] = _parse_hhmm(
+    _get_env_str("PENDING_ORDER_LAST_PLACEMENT_NY", "11:00"), (11, 0)
+)

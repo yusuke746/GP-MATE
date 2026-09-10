@@ -140,6 +140,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(main, "calc_today_risk_stats", lambda: (0, 0.0))
     monkeypatch.setattr(main, "is_high_impact_soon", lambda minutes: False)
     monkeypatch.setattr(main, "get_positions", lambda symbol: [])
+    monkeypatch.setattr(main, "_is_past_pending_placement_cutoff", lambda reference=None: False)
 
     # Default: skip the debate so tests never reach the real LangGraph/LLM path.
     # Individual tests override these when they exercise debate behavior.
@@ -914,6 +915,8 @@ def _pending_common(monkeypatch, tmp_path: Path) -> tuple[Path, list[dict[str, A
     monkeypatch.setattr(main, "LOG_DIR", tmp_path)
     monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
     monkeypatch.setattr(main, "get_usd_jpy_rate", lambda: 150.0)
+    # Judgment-time gate is exercised in its own tests; default to "in window".
+    monkeypatch.setattr(main, "_is_past_pending_placement_cutoff", lambda reference=None: False)
 
     placed: list[dict[str, Any]] = []
 
@@ -1227,3 +1230,88 @@ def test_run_once_market_order_skipped_on_low_rr_is_logged(tmp_path: Path, monke
     assert rows[0]["tp_source"] == "suggested"
     assert rows[0]["effective_rr"] == "1.076"
     assert rows[0]["order_success"] == "False"
+
+
+_ORIGINAL_PLACEMENT_CUTOFF = main._is_past_pending_placement_cutoff
+
+
+def test_is_past_pending_placement_cutoff_default_11_00_ny() -> None:
+    assert not main._is_past_pending_placement_cutoff(reference=datetime(2026, 9, 9, 10, 30, tzinfo=main.MARKET_TZ))
+    assert not main._is_past_pending_placement_cutoff(reference=datetime(2026, 9, 9, 10, 59, tzinfo=main.MARKET_TZ))
+    assert main._is_past_pending_placement_cutoff(reference=datetime(2026, 9, 9, 11, 0, tzinfo=main.MARKET_TZ))
+    assert main._is_past_pending_placement_cutoff(reference=datetime(2026, 9, 9, 15, 30, tzinfo=main.MARKET_TZ))
+    # Same instant expressed in UTC (15:30 NY EDT = 19:30 UTC) is converted first.
+    from datetime import timezone as _tz
+
+    assert main._is_past_pending_placement_cutoff(reference=datetime(2026, 9, 9, 19, 30, tzinfo=_tz.utc))
+
+
+def _hold_with_pending_plan(monkeypatch: pytest.MonkeyPatch, placed: list[dict[str, Any]]) -> None:
+    monkeypatch.setattr(
+        main,
+        "build_risk_plan",
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+            "ok": action in {"BUY", "SELL"},
+            "action": action if action in {"BUY", "SELL"} else "HOLD",
+            "lot": 0.01,
+            "sl": entry_price - 3.0,
+            "sl_source": "fallback_atr",
+            "tp": entry_price + 6.0,
+            "tp_source": "fallback_2r",
+            "effective_rr": 2.0,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "place_pending_order",
+        lambda **kwargs: placed.append(kwargs) or {"success": True, "retcode": 0, "order": 889},
+    )
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+            "action": "HOLD",
+            "confidence": 0.7,
+            "reasoning": "押し目待ち",
+            "risk_level": "MID",
+            "directional_bias": "BULLISH",
+            "bias_strength": 0.7,
+            "pending_orders": [{"type": "BUY_LIMIT", "price": 98.0, "tp": None, "basis": "サポート"}],
+            "_meta": {"model": "t", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+
+
+def test_run_once_places_pending_at_10_30_ny(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    placed: list[dict[str, Any]] = []
+    _hold_with_pending_plan(monkeypatch, placed)
+    judgment = datetime(2026, 9, 9, 10, 30, tzinfo=main.MARKET_TZ)
+    monkeypatch.setattr(main, "_is_past_pending_placement_cutoff", lambda reference=None: _ORIGINAL_PLACEMENT_CUTOFF(judgment))
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert result["pending_status"] == "placed"
+    assert len(placed) == 1
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert [row["action"] for row in rows] == ["HOLD", "BUY_LIMIT"]
+
+
+def test_run_once_skips_pending_at_15_30_ny(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    placed: list[dict[str, Any]] = []
+    _hold_with_pending_plan(monkeypatch, placed)
+    judgment = datetime(2026, 9, 9, 15, 30, tzinfo=main.MARKET_TZ)
+    monkeypatch.setattr(main, "_is_past_pending_placement_cutoff", lambda reference=None: _ORIGINAL_PLACEMENT_CUTOFF(judgment))
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert result["pending_status"] == "skipped_late_placement"
+    assert placed == []
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert [row["action"] for row in rows] == ["HOLD"]
+    assert rows[0]["pending_status"] == "skipped_late_placement"
+    # The trader's plan itself is untouched in the log.
+    assert rows[0]["directional_bias"] == "BULLISH"
