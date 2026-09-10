@@ -386,3 +386,11 @@ EVENTS_LOOKAHEAD_HOURS: Final[int] = _get_env_int("EVENTS_LOOKAHEAD_HOURS", 24)
 # the system would send is not the one the AI reasoned about; below this
 # ratio the order is skipped and logged instead of silently re-shaped.
 MIN_RISK_REWARD_RATIO: Final[float] = _get_env_float("MIN_RISK_REWARD_RATIO", 1.5)
+
+# --------------------------------------------------------------------------- #
+# Macro analyst confidence merge
+# --------------------------------------------------------------------------- #
+# The LLM may only LOWER the rule-based macro confidence (never raise it), and
+# by at most this much, so its narrative and the number handed downstream
+# (debate gate, trader) cannot disagree by more than one notch.
+MACRO_LLM_CONF_MAX_DOWNSHIFT: Final[float] = _get_env_float("MACRO_LLM_CONF_MAX_DOWNSHIFT", 0.15)
