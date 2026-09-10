@@ -54,6 +54,10 @@ SYSTEM_PROMPT = (
     "伸び切り警戒中の順方向エントリーは、ブレイク追随ではなく押し目/戻りのLIMIT型を優先すること。"
     "pending_ordersのtpは任意で、設定時は2R上限が適用される。"
     "予約に値する明確な条件がなければpending_ordersは空配列にすること。"
+    "システム側の構造SLはH1 ATR×1.0が最小距離であり、それより近い水準はATR×1.5に置き換えられる。"
+    "suggested_tpと最終SLの比がMIN_RISK_REWARD_RATIO(既定1.5)を下回る注文はシステムが発注しない。"
+    "抵抗が近く損切り幅が取れない局面では、TPを遠ざけるのではなく、"
+    "より有利な価格の押し目/戻りをpending_ordersに置くか、pending_ordersを空にすること。"
 )
 
 PENDING_ORDER_TYPES = ("BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT")

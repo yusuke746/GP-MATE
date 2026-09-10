@@ -163,6 +163,9 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "mae_usd",
     "pending_status",
     "news_feeds_live",
+    "sl_source",
+    "tp_source",
+    "effective_rr",
 )
 
 
@@ -1018,6 +1021,16 @@ PENDING_MIN_DISTANCE_ATR = 0.1
 PENDING_MAX_DISTANCE_ATR = 3.0
 
 
+def _risk_plan_log_fields(risk_plan: dict[str, Any]) -> dict[str, Any]:
+    """sl_source / tp_source / effective_rr for the trade log ('' when absent)."""
+    rr = risk_plan.get("effective_rr", "")
+    return {
+        "sl_source": str(risk_plan.get("sl_source", "") or ""),
+        "tp_source": str(risk_plan.get("tp_source", "") or ""),
+        "effective_rr": rr if rr not in (None, "") else "",
+    }
+
+
 def _handle_pending_orders(
     pendings: list[dict[str, Any]],
     current_price: float,
@@ -1094,9 +1107,12 @@ def _handle_pending_orders(
             suggested_sl=pending.get("sl"),
             jpy_usd_rate=jpy_usd_rate,
         )
+        plan_fields = _risk_plan_log_fields(risk_plan)
         if not bool(risk_plan.get("ok")):
-            LOGGER.info("Pending order skipped: risk plan failed (%s)", risk_plan.get("reason"))
-            return {"status": f"skipped_risk_plan:{risk_plan.get('reason', '')}", "log_row": None}
+            reason = str(risk_plan.get("reason", "") or "")
+            LOGGER.info("Pending order skipped: risk plan failed (%s)", reason)
+            status = "skipped_low_rr" if reason == "low_rr" else f"skipped_risk_plan:{reason}"
+            return {"status": status, "log_row": None, "fields": plan_fields}
 
         order_result = place_pending_order(
             symbol=SYMBOL,
@@ -1128,6 +1144,7 @@ def _handle_pending_orders(
             "order_success": placed,
             "retcode": order_result.get("retcode", ""),
             "error": str(order_result.get("reason", "")),
+            **plan_fields,
         }
         if placed:
             LOGGER.info(
@@ -1138,7 +1155,7 @@ def _handle_pending_orders(
                 float(risk_plan["sl"]),
                 float(risk_plan["tp"]),
             )
-        return {"status": "placed" if placed else "order_failed", "log_row": log_row}
+        return {"status": "placed" if placed else "order_failed", "log_row": log_row, "fields": plan_fields}
     except Exception as exc:
         LOGGER.warning("_handle_pending_orders failed safely: %s", exc)
         return {"status": f"error:{exc}", "log_row": None}
@@ -1586,6 +1603,19 @@ def run_once(
         }
 
         final_action = str(risk_plan.get("action", "HOLD"))
+        market_filter_ok = bool(filter_result.ok)
+        market_filter_reason = str(filter_result.reason)
+        if action in {"BUY", "SELL"} and market_filter_ok and str(risk_plan.get("reason", "")) == "low_rr":
+            # The AI's SL was floored to ATR x 1.5 while its TP stayed; the
+            # resulting geometry is not the trade it reasoned about.
+            market_filter_ok = False
+            market_filter_reason = "skipped_low_rr"
+            LOGGER.info(
+                "Market order skipped: effective RR %.2f below minimum (sl_source=%s tp_source=%s)",
+                float(risk_plan.get("effective_rr", 0.0) or 0.0),
+                risk_plan.get("sl_source", ""),
+                risk_plan.get("tp_source", ""),
+            )
         if filter_result.ok and bool(risk_plan.get("ok")) and final_action in {"BUY", "SELL"}:
             order_result = send_order(
                 symbol=SYMBOL,
@@ -1614,11 +1644,12 @@ def run_once(
             "confidence": float(trader_report.get("confidence", 0.0) or 0.0),
             "reasoning": str(trader_report.get("reasoning", "")),
             "risk_level": str(trader_report.get("risk_level", "MID")),
-            "allowed": bool(filter_result.ok),
-            "filter_reason": filter_result.reason,
+            "allowed": market_filter_ok,
+            "filter_reason": market_filter_reason,
             "lot": float(risk_plan.get("lot", 0.0) or 0.0),
             "sl": float(risk_plan.get("sl", 0.0) or 0.0),
             "tp": float(risk_plan.get("tp", 0.0) or 0.0),
+            **_risk_plan_log_fields(risk_plan),
             "order_success": bool(order_result.get("success", False)),
             "retcode": order_result.get("retcode", ""),
             "prompt_tokens": usage["prompt_tokens"],
@@ -1653,6 +1684,9 @@ def run_once(
             else:
                 pending_outcome = {"status": "none_proposed", "log_row": None}
         result["pending_status"] = str(pending_outcome.get("status", "") or "")
+        pending_fields = pending_outcome.get("fields")
+        if isinstance(pending_fields, dict):
+            result.update(pending_fields)
         _append_trade_log(result)
         pending_row = pending_outcome.get("log_row")
         if isinstance(pending_row, dict):

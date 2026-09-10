@@ -8,6 +8,7 @@ from config import (
     CONSECUTIVE_LOSS_LIMIT,
     JPY_USD_RATE_FALLBACK,
     MAX_DAILY_LOSS_PCT,
+    MIN_RISK_REWARD_RATIO,
     RISK_PERCENT,
     RISK_REWARD_RATIO,
     SL_STRUCTURE_BUFFER_USD,
@@ -190,10 +191,16 @@ def build_risk_plan(
     atr_mult: float = ATR_MULTIPLIER_SL,
     rr: float = RISK_REWARD_RATIO,
     jpy_usd_rate: float | None = None,
+    min_rr: float = MIN_RISK_REWARD_RATIO,
 ) -> dict[str, float | str | bool]:
     """Build lot/SL/TP plan with safe fallback for invalid cases.
 
     This function never raises and is suitable for production call paths.
+
+    After SL and TP are final, the effective reward/risk is checked against
+    ``min_rr``. A plan below it returns ``ok: False, reason: "low_rr"`` with
+    the SL/TP left exactly as computed (never re-shaped) so the caller can
+    log the geometry the AI actually proposed.
     """
     normalized_action = action.upper().strip()
     if normalized_action not in {"BUY", "SELL"}:
@@ -254,6 +261,25 @@ def build_risk_plan(
                 tp_source = "suggested" if final_tp == round(suggested_tp_value, 5) else "suggested_capped_2r"
 
         sl_distance = abs(entry_price - sl)
+        tp_distance = abs(final_tp - entry_price)
+        effective_rr = round(tp_distance / sl_distance, 4) if sl_distance > 0 else 0.0
+        if effective_rr < min_rr:
+            # The AI's TP is its reasoning; the SL was widened by the floor.
+            # Sending that combination would be a different trade from the
+            # one the AI judged, so skip and report instead of moving either.
+            return {
+                "ok": False,
+                "action": "HOLD",
+                "lot": 0.0,
+                "sl": sl,
+                "sl_source": sl_source,
+                "tp": final_tp,
+                "tp_2r": tp_2r,
+                "tp_source": tp_source,
+                "effective_rr": effective_rr,
+                "reason": "low_rr",
+            }
+
         effective_rate = jpy_usd_rate if jpy_usd_rate is not None and jpy_usd_rate > 0 else JPY_USD_RATE_FALLBACK
         lot = calc_lot(
             balance_jpy=balance_jpy,
@@ -283,6 +309,7 @@ def build_risk_plan(
             "tp": final_tp,
             "tp_2r": tp_2r,
             "tp_source": tp_source,
+            "effective_rr": effective_rr,
             "reason": "OK",
         }
     except Exception as exc:

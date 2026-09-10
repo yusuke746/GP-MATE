@@ -1154,3 +1154,76 @@ def test_pop_excursion_removes_record(tmp_path: Path, monkeypatch) -> None:
     assert record is not None
     assert main._load_excursions() == {}
     assert main._pop_excursion("777") is None
+
+
+def test_handle_pending_orders_skips_low_rr_and_reports_geometry(tmp_path: Path, monkeypatch) -> None:
+    # 2026-09-09 case: BUY_LIMIT 4414.08, structural SL 4405.32 (buffered 4403.32,
+    # 10.76 < 1.0 ATR) floors to ATR x 1.5 while suggested_tp 4442 stays -> RR 1.08.
+    _, placed = _pending_common(monkeypatch, tmp_path)
+
+    outcome = main._handle_pending_orders(
+        pendings=[{"type": "BUY_LIMIT", "price": 4414.08, "tp": 4442.0, "sl": 4405.32, "basis": "H4サポート押し目"}],
+        current_price=4425.0,
+        atr=17.3,
+        spread=10.0,
+        baseline_spread=10.0,
+        consecutive_losses=0,
+        daily_loss_pct=0.0,
+        balance=1_000_000.0,
+        trader_confidence=0.8,
+        now_iso="2026-09-09T14:30:00+00:00",
+    )
+
+    assert placed == []
+    assert outcome["status"] == "skipped_low_rr"
+    assert outcome["log_row"] is None
+    assert outcome["fields"]["sl_source"] == "fallback_atr"
+    assert outcome["fields"]["tp_source"] == "suggested"
+    assert abs(float(outcome["fields"]["effective_rr"]) - 1.076) < 0.001
+
+
+def test_run_once_market_order_skipped_on_low_rr_is_logged(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(main, "send_order", lambda **kwargs: sent.append(kwargs) or {"success": True, "retcode": 0})
+    monkeypatch.setattr(
+        main,
+        "build_risk_plan",
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+            "ok": False,
+            "action": "HOLD",
+            "lot": 0.0,
+            "sl": entry_price - 25.95,
+            "sl_source": "fallback_atr",
+            "tp": entry_price + 27.92,
+            "tp_source": "suggested",
+            "effective_rr": 1.076,
+            "reason": "low_rr",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+            "action": "BUY",
+            "confidence": 0.8,
+            "reasoning": "押し目買い",
+            "risk_level": "MID",
+            "suggested_tp": 127.92,
+            "suggested_sl": 91.32,
+            "_meta": {"model": "t", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert sent == []
+    assert result["action"] == "HOLD"
+    assert result["allowed"] is False
+    assert result["filter_reason"] == "skipped_low_rr"
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert rows[0]["filter_reason"] == "skipped_low_rr"
+    assert rows[0]["sl_source"] == "fallback_atr"
+    assert rows[0]["tp_source"] == "suggested"
+    assert rows[0]["effective_rr"] == "1.076"
+    assert rows[0]["order_success"] == "False"

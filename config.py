@@ -376,3 +376,13 @@ DXY_SYMBOL_CANDIDATES: Final[tuple[str, ...]] = tuple(
 # Hours of economic releases (back) and scheduled events (ahead) handed to the analysts.
 RELEASES_LOOKBACK_HOURS: Final[int] = _get_env_int("RELEASES_LOOKBACK_HOURS", 48)
 EVENTS_LOOKAHEAD_HOURS: Final[int] = _get_env_int("EVENTS_LOOKAHEAD_HOURS", 24)
+
+# --------------------------------------------------------------------------- #
+# Order geometry guard
+# --------------------------------------------------------------------------- #
+# Minimum effective reward/risk (|tp-entry| / |sl-entry|) after the final SL
+# and TP are fixed. When the AI's structural SL is rejected (too tight) and
+# falls back to ATR x 1.5 while its resistance-anchored TP stays, the trade
+# the system would send is not the one the AI reasoned about; below this
+# ratio the order is skipped and logged instead of silently re-shaped.
+MIN_RISK_REWARD_RATIO: Final[float] = _get_env_float("MIN_RISK_REWARD_RATIO", 1.5)
