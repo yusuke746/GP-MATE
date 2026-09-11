@@ -404,3 +404,41 @@ MACRO_LLM_CONF_MAX_DOWNSHIFT: Final[float] = _get_env_float("MACRO_LLM_CONF_MAX_
 PENDING_ORDER_LAST_PLACEMENT_NY: Final[tuple[int, int]] = _parse_hhmm(
     _get_env_str("PENDING_ORDER_LAST_PLACEMENT_NY", "11:00"), (11, 0)
 )
+
+# --------------------------------------------------------------------------- #
+# Forecast-only logger (no trading; see scripts/run_forecast_logger.py)
+# --------------------------------------------------------------------------- #
+# Triple-barrier task: from the confirmed H1 close P0 with ATR A, does price
+# touch P0 + K_UP*A or P0 - K_DOWN*A first within HORIZON bars, or neither?
+FORECAST_K_UP: Final[float] = _get_env_float("FORECAST_K_UP", 1.0)
+FORECAST_K_DOWN: Final[float] = _get_env_float("FORECAST_K_DOWN", 1.0)
+FORECAST_HORIZON_BARS: Final[int] = _get_env_int("FORECAST_HORIZON_BARS", 6)
+
+
+def _parse_int_list(value: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    items: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            number = int(part)
+        except ValueError:
+            return default
+        if number > 0:
+            items.append(number)
+    return tuple(items) if items else default
+
+
+# One forecast row is written per horizon (default: just FORECAST_HORIZON_BARS).
+FORECAST_HORIZONS: Final[tuple[int, ...]] = _parse_int_list(
+    _get_env_str("FORECAST_HORIZONS", ""), (FORECAST_HORIZON_BARS,)
+)
+# Seconds after each UTC full hour to run (lets the H1 bar settle).
+FORECAST_DELAY_SEC: Final[int] = _get_env_int("FORECAST_DELAY_SEC", 90)
+# Optional NY-time window "HH:MM-HH:MM"; empty = all 24 hours (weekends skipped).
+FORECAST_SESSION_FILTER: Final[str] = _get_env_str("FORECAST_SESSION_FILTER", "")
+FORECAST_USE_DEBATE: Final[bool] = _get_env_str("FORECAST_USE_DEBATE", "false").lower() in {"1", "true", "yes"}
+MODEL_FORECAST: Final[str] = _get_env_str("MODEL_FORECAST", MODEL_ANALYSIS)
+# >1 calls the forecaster repeatedly on identical input (agreement analysis).
+FORECAST_SAMPLES: Final[int] = max(1, _get_env_int("FORECAST_SAMPLES", 1))
