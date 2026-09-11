@@ -46,6 +46,20 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 3. Automated schedule run:
    - `python scripts/run_scheduler.py`
 
+## Forecast-only logger (research, no trading)
+
+Records the LLM's triple-barrier probabilities (`p_up` / `p_down` / `p_timeout`)
+every confirmed H1 bar, labels them later from realised bars, and scores
+calibration (Brier / log loss / reliability) against uniform, base-rate and
+momentum baselines. It never places orders and does not touch `main.py` or
+the trade log.
+
+- `python scripts/run_forecast_logger.py` — hourly scheduler (`--once` for a single cycle)
+- `python scripts/resolve_forecasts.py` — label elapsed forecasts (idempotent; the logger also does this after each cycle)
+- `python scripts/eval_forecasts.py [--csv out.csv]` — calibration report
+- Data: `logs/forecasts.jsonl` (one row per forecast) and `logs/forecast_inputs/<id>.json` (full inputs for ablations)
+- Settings: `FORECAST_*` and `MODEL_FORECAST` in `.env` (defaults: K=1.0 ATR both sides, 6 bars, 24h, no debate, 1 sample)
+
 ## Tests
 
 - Run all tests:
