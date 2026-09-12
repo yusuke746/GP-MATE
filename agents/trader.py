@@ -243,6 +243,40 @@ def _strip_debater_confidence(payload: Any) -> Any:
     return payload
 
 
+def _describe_pending_proposal(
+    raw: Any,
+    action: str,
+    directional_bias: str,
+    bias_strength: float,
+    validated: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any] | None]:
+    """Explain why a proposed pending order survived or was dropped.
+
+    Returns (status, first_proposal). ``status`` is "" when an order survived
+    validation (the placement path then reports placed/skipped_*), otherwise a
+    trade-log-ready reason so "the LLM proposed nothing" and "the LLM proposed
+    something the validator dropped" are distinguishable in the CSV.
+    """
+    items = [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    proposal: dict[str, Any] | None = None
+    if items:
+        proposal = {
+            "type": str(items[0].get("type", "") or "").upper().strip(),
+            "price": _safe_float_or_none(items[0].get("price")),
+        }
+    if validated:
+        return "", proposal
+    if action != "HOLD":
+        return "", proposal
+    if not items:
+        return "none_proposed", None
+    if directional_bias not in {"BULLISH", "BEARISH"}:
+        return "skipped_no_bias", proposal
+    if bias_strength < PENDING_MIN_BIAS_STRENGTH:
+        return f"skipped_weak_bias:{bias_strength:.2f}", proposal
+    return "skipped_invalid_proposal", proposal
+
+
 def decide_trade(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
@@ -349,12 +383,20 @@ def decide_trade(
     payload["suggested_sl"] = suggested_sl
     payload["suggested_sl_basis"] = str(payload.get("suggested_sl_basis", "") or "")
 
+    raw_pending_orders = payload.get("pending_orders")
     payload["pending_orders"] = _validate_pending_orders(
-        raw=payload.get("pending_orders"),
+        raw=raw_pending_orders,
         action=action,
         directional_bias=directional_bias,
         bias_strength=float(payload.get("bias_strength", 0.0) or 0.0),
         current_price=current_price,
+    )
+    payload["pending_validation"], payload["pending_proposal"] = _describe_pending_proposal(
+        raw=raw_pending_orders,
+        action=action,
+        directional_bias=directional_bias,
+        bias_strength=float(payload.get("bias_strength", 0.0) or 0.0),
+        validated=payload["pending_orders"],
     )
 
     payload["_meta"] = {

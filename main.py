@@ -167,6 +167,8 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "sl_source",
     "tp_source",
     "effective_rr",
+    "pending_type",
+    "pending_price",
 )
 
 
@@ -1034,6 +1036,22 @@ def _is_past_pending_placement_cutoff(reference: datetime | None = None) -> bool
     return (now_market.hour, now_market.minute) >= (cutoff_hour, cutoff_minute)
 
 
+def _pending_intent_fields(pendings: Any) -> dict[str, Any]:
+    """pending_type / pending_price of the first proposed order ('' when none).
+
+    Recorded on the HOLD row for every outcome so a skipped plan can be read
+    from the CSV alone (which order, at what price, why it was not placed)."""
+    first = pendings[0] if isinstance(pendings, list) and pendings and isinstance(pendings[0], dict) else None
+    if first is None:
+        return {"pending_type": "", "pending_price": ""}
+    price = first.get("price")
+    try:
+        price_value: Any = round(float(price), 5) if price not in (None, "") else ""
+    except (TypeError, ValueError):
+        price_value = ""
+    return {"pending_type": str(first.get("type", "") or "").upper(), "pending_price": price_value}
+
+
 def _risk_plan_log_fields(risk_plan: dict[str, Any]) -> dict[str, Any]:
     """sl_source / tp_source / effective_rr for the trade log ('' when absent)."""
     rr = risk_plan.get("effective_rr", "")
@@ -1067,13 +1085,14 @@ def _handle_pending_orders(
     CSV; ``log_row`` is the pending-order row for the caller to append after
     the HOLD row (keeps the CSV in decision order).
     """
+    intent = _pending_intent_fields(pendings)
     try:
         if _is_past_pending_placement_cutoff():
             LOGGER.info(
                 "Pending order skipped: judgment is at/after the placement cutoff %02d:%02d NY",
                 *PENDING_ORDER_LAST_PLACEMENT_NY,
             )
-            return {"status": "skipped_late_placement", "log_row": None}
+            return {"status": "skipped_late_placement", "log_row": None, "fields": intent}
 
         gate = check_filters(
             confidence=1.0,
@@ -1085,16 +1104,16 @@ def _handle_pending_orders(
         )
         if not gate.ok:
             LOGGER.info("Pending order skipped by risk filters: %s", gate.reason)
-            return {"status": f"skipped_risk_filter:{gate.reason}", "log_row": None}
+            return {"status": f"skipped_risk_filter:{gate.reason}", "log_row": None, "fields": intent}
 
         pending = pendings[0] if pendings and isinstance(pendings[0], dict) else None
         if pending is None:
-            return {"status": "skipped_invalid", "log_row": None}
+            return {"status": "skipped_invalid", "log_row": None, "fields": intent}
 
         order_type = str(pending.get("type", "") or "")
         price = float(pending.get("price", 0.0) or 0.0)
         if price <= 0 or atr <= 0 or current_price <= 0:
-            return {"status": "skipped_invalid", "log_row": None}
+            return {"status": "skipped_invalid", "log_row": None, "fields": intent}
 
         distance = abs(price - current_price)
         if not (PENDING_MIN_DISTANCE_ATR * atr <= distance <= PENDING_MAX_DISTANCE_ATR * atr):
@@ -1107,6 +1126,7 @@ def _handle_pending_orders(
             return {
                 "status": f"skipped_distance:{distance / atr:.2f}atr",
                 "log_row": None,
+                "fields": intent,
             }
 
         jpy_usd_rate = get_usd_jpy_rate()
@@ -1127,7 +1147,7 @@ def _handle_pending_orders(
             suggested_sl=pending.get("sl"),
             jpy_usd_rate=jpy_usd_rate,
         )
-        plan_fields = _risk_plan_log_fields(risk_plan)
+        plan_fields = {**intent, **_risk_plan_log_fields(risk_plan)}
         if not bool(risk_plan.get("ok")):
             reason = str(risk_plan.get("reason", "") or "")
             LOGGER.info("Pending order skipped: risk plan failed (%s)", reason)
@@ -1178,7 +1198,7 @@ def _handle_pending_orders(
         return {"status": "placed" if placed else "order_failed", "log_row": log_row, "fields": plan_fields}
     except Exception as exc:
         LOGGER.warning("_handle_pending_orders failed safely: %s", exc)
-        return {"status": f"error:{exc}", "log_row": None}
+        return {"status": f"error:{exc}", "log_row": None, "fields": intent}
 
 
 RECENT_CONTEXT_HOURS = 24
@@ -1702,7 +1722,15 @@ def run_once(
                     now_iso=now_iso,
                 )
             else:
-                pending_outcome = {"status": "none_proposed", "log_row": None}
+                # The trader explains whether nothing was proposed or the
+                # validator dropped the proposal (weak bias / wrong side).
+                validation = str(trader_report.get("pending_validation", "") or "") if isinstance(trader_report, dict) else ""
+                proposal = trader_report.get("pending_proposal") if isinstance(trader_report, dict) else None
+                pending_outcome = {
+                    "status": validation or "none_proposed",
+                    "log_row": None,
+                    "fields": _pending_intent_fields([proposal] if isinstance(proposal, dict) else []),
+                }
         result["pending_status"] = str(pending_outcome.get("status", "") or "")
         pending_fields = pending_outcome.get("fields")
         if isinstance(pending_fields, dict):
