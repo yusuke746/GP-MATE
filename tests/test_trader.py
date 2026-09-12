@@ -429,3 +429,37 @@ def test_trader_payload_excludes_debater_self_confidence() -> None:
     # The caller's report object is untouched (the log still records the shift).
     assert "confidence_shift" in debate_report["judge_summary"]
     assert debate_report["bull_confidence"] == 0.81
+
+
+def test_pending_validation_distinguishes_dropped_from_absent() -> None:
+    weak = _decide_with_payload(
+        {
+            "action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID",
+            "directional_bias": "BEARISH", "bias_strength": 0.58,
+            "pending_orders": [{"type": "SELL_STOP", "price": 4405.89, "basis": "D1サポート割れ"}],
+        }
+    )
+    assert weak["pending_orders"] == []
+    assert weak["pending_validation"] == "skipped_weak_bias:0.58"
+    assert weak["pending_proposal"] == {"type": "SELL_STOP", "price": 4405.89}
+
+    absent = _decide_with_payload(
+        {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID",
+         "directional_bias": "BEARISH", "bias_strength": 0.7, "pending_orders": []}
+    )
+    assert absent["pending_validation"] == "none_proposed" and absent["pending_proposal"] is None
+
+    wrong_side = _decide_with_payload(
+        {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID",
+         "directional_bias": "BEARISH", "bias_strength": 0.8,
+         "pending_orders": [{"type": "BUY_LIMIT", "price": 4380.0}]}
+    )
+    assert wrong_side["pending_orders"] == []
+    assert wrong_side["pending_validation"] == "skipped_invalid_proposal"
+
+    kept = _decide_with_payload(
+        {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID",
+         "directional_bias": "BEARISH", "bias_strength": 0.8,
+         "pending_orders": [{"type": "SELL_LIMIT", "price": 4420.0}]}
+    )
+    assert len(kept["pending_orders"]) == 1 and kept["pending_validation"] == ""

@@ -1315,3 +1315,57 @@ def test_run_once_skips_pending_at_15_30_ny(tmp_path: Path, monkeypatch) -> None
     assert rows[0]["pending_status"] == "skipped_late_placement"
     # The trader's plan itself is untouched in the log.
     assert rows[0]["directional_bias"] == "BULLISH"
+
+
+def test_handle_pending_orders_reports_intended_order_on_skip(tmp_path: Path, monkeypatch) -> None:
+    _, placed = _pending_common(monkeypatch, tmp_path)
+    outcome = main._handle_pending_orders(
+        pendings=[{"type": "SELL_STOP", "price": 4405.89, "tp": None, "basis": "割れ待ち"}],
+        current_price=4406.33,  # 0.44 below market = 0.03 ATR -> too close
+        atr=15.0,
+        spread=10.0,
+        baseline_spread=10.0,
+        consecutive_losses=0,
+        daily_loss_pct=0.0,
+        balance=400_000.0,
+        trader_confidence=0.7,
+        now_iso="2026-09-07T14:30:00+00:00",
+    )
+    assert placed == []
+    assert outcome["status"] == "skipped_distance:0.03atr"
+    assert outcome["fields"] == {"pending_type": "SELL_STOP", "pending_price": 4405.89}
+
+
+def test_run_once_logs_weak_bias_drop_with_intended_order(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "build_risk_plan",
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+            "ok": False, "action": "HOLD", "lot": 0.0, "sl": 0.0, "tp": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+            "action": "HOLD",
+            "confidence": 0.7,
+            "reasoning": "確信弱い",
+            "risk_level": "MID",
+            "directional_bias": "BEARISH",
+            "bias_strength": 0.58,
+            "pending_orders": [],  # validator already dropped it
+            "pending_validation": "skipped_weak_bias:0.58",
+            "pending_proposal": {"type": "SELL_STOP", "price": 4405.89},
+            "_meta": {"model": "t", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["pending_status"] == "skipped_weak_bias:0.58"
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert rows[0]["pending_status"] == "skipped_weak_bias:0.58"
+    assert rows[0]["pending_type"] == "SELL_STOP"
+    assert rows[0]["pending_price"] == "4405.89"
