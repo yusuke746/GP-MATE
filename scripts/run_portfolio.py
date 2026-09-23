@@ -25,9 +25,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import baseline as bl  # noqa: E402
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 MAGIC = 20260919                 # GP-MATE(20260702)と別
 BARS = 700                       # シグナル・ボラ推定に使う日足本数
@@ -150,8 +153,14 @@ def main():
                             "server": os.getenv("PF_MT5_SERVER")}.items() if v}
     if os.getenv("PF_MT5_LOGIN"):
         kw["login"] = int(os.environ["PF_MT5_LOGIN"])
-    if a.live and "login" not in kw:
-        raise SystemExit("--live には PF_MT5_LOGIN 等の指定が必須（GP-MATEの口座に誤発注しないため）")
+    if "login" not in kw:
+        raise SystemExit("PF_MT5_LOGIN 等の指定が必須（GP-MATEの口座へ接続しないため）")
+    gp_login = os.getenv("MT5_LOGIN", "").strip()
+    gp_path = os.getenv("MT5_PATH", "").strip()
+    if gp_login and str(kw["login"]) == gp_login:
+        raise SystemExit("PF_MT5_LOGIN がGP-MATEのMT5_LOGINと同一。別口座を指定すること。")
+    if gp_path and os.path.normcase(os.path.abspath(kw.get("path", ""))) == os.path.normcase(os.path.abspath(gp_path)):
+        raise SystemExit("PF_MT5_PATH がGP-MATEのMT5_PATHと同一。別ターミナルを指定すること。")
     if not mt5.initialize(**kw):
         raise SystemExit(f"MT5 initialize failed: {mt5.last_error()}")
     try:
