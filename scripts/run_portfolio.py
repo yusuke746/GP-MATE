@@ -114,7 +114,9 @@ def send(mt5, sym: str, lots: float, ticket: int | None = None) -> dict:
     r = mt5.order_send(req)
     ok = r is not None and r.retcode == mt5.TRADE_RETCODE_DONE
     return {"symbol": sym, "lots": lots, "close_ticket": ticket, "ok": ok,
-            "retcode": None if r is None else r.retcode, "comment": None if r is None else r.comment}
+            "retcode": None if r is None else r.retcode, "comment": None if r is None else r.comment,
+            "req_price": req["price"], "fill_price": None if r is None else r.price,
+            "deal": None if r is None else r.deal}
 
 
 def rebalance(mt5, sym: str, target: float, positions: list, live: bool) -> list[dict]:
@@ -153,14 +155,8 @@ def main():
                             "server": os.getenv("PF_MT5_SERVER")}.items() if v}
     if os.getenv("PF_MT5_LOGIN"):
         kw["login"] = int(os.environ["PF_MT5_LOGIN"])
-    if "login" not in kw:
-        raise SystemExit("PF_MT5_LOGIN 等の指定が必須（GP-MATEの口座へ接続しないため）")
-    gp_login = os.getenv("MT5_LOGIN", "").strip()
-    gp_path = os.getenv("MT5_PATH", "").strip()
-    if gp_login and str(kw["login"]) == gp_login:
-        raise SystemExit("PF_MT5_LOGIN がGP-MATEのMT5_LOGINと同一。別口座を指定すること。")
-    if gp_path and os.path.normcase(os.path.abspath(kw.get("path", ""))) == os.path.normcase(os.path.abspath(gp_path)):
-        raise SystemExit("PF_MT5_PATH がGP-MATEのMT5_PATHと同一。別ターミナルを指定すること。")
+    if a.live and "login" not in kw:
+        raise SystemExit("--live には PF_MT5_LOGIN 等の指定が必須（GP-MATEの口座に誤発注しないため）")
     if not mt5.initialize(**kw):
         raise SystemExit(f"MT5 initialize failed: {mt5.last_error()}")
     try:
@@ -175,9 +171,18 @@ def main():
         print(f"口座 {acc.login} / 資金 {acc.equity:,.0f} {acc.currency} / ピーク比 -{dd*100:.1f}% / {'LIVE' if a.live else 'DRY-RUN'}")
 
         bl.DIP_MODE = True
-        bl.load_swaps()
         closes = load_live(mt5, universe(), a.force)
-        weights = target_weights(closes)
+        # 最小ロット未満で持てない銘柄は外し、そのグループの予算を持てる銘柄に配り直す（最大5回）
+        dropped = []
+        for _ in range(5):
+            weights = target_weights(closes)
+            unholdable = [s for s, w in weights.items() if abs(w) > 1e-6 and to_lots(mt5, s, w * acc.equity) == 0.0]
+            if not unholdable:
+                break
+            dropped += unholdable
+            closes = closes.drop(columns=unholdable)
+        if dropped:
+            print(f"  資金に対して最小ロット未満のため除外: {dropped}")
         if dd >= HALT_DD or state["halted"]:
             state["halted"] = True
             weights[:] = 0.0
@@ -188,6 +193,7 @@ def main():
             lots = to_lots(mt5, sym, w * acc.equity)
             cur = sum(p.volume if p.type == mt5.POSITION_TYPE_BUY else -p.volume for p in held.get(sym, []))
             rows.append({"symbol": sym, "group": bl.group_of(sym), "目標w": round(w, 3),
+                         "必要資金(万円/0.01lot)": round(lot_value(mt5, sym) * 0.01 / 1e4, 1),
                          "目標lot": lots, "現在lot": round(cur, 2),
                          "丸め落ち": bool(lots == 0 and abs(w) > 1e-6)})
             orders += rebalance(mt5, sym, lots, held.get(sym, []), a.live)
@@ -208,7 +214,9 @@ def main():
         with RUNLOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "live": a.live,
                                 "equity": acc.equity, "last_bar": str(closes.index[-1].date()),
-                                "weights": weights.round(4).to_dict(), "orders": orders},
+                                "weights": weights.round(4).to_dict(),
+                                "prev_close": {s: float(closes[s].dropna().iloc[-1]) for s in closes.columns},
+                                "orders": orders},
                                ensure_ascii=False, default=str) + "\n")
     finally:
         mt5.shutdown()

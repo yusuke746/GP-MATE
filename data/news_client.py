@@ -206,7 +206,9 @@ def _deduplicate_by_title(news_items: list[dict[str, Any]]) -> list[dict[str, An
 
 
 def fetch_news_with_meta(
-    hours: int = 24, max_items: int = MAX_NEWS_ITEMS
+    hours: int = 24,
+    max_items: int = MAX_NEWS_ITEMS,
+    keywords: tuple[str, ...] | None = GOLD_KEYWORDS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """fetch_news plus feed-health metadata.
 
@@ -248,7 +250,7 @@ def fetch_news_with_meta(
     dropped_undated = 0
     for item in _deduplicate_by_title(all_items):
         title = str(item.get("title") or "")
-        if not _contains_keywords(title, GOLD_KEYWORDS):
+        if keywords is not None and not _contains_keywords(title, keywords):
             continue
         meta["keyword_items"] = int(meta["keyword_items"]) + 1
 

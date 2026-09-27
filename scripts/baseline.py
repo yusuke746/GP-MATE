@@ -240,6 +240,7 @@ def main():
     ap.add_argument("--plot", action="store_true")
     ap.add_argument("--core", action="store_true", help="FXクロスを除外（USDストレートと情報が重複するため）")
     ap.add_argument("--dip", action="store_true", help="指数をトレンドではなく押し目買い(BB下限→10日保有)で運用")
+    ap.add_argument("--exclude", default="", help="除外するグループ（例: metals または metals,energy）")
     ap.add_argument("--end", default=None, help="この日付までで評価（例: 2022-12-31）")
     a = ap.parse_args()
     global DIP_MODE
@@ -250,6 +251,9 @@ def main():
         load_swaps()
     if a.core:
         closes = closes[[c for c in closes.columns if group_of(c) != "fx_cross"]]
+    if a.exclude:
+        ex = set(a.exclude.split(","))
+        closes = closes[[c for c in closes.columns if group_of(c) not in ex]]
     if a.end:
         closes = closes.loc[:a.end]
     print("グループ:", pd.Series({c: group_of(c) for c in closes.columns}).value_counts().to_dict())
