@@ -463,3 +463,39 @@ def test_pending_validation_distinguishes_dropped_from_absent() -> None:
          "pending_orders": [{"type": "SELL_LIMIT", "price": 4420.0}]}
     )
     assert len(kept["pending_orders"]) == 1 and kept["pending_validation"] == ""
+
+
+def test_trader_sees_rule_regime_and_judge_regime_summary() -> None:
+    import json
+
+    from agents.trader import SYSTEM_PROMPT
+
+    fake_client = Mock()
+    fake_client.call_function.return_value = _fake_result({"action": "HOLD", "confidence": 0.5, "reasoning": "x"})
+    technical = {"signal": "BUY", "regime": {"regime": "RANGE", "direction": "NEUTRAL", "confidence": 0.8, "entry_style": "LIMIT_FADE", "source": "rule_based"}}
+    debate_report = {
+        "axis": "regime",
+        "regime_summary": {"regime": "RANGE", "entry_style": "LIMIT_FADE", "source": "judge"},
+        "bull_confidence": 0.7,
+        "judge_summary": {
+            "agreements": [],
+            "conflicts": [],
+            "confidence_shift": {"bull": [0.5, 0.7], "bear": [0.5, 0.6]},
+            "stronger_side": "neutral",
+            "regime_summary": {"regime": "RANGE", "regime_confidence": 0.66, "entry_style": "LIMIT_FADE", "key_levels": {"continuation_confirms": None, "reversal_confirms": 2280.0}, "source": "judge"},
+        },
+        "_meta": {"ok": True, "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
+    }
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        decide_trade(technical_report=technical, sentiment_report={"score": 0.1}, debate_report=debate_report, confidence_threshold=0.1)
+
+    sent = json.loads(fake_client.call_function.call_args.kwargs["user_prompt"])
+    assert sent["technical"]["regime"]["regime"] == "RANGE"
+    assert sent["judge_summary"]["regime_summary"]["entry_style"] == "LIMIT_FADE"
+    assert sent["judge_summary"]["regime_summary"]["key_levels"]["reversal_confirms"] == 2280.0
+    assert sent["debate"]["regime_summary"]["regime"] == "RANGE"
+    assert "confidence_shift" not in sent["judge_summary"] and "bull_confidence" not in sent["debate"]
+    # The prompt tells the trader to fit the order type to the regime before arguing direction.
+    assert "【レジーム】" in SYSTEM_PROMPT
+    for token in ("TREND", "RANGE", "TRANSITION", "LIMIT_PULLBACK", "STOP_BREAKOUT", "LIMIT_FADE"):
+        assert token in SYSTEM_PROMPT

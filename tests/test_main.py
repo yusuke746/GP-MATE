@@ -160,7 +160,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "run_debate_graph",
-        lambda technical_report, sentiment_report, macro_report=None: {
+        lambda technical_report, sentiment_report, macro_report=None, **kwargs: {
             "judge_summary": {
                 "agreements": [],
                 "conflicts": [],
@@ -287,7 +287,7 @@ def test_run_once_logs_debate_fields_when_executed(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(
         main,
         "run_debate_graph",
-        lambda technical_report, sentiment_report, macro_report: {
+        lambda technical_report, sentiment_report, macro_report, **kwargs: {
             "judge_summary": {
                 "conflicts": ["方向感"],
                 "stronger_side": "bull",
@@ -387,7 +387,7 @@ def test_run_once_logs_judge_parse_failure_flag(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr(
         main,
         "run_debate_graph",
-        lambda technical_report, sentiment_report, macro_report: {
+        lambda technical_report, sentiment_report, macro_report, **kwargs: {
             "judge_summary": {
                 "conflicts": ["judge parse error"],
                 "stronger_side": "neutral",
@@ -429,7 +429,7 @@ def test_run_once_continues_when_debate_log_serialization_fails(tmp_path: Path, 
     monkeypatch.setattr(
         main,
         "run_debate_graph",
-        lambda technical_report, sentiment_report, macro_report: {
+        lambda technical_report, sentiment_report, macro_report, **kwargs: {
             "judge_summary": {
                 "conflicts": {"non_serializable"},
                 "stronger_side": "bull",
@@ -1369,3 +1369,94 @@ def test_run_once_logs_weak_bias_drop_with_intended_order(tmp_path: Path, monkey
     assert rows[0]["pending_status"] == "skipped_weak_bias:0.58"
     assert rows[0]["pending_type"] == "SELL_STOP"
     assert rows[0]["pending_price"] == "4405.89"
+
+
+def test_extract_debate_log_fields_prefers_judge_regime_over_rule() -> None:
+    gate = {"should_debate": True, "reason": "議論実行"}
+    technical = {"signal": "BUY", "regime": {"regime": "RANGE", "confidence": 0.7, "entry_style": "LIMIT_FADE", "source": "rule_based"}}
+    debate = {
+        "axis": "regime",
+        "regime_summary": {"regime": "TREND", "regime_confidence": 0.66, "entry_style": "LIMIT_PULLBACK", "source": "judge"},
+        "judge_summary": {"stronger_side": "bull", "conflicts": [], "confidence_shift": {}},
+        "_meta": {"ok": True, "judge_ok": True, "usage": {"total_tokens": 3}},
+    }
+    fields = main._extract_debate_log_fields(gate, debate, technical_report=technical)
+    assert fields["regime"] == "TREND"
+    assert fields["regime_confidence"] == 0.66
+    assert fields["entry_style"] == "LIMIT_PULLBACK"
+    assert fields["regime_source"] == "judge"
+    assert fields["stronger_side"] == "bull"
+
+
+def test_extract_debate_log_fields_uses_rule_regime_when_debate_has_none() -> None:
+    technical = {"signal": "BUY", "regime": {"regime": "RANGE", "confidence": 0.7, "entry_style": "LIMIT_FADE", "source": "rule_based"}}
+    skipped = {"judge_summary": {"stronger_side": "neutral"}, "_meta": {"ok": True, "debate_executed": False, "skip_reason": "strong trend"}}
+    fields = main._extract_debate_log_fields({"should_debate": False, "reason": "strong trend"}, skipped, technical_report=technical)
+    assert fields["regime"] == "RANGE"
+    assert fields["regime_confidence"] == 0.7
+    assert fields["entry_style"] == "LIMIT_FADE"
+    assert fields["regime_source"] == "rule_based"
+
+    blank = main._extract_debate_log_fields({"should_debate": False, "reason": "x"}, {}, technical_report={"signal": "BUY"})
+    assert blank["regime"] == "" and blank["regime_confidence"] == "" and blank["entry_style"] == "" and blank["regime_source"] == ""
+    for column in ("regime", "regime_confidence", "entry_style", "regime_source"):
+        assert column in main.TRADE_LOG_COLUMNS
+
+
+def test_run_once_logs_rule_based_regime_columns(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "BUY"
+    row = _read_single_row(log_path)
+    # The test technical report carries no ADX snapshot, so the classifier
+    # refuses to call a regime -- and says so in the log instead of leaving it blank.
+    assert row["regime"] == "TRANSITION"
+    assert row["regime_source"] == "rule_based"
+    assert row["entry_style"] == "NONE"
+    assert row["regime_confidence"] == "0.3"
+
+
+def test_run_once_logs_judge_regime_and_passes_axis_to_debate(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "DEBATE_AXIS", "regime")
+    calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        main,
+        "should_execute_debate",
+        lambda technical_report, sentiment_report, macro_report: {
+            "should_debate": True,
+            "reason": "議論実行（通常判定）",
+            "technical_direction": "BUY",
+            "sentiment_direction": "BULLISH",
+            "macro_direction": "NEUTRAL",
+            "alignment": "ALIGNED",
+            "estimated_confidence": 0.61,
+        },
+    )
+
+    def _fake_debate(technical_report, sentiment_report, macro_report, **kwargs):
+        calls.append({"technical_regime": technical_report.get("regime"), **kwargs})
+        return {
+            "axis": kwargs.get("axis"),
+            "regime_summary": {"regime": "TREND", "regime_confidence": 0.71, "direction_if_trend": "UP", "entry_style": "LIMIT_PULLBACK", "source": "judge"},
+            "judge_summary": {"conflicts": [], "stronger_side": "bull", "confidence_shift": {"bull": [], "bear": []}, "regime_summary": {"regime": "TREND"}},
+            "_meta": {"ok": True, "judge_ok": True, "judge_error": "", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        }
+
+    monkeypatch.setattr(main, "run_debate_graph", _fake_debate)
+
+    main.run_once(baseline_spread=10.0)
+
+    assert len(calls) == 1
+    assert calls[0]["axis"] == "regime"
+    assert calls[0]["regime_hint"]["regime"] == "TRANSITION"  # the rule-based read is handed to the debate
+    assert calls[0]["technical_regime"]["source"] == "rule_based"
+    row = _read_single_row(log_path)
+    assert row["regime"] == "TREND"
+    assert row["regime_confidence"] == "0.71"
+    assert row["entry_style"] == "LIMIT_PULLBACK"
+    assert row["regime_source"] == "judge"
+    assert row["stronger_side"] == "bull"

@@ -37,6 +37,7 @@ from config import (
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS,
     MONDAY_OPEN_NY,
+    DEBATE_AXIS,
     NEWS_FILTER_MINUTES,
     PENDING_ORDER_LAST_PLACEMENT_NY,
     NY_RUN_TIMES,
@@ -63,6 +64,7 @@ from data.news_client import fetch_news_with_meta, is_high_impact_soon
 from agents.technical import EXTENSION_ATR_CAUTION, calc_extension_atr
 from indicators.ta_calc import add_indicators
 from indicators.horizontal_levels import build_horizontal_levels
+from indicators.regime import classify_regime
 from risk.risk_manager import build_risk_plan, check_filters
 from risk.breakeven import should_move_to_breakeven
 
@@ -169,6 +171,10 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "effective_rr",
     "pending_type",
     "pending_price",
+    "regime",
+    "regime_confidence",
+    "entry_style",
+    "regime_source",
 )
 
 
@@ -798,7 +804,35 @@ def _default_debate_log_fields() -> dict[str, Any]:
         "breakeven_modify_success": "",
         "breakeven_modify_retcode": "",
         "breakeven_reason": "",
+        "regime": "",
+        "regime_confidence": "",
+        "entry_style": "",
+        "regime_source": "",
     }
+
+
+def _regime_log_fields(technical_report: Any, debate_report: Any) -> dict[str, Any]:
+    """regime / regime_confidence / entry_style / regime_source for the trade log.
+
+    Judge verdict wins when the regime debate ran; otherwise the rule-based
+    classification attached to the technical report."""
+    judge = debate_report.get("regime_summary") if isinstance(debate_report, dict) else None
+    if isinstance(judge, dict) and judge.get("regime"):
+        return {
+            "regime": str(judge.get("regime", "")),
+            "regime_confidence": judge.get("regime_confidence", ""),
+            "entry_style": str(judge.get("entry_style", "") or ""),
+            "regime_source": str(judge.get("source", "judge") or "judge"),
+        }
+    rule = technical_report.get("regime") if isinstance(technical_report, dict) else None
+    if isinstance(rule, dict) and rule.get("regime"):
+        return {
+            "regime": str(rule.get("regime", "")),
+            "regime_confidence": rule.get("confidence", ""),
+            "entry_style": str(rule.get("entry_style", "") or ""),
+            "regime_source": "rule_based",
+        }
+    return {"regime": "", "regime_confidence": "", "entry_style": "", "regime_source": ""}
 
 
 def _debate_direction_from_stronger_side(stronger_side: str) -> str:
@@ -810,8 +844,13 @@ def _debate_direction_from_stronger_side(stronger_side: str) -> str:
     return "NEUTRAL"
 
 
-def _extract_debate_log_fields(gate: dict[str, Any], debate_report: dict[str, Any]) -> dict[str, Any]:
+def _extract_debate_log_fields(
+    gate: dict[str, Any],
+    debate_report: dict[str, Any],
+    technical_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     fields = _default_debate_log_fields()
+    fields.update(_regime_log_fields(technical_report, debate_report))
 
     should_debate = bool(gate.get("should_debate", False))
     fields["debate_executed"] = should_debate
@@ -907,6 +946,13 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
             "tp_reference_only": tp_reference_only,
         }
     )
+    # Rule-based regime read (TREND / RANGE / TRANSITION + entry style) shared
+    # by the debate (as regime_hint), the trader and the forecast logger.
+    if isinstance(technical_report, dict):
+        try:
+            technical_report["regime"] = classify_regime(technical_report)
+        except Exception as exc:
+            LOGGER.warning("classify_regime failed safely: %s", exc)
     sentiment_report = analyze_sentiment(news_items)
     if isinstance(sentiment_report, dict):
         sentiment_report["feed_meta"] = feed_meta
@@ -928,7 +974,13 @@ def _build_debate_and_decision_reports(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
     gate = should_execute_debate(technical_report, sentiment_report, macro_report)
     if gate["should_debate"]:
-        debate_report = run_debate_graph(technical_report, sentiment_report, macro_report)
+        debate_report = run_debate_graph(
+            technical_report,
+            sentiment_report,
+            macro_report,
+            axis=DEBATE_AXIS,
+            regime_hint=technical_report.get("regime") if isinstance(technical_report, dict) else None,
+        )
         debate_meta = debate_report.get("_meta", {}) if isinstance(debate_report, dict) else {}
         debate_ok = bool(debate_meta.get("ok", False)) if isinstance(debate_meta, dict) else False
         if debate_ok:
@@ -1480,7 +1532,7 @@ def run_once(
         )
 
         try:
-            debate_log_fields = _extract_debate_log_fields(gate=gate, debate_report=debate_report)
+            debate_log_fields = _extract_debate_log_fields(gate=gate, debate_report=debate_report, technical_report=technical_report)
         except Exception as exc:
             LOGGER.warning("Failed to extract debate log fields; defaults used: %s", exc)
             debate_log_fields = _default_debate_log_fields()

@@ -30,6 +30,7 @@ _BEAR_RAW_LOGGED_ONCE = False
 _JUDGE_RAW_LOGGED_ONCE = False
 
 DEBATE_MODEL = MODEL_DEBATE
+from config import DEBATE_AXIS  # noqa: E402  (axis default; overridable per call)
 BULL_TEMPERATURE = 0.7
 BEAR_TEMPERATURE = 0.3
 JUDGE_TEMPERATURE = 0.2
@@ -63,6 +64,62 @@ BEAR_SYSTEM_PROMPT = (
     "{argument: string, confidence: number(0-1), conceded_points: string[]}"
 )
 
+# --------------------------------------------------------------------------- #
+# Regime axis: Trend-continuation advocate vs Range/mean-reversion advocate.
+# The question is not "up or down?" but "what kind of market is this, and
+# therefore which entry type fits?" -- the decision the trader actually makes.
+# --------------------------------------------------------------------------- #
+TREND_SYSTEM_PROMPT = (
+    "あなたはTrend側アナリストです。『現在はトレンド継続局面であり、順張り(押し目買い/戻り売り、"
+    "またはブレイク追随)が優位』という立場を必ず主張し、レンジ寄りに逃げないこと。"
+    "あなたは必ず【Trend】の立場です。相手(Range)の主張を要約して引用し、"
+    "『相手は○○と言うが、△△を見落としている』形式で反論すること。"
+    "ただし初回ラウンド(相手の主張がまだ存在しない場合)は反論形式を使わず、存在しない主張を捏造しないこと。"
+    "主張の中で必ず次を数値で示すこと: 継続方向(UP/DOWN)、継続が確認される価格(ブレイク水準)、"
+    "押し目/戻りとして待てる価格、トレンドが否定される価格。"
+    "ADX・多時間軸の整合・BBミドルからの乖離・regime_hint(ルールベースの暫定判定)を根拠として使うこと。"
+    "JSONのみで返答し、必ず次のキーを含めること:"
+    "{argument: string, confidence: number(0-1), conceded_points: string[], "
+    "direction: 'UP'|'DOWN', continuation_level: number, pullback_level: number, invalidation_level: number}"
+)
+
+RANGE_SYSTEM_PROMPT = (
+    "あなたはRange側アナリストです。『現在はレンジ/平均回帰局面であり、帯の端で逆張り(支持で買い、"
+    "抵抗で売り)が優位で、ブレイク追随はダマシに遭いやすい』という立場を必ず主張すること。"
+    "あなたは必ず【Range】の立場です。相手(Trend)の主張を要約して引用し、"
+    "『相手は○○と言うが、△△を見落としている』形式で反論すること。"
+    "ただし初回ラウンド(相手の主張がまだ存在しない場合)は反論形式を使わず、存在しない主張を捏造しないこと。"
+    "confidenceは必ず0.3以上で答え、極端な棄権は禁止。"
+    "主張の中で必ず次を数値で示すこと: 帯の上限と下限(反転が期待できる価格)、"
+    "レンジが否定される価格(ここを抜けたらトレンドと認める)。"
+    "低ADX・BB幅の収縮・水平帯のタッチ回数・伸び切り(D1乖離)を根拠として使うこと。"
+    "JSONのみで返答し、必ず次のキーを含めること:"
+    "{argument: string, confidence: number(0-1), conceded_points: string[], "
+    "band_high: number, band_low: number, invalidation_level: number}"
+)
+
+REGIME_JUDGE_SYSTEM_PROMPT = (
+    "あなたはJudgeです。Trend側とRange側の議論を裁定し、現在の相場が"
+    "TREND(継続・順張りが優位)/RANGE(反転・逆張りが優位)/TRANSITION(どちらとも言えない、見送り)のどれかを判定してください。"
+    "自己申告のconfidenceに引きずられず、論拠の具体性・反論への応答力・譲歩の非対称性で判定すること。"
+    "regime_hint(ルールベースの暫定判定)と食い違う結論を出す場合は、その理由をconflictsに明記すること。"
+    "TRENDならdirection_if_trend(UP/DOWN)とentry_style(押し目/戻りが待てるならLIMIT_PULLBACK、"
+    "伸び切っておらずブレイクを追えるならSTOP_BREAKOUT)を、RANGEならentry_style=LIMIT_FADEを、"
+    "TRANSITIONならentry_style=NONEを返すこと。"
+    "key_levelsには、継続が確認される価格(continuation_confirms)と反転が確認される価格(reversal_confirms)を数値で入れること。"
+    "必ず次のJSON形式で返してください:"
+    "{agreements: string[], conflicts: string[], regime: 'TREND'|'RANGE'|'TRANSITION', "
+    "regime_confidence: number(0-1), direction_if_trend: 'UP'|'DOWN'|'NEUTRAL', "
+    "entry_style: 'STOP_BREAKOUT'|'LIMIT_PULLBACK'|'LIMIT_FADE'|'NONE', "
+    "key_levels: {continuation_confirms: number|null, reversal_confirms: number|null}, "
+    "stronger_side: 'trend'|'range'|'neutral'}"
+)
+
+AXIS_DIRECTION = "direction"
+AXIS_REGIME = "regime"
+REGIME_VALUES = {"TREND", "RANGE", "TRANSITION"}
+ENTRY_STYLES = {"STOP_BREAKOUT", "LIMIT_PULLBACK", "LIMIT_FADE", "NONE"}
+
 BEAR_MAX_ATTEMPTS = 2
 JUDGE_MAX_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 0.4
@@ -78,17 +135,22 @@ class UsageStats(TypedDict):
     total_tokens: int
 
 
-class JudgeSummary(TypedDict):
+class JudgeSummary(TypedDict, total=False):
     agreements: list[str]
     conflicts: list[str]
     confidence_shift: dict[str, list[float]]
     stronger_side: Literal["bull", "bear", "neutral"]
+    # Present only on the regime axis: regime / regime_confidence /
+    # direction_if_trend / entry_style / key_levels / stronger_advocate.
+    regime_summary: dict[str, Any]
 
 
-class DebateState(TypedDict):
+class DebateState(TypedDict, total=False):
     technical_report: dict[str, Any]
     sentiment_report: dict[str, Any]
     macro_report: dict[str, Any]
+    axis: str
+    regime_hint: dict[str, Any]
     bull_arguments: Annotated[list[str], add]
     bear_arguments: Annotated[list[str], add]
     bull_conceded_points: Annotated[list[str], add]
@@ -157,6 +219,57 @@ def _default_judge_summary() -> JudgeSummary:
         "conflicts": ["データ不足のため判断保留"],
         "confidence_shift": {"bull": [], "bear": []},
         "stronger_side": "neutral",
+        "regime_summary": {},
+    }
+
+
+def _axis_of(state: DebateState) -> str:
+    return AXIS_REGIME if str(state.get("axis", AXIS_DIRECTION) or AXIS_DIRECTION).lower() == AXIS_REGIME else AXIS_DIRECTION
+
+
+def _stronger_side_from_regime(regime: str, direction: str) -> Literal["bull", "bear", "neutral"]:
+    """Map a regime verdict onto the legacy bull/bear field downstream reads."""
+    if regime == "TREND":
+        if direction == "UP":
+            return "bull"
+        if direction == "DOWN":
+            return "bear"
+    return "neutral"
+
+
+def _coerce_regime_summary(value: dict[str, Any]) -> dict[str, Any]:
+    regime = str(value.get("regime", "") or "").upper()
+    if regime not in REGIME_VALUES:
+        return {}
+    direction = str(value.get("direction_if_trend", "NEUTRAL") or "NEUTRAL").upper()
+    if direction not in {"UP", "DOWN", "NEUTRAL"}:
+        direction = "NEUTRAL"
+    entry_style = str(value.get("entry_style", "") or "").upper()
+    if entry_style not in ENTRY_STYLES:
+        entry_style = {"TREND": "LIMIT_PULLBACK", "RANGE": "LIMIT_FADE"}.get(regime, "NONE")
+    try:
+        confidence = max(0.0, min(1.0, float(value.get("regime_confidence", 0.5))))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    levels_raw = value.get("key_levels", {})
+    levels: dict[str, float | None] = {"continuation_confirms": None, "reversal_confirms": None}
+    if isinstance(levels_raw, dict):
+        for key in levels:
+            try:
+                levels[key] = float(levels_raw.get(key)) if levels_raw.get(key) is not None else None
+            except (TypeError, ValueError):
+                levels[key] = None
+    advocate = str(value.get("stronger_side", "neutral") or "neutral").lower()
+    if advocate not in {"trend", "range", "neutral"}:
+        advocate = "neutral"
+    return {
+        "regime": regime,
+        "regime_confidence": round(confidence, 3),
+        "direction_if_trend": direction if regime == "TREND" else "NEUTRAL",
+        "entry_style": entry_style,
+        "key_levels": levels,
+        "stronger_advocate": advocate,
+        "source": "judge",
     }
 
 
@@ -671,6 +784,12 @@ def _coerce_judge_summary(value: Any) -> JudgeSummary:
     if stronger_raw in {"bull", "bear", "neutral"}:
         stronger_side = cast(Literal["bull", "bear", "neutral"], stronger_raw)
 
+    regime_summary = _coerce_regime_summary(value) if "regime" in value else (
+        dict(value.get("regime_summary")) if isinstance(value.get("regime_summary"), dict) else {}
+    )
+    if regime_summary and stronger_raw in {"trend", "range", "neutral"}:
+        stronger_side = _stronger_side_from_regime(regime_summary["regime"], regime_summary["direction_if_trend"])
+
     return {
         "agreements": agreements,
         "conflicts": conflicts,
@@ -679,6 +798,7 @@ def _coerce_judge_summary(value: Any) -> JudgeSummary:
             "bear": [],
         },
         "stronger_side": stronger_side,
+        "regime_summary": regime_summary,
     }
 
 
@@ -929,14 +1049,18 @@ def _build_opponent_context(opponent_label: str, latest_argument: str) -> tuple[
 def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
     latest_bear_raw = state["bear_arguments"][-1] if state["bear_arguments"] else ""
     latest_bull_raw = state["bull_arguments"][-1] if state["bull_arguments"] else ""
-    latest_bear, bear_opponent_context = _build_opponent_context("Bear", latest_bear_raw)
-    latest_bull, bull_opponent_context = _build_opponent_context("Bull", latest_bull_raw)
+    regime_axis = _axis_of(state) == AXIS_REGIME
+    latest_bear, bear_opponent_context = _build_opponent_context("Range" if regime_axis else "Bear", latest_bear_raw)
+    latest_bull, bull_opponent_context = _build_opponent_context("Trend" if regime_axis else "Bull", latest_bull_raw)
     horizontal_levels_context = _build_horizontal_levels_context(state["technical_report"])
 
+    axis = _axis_of(state)
+    regime_hint = state.get("regime_hint", {}) or {}
     if role == "bull":
-        system_prompt = BULL_SYSTEM_PROMPT
+        system_prompt = TREND_SYSTEM_PROMPT if axis == AXIS_REGIME else BULL_SYSTEM_PROMPT
         user_payload = {
-            "self_role": "Bull",
+            "self_role": "Trend" if axis == AXIS_REGIME else "Bull",
+            "regime_hint": regime_hint,
             "technical_report": state["technical_report"],
             "sentiment_report": state["sentiment_report"],
             "macro_report": state.get("macro_report", {}),
@@ -951,9 +1075,10 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
             "prev_bull_confidence": state["bull_confidence"],
         }
     else:
-        system_prompt = BEAR_SYSTEM_PROMPT
+        system_prompt = RANGE_SYSTEM_PROMPT if axis == AXIS_REGIME else BEAR_SYSTEM_PROMPT
         user_payload = {
-            "self_role": "Bear",
+            "self_role": "Range" if axis == AXIS_REGIME else "Bear",
+            "regime_hint": regime_hint,
             "technical_report": state["technical_report"],
             "sentiment_report": state["sentiment_report"],
             "macro_report": state.get("macro_report", {}),
@@ -1072,7 +1197,7 @@ def _invoke_role_llm(role: str, state: DebateState) -> _RoleResponse:
 
 
 def _invoke_judge_llm(state: DebateState) -> _JudgeResponse:
-    system_prompt = (
+    system_prompt = REGIME_JUDGE_SYSTEM_PROMPT if _axis_of(state) == AXIS_REGIME else (
         "あなたはJudgeです。Bull/Bearの議論全体を裁定し、合意点・対立点と、"
         "どちらの論拠が強いか(stronger_side)を判定してください。"
         "stronger_sideは自己申告のconfidence数値に引きずられず、"
@@ -1083,9 +1208,12 @@ def _invoke_judge_llm(state: DebateState) -> _JudgeResponse:
         "必ず次のJSON形式で返してください:"
         "{agreements: string[], conflicts: string[], stronger_side:'bull'|'bear'|'neutral'}"
     )
+    regime_axis = _axis_of(state) == AXIS_REGIME
     user_payload = {
-        "bull_arguments": state["bull_arguments"],
-        "bear_arguments": state["bear_arguments"],
+        "axis": _axis_of(state),
+        "regime_hint": state.get("regime_hint", {}) or {},
+        ("trend_arguments" if regime_axis else "bull_arguments"): state["bull_arguments"],
+        ("range_arguments" if regime_axis else "bear_arguments"): state["bear_arguments"],
         "bull_confidence": state["bull_confidence"],
         "bear_confidence": state["bear_confidence"],
         "round_count": state["round_count"],
@@ -1262,6 +1390,49 @@ def _judge_node(state: DebateState, llm: RoleLLMCallable | None) -> dict[str, An
     summary = _coerce_judge_summary(judge_payload.get("judge_summary", judge_payload.get("summary", {})))
     summary["confidence_shift"] = _build_confidence_shift_from_state(state)
 
+    regime_axis = _axis_of(state) == AXIS_REGIME
+    if regime_axis:
+        regime_summary = dict(summary.get("regime_summary") or {})
+        if not regime_summary:
+            # Judge failed or returned no regime: fall back to the rule-based
+            # hint so downstream still gets a regime, and say so.
+            hint = state.get("regime_hint", {}) or {}
+            regime_summary = {
+                "regime": str(hint.get("regime", "TRANSITION") or "TRANSITION"),
+                "regime_confidence": min(0.5, float(hint.get("confidence", 0.4) or 0.4)),
+                "direction_if_trend": str(hint.get("direction", "NEUTRAL") or "NEUTRAL"),
+                "entry_style": str(hint.get("entry_style", "NONE") or "NONE"),
+                "key_levels": {"continuation_confirms": None, "reversal_confirms": None},
+                "stronger_advocate": "neutral",
+                "source": "rule_based_fallback",
+            }
+            conflicts = summary.get("conflicts", [])
+            if isinstance(conflicts, list):
+                conflicts.append("judgeがレジームを返さなかったためルールベース判定で代替")
+                summary["conflicts"] = [str(x) for x in conflicts]
+        hint_regime = str((state.get("regime_hint", {}) or {}).get("regime", "") or "")
+        if hint_regime and hint_regime != regime_summary.get("regime"):
+            regime_summary["disagrees_with_rule"] = True
+        summary["regime_summary"] = regime_summary
+        summary["stronger_side"] = _stronger_side_from_regime(
+            str(regime_summary.get("regime", "")), str(regime_summary.get("direction_if_trend", ""))
+        )
+        temp_state = dict(state)
+        temp_state["judge_ok"] = judge_ok_now
+        incomplete = _build_incomplete_marker(cast(DebateState, temp_state))
+        if incomplete:
+            conflicts = summary.get("conflicts", [])
+            summary["conflicts"] = [str(x) for x in conflicts] + [incomplete] if isinstance(conflicts, list) else [incomplete]
+        usage = _usage_from_payload(judge_payload)
+        return {
+            "judge_summary": summary,
+            "judge_ok": judge_ok_now,
+            "judge_error": _is_nonempty_error(judge_payload.get("error", "")),
+            "prompt_tokens": int(state["prompt_tokens"]) + usage["prompt_tokens"],
+            "completion_tokens": int(state["completion_tokens"]) + usage["completion_tokens"],
+            "total_tokens": int(state["total_tokens"]) + usage["total_tokens"],
+        }
+
     llm_stronger = str(summary.get("stronger_side", "neutral") or "neutral")
     resolved_stronger = _resolve_stronger_side(state, judge_verdict=llm_stronger, judge_ok=judge_ok_now)
     if llm_stronger != resolved_stronger:
@@ -1379,15 +1550,26 @@ def run_debate_graph(
     macro_report: dict[str, Any] | None = None,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     llm_override: RoleLLMCallable | None = None,
+    axis: str | None = None,
+    regime_hint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run Bull/Bear/Judge debate with LangGraph and return structured report.
+    """Run the two-advocate + Judge debate with LangGraph and return a report.
 
-    Safe policy: any failure returns HOLD-friendly fallback report.
+    ``axis`` selects the question: "direction" (Bull vs Bear, legacy) or
+    "regime" (Trend-continuation vs Range/mean-reversion; the judge returns a
+    regime_summary and stronger_side is derived from it). Defaults to
+    config.DEBATE_AXIS. Safe policy: any failure returns a HOLD-friendly report.
     """
+    resolved_axis = AXIS_REGIME if str(axis if axis is not None else DEBATE_AXIS).lower() == AXIS_REGIME else AXIS_DIRECTION
+    hint = dict(regime_hint) if isinstance(regime_hint, dict) else (
+        dict(technical_report.get("regime")) if isinstance(technical_report.get("regime"), dict) else {}
+    )
     initial_state: DebateState = {
         "technical_report": technical_report,
         "sentiment_report": sentiment_report,
         "macro_report": macro_report or {},
+        "axis": resolved_axis,
+        "regime_hint": hint,
         "bull_arguments": [],
         "bear_arguments": [],
         "bull_conceded_points": [],
@@ -1423,6 +1605,8 @@ def run_debate_graph(
         summary["confidence_shift"] = _build_confidence_shift_from_state(cast(DebateState, final_state))
 
         return {
+            "axis": resolved_axis,
+            "regime_summary": dict(summary.get("regime_summary") or {}),
             "bull_arguments": list(final_state.get("bull_arguments", [])),
             "bear_arguments": list(final_state.get("bear_arguments", [])),
             "bull_conceded_points": list(final_state.get("bull_conceded_points", [])),
@@ -1456,6 +1640,8 @@ def run_debate_graph(
     except Exception as exc:
         LOGGER.warning("run_debate_graph failed: %s", exc)
         return {
+            "axis": resolved_axis,
+            "regime_summary": {},
             "bull_arguments": ["Bull分析失敗"],
             "bear_arguments": ["Bear分析失敗"],
             "bull_conceded_points": [],
