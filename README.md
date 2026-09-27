@@ -59,6 +59,25 @@ the trade log.
 - `python scripts/eval_forecasts.py [--csv out.csv]` — calibration report
 - Data: `logs/forecasts.jsonl` (one row per forecast) and `logs/forecast_inputs/<id>.json` (full inputs for ablations)
 - Settings: `FORECAST_*` and `MODEL_FORECAST` in `.env` (defaults: K=1.0 ATR both sides, 6 bars, 24h, no debate, 1 sample)
+- The forecaster is anchored on the realised UP/DOWN/TIMEOUT frequencies of recent resolved forecasts (`task.reference_base_rates`, from 30 rows) and receives the rule-based regime read (`task.regime`)
+- `python scripts/calibrate_forecasts.py` — fits shrink / shrink+tilt transforms on the first half of the record and tests them on the second half; a fitted weight near 0 means the probabilities carry no usable signal
+- `python scripts/ablate_forecasts.py` — re-forecasts archived inputs with reports removed to attribute the error
+
+## Regime (Trend vs Range)
+
+`indicators/regime.py` classifies every cycle as TREND / RANGE / TRANSITION from
+ADX (H4/H1/D1), multi-timeframe alignment, H4 Bollinger width and D1 extension,
+and proposes an `entry_style` (STOP_BREAKOUT / LIMIT_PULLBACK / LIMIT_FADE / NONE).
+The read is attached to the technical report, handed to the debate as
+`regime_hint`, to the trader (order type must fit the regime before direction)
+and to the forecast logger, and is written to the trade log
+(`regime`, `regime_confidence`, `entry_style`, `regime_source`).
+
+`DEBATE_AXIS` selects what the debate argues about: `direction` (Bull vs Bear,
+default) or `regime` (a Trend-continuation advocate vs a Range/mean-reversion
+advocate; the judge returns `regime_summary` and `stronger_side` is derived from
+it). The forecast logger uses `FORECAST_DEBATE_AXIS` (default `regime`) so the two
+axes can be compared on Brier score before production is switched.
 
 ## Tests
 

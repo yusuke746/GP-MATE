@@ -442,3 +442,14 @@ FORECAST_USE_DEBATE: Final[bool] = _get_env_str("FORECAST_USE_DEBATE", "false").
 MODEL_FORECAST: Final[str] = _get_env_str("MODEL_FORECAST", MODEL_ANALYSIS)
 # >1 calls the forecaster repeatedly on identical input (agreement analysis).
 FORECAST_SAMPLES: Final[int] = max(1, _get_env_int("FORECAST_SAMPLES", 1))
+
+# --------------------------------------------------------------------------- #
+# Debate axis
+# --------------------------------------------------------------------------- #
+# "direction": legacy Bull vs Bear (which way?). "regime": Trend-continuation
+# advocate vs Range/mean-reversion advocate (what kind of market is this, and
+# therefore which order type fits?). Production keeps "direction" until the
+# forecast-only A/B (FORECAST_DEBATE_AXIS) shows the regime axis calibrates
+# better; flip with DEBATE_AXIS=regime.
+DEBATE_AXIS: Final[str] = _get_env_str("DEBATE_AXIS", "direction").lower()
+FORECAST_DEBATE_AXIS: Final[str] = _get_env_str("FORECAST_DEBATE_AXIS", "regime").lower()

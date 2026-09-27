@@ -936,7 +936,7 @@ def test_run_once_falls_back_to_hold_when_debate_graph_fails(tmp_path: Path, mon
     monkeypatch.setattr(
         main,
         "run_debate_graph",
-        lambda t, s, m=None: {
+        lambda t, s, m=None, **kwargs: {
             "judge_summary": {
                 "agreements": [],
                 "conflicts": ["engine down"],
@@ -1521,3 +1521,227 @@ def test_count_conceded_deduplicates_repeated_concessions() -> None:
     ]
 
     assert debate_graph._count_conceded(conceded) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Regime axis (Trend advocate vs Range advocate)
+# --------------------------------------------------------------------------- #
+def _regime_hint(regime: str = "TREND", direction: str = "UP", entry_style: str = "STOP_BREAKOUT") -> dict[str, Any]:
+    return {"regime": regime, "direction": direction, "confidence": 0.7, "entry_style": entry_style, "source": "rule_based"}
+
+
+def _regime_fake_llm(judge_payload: dict[str, Any], seen: dict[str, Any] | None = None):
+    def fake_llm(role: str, state: dict[str, Any]) -> dict[str, Any]:
+        if seen is not None:
+            seen.setdefault("axis", state.get("axis"))
+            seen.setdefault("regime_hint", state.get("regime_hint"))
+        if role in {"bull", "bear"}:
+            return {
+                "argument": f"{role} argument",
+                "confidence": 0.6,
+                "conceded_points": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        return {"judge_summary": judge_payload, "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+    return fake_llm
+
+
+def test_regime_axis_judge_trend_up_maps_to_bull_and_reports_regime_summary() -> None:
+    seen: dict[str, Any] = {}
+    judge = {
+        "agreements": ["ADX高い"],
+        "conflicts": [],
+        "regime": "TREND",
+        "regime_confidence": 0.72,
+        "direction_if_trend": "UP",
+        "entry_style": "LIMIT_PULLBACK",
+        "key_levels": {"continuation_confirms": 2325.0, "reversal_confirms": 2280.5},
+        "stronger_side": "trend",
+    }
+    report = run_debate_graph(
+        technical_report={"signal": "BUY", "trend": "UP"},
+        sentiment_report={"score": 0.1},
+        max_rounds=1,
+        llm_override=_regime_fake_llm(judge, seen),
+        axis="regime",
+        regime_hint=_regime_hint(),
+    )
+
+    assert seen["axis"] == "regime"
+    assert seen["regime_hint"]["regime"] == "TREND"
+    assert report["axis"] == "regime"
+    summary = report["regime_summary"]
+    assert summary["regime"] == "TREND"
+    assert summary["direction_if_trend"] == "UP"
+    assert summary["entry_style"] == "LIMIT_PULLBACK"
+    assert summary["regime_confidence"] == 0.72
+    assert summary["key_levels"] == {"continuation_confirms": 2325.0, "reversal_confirms": 2280.5}
+    assert summary["stronger_advocate"] == "trend"
+    assert summary["source"] == "judge"
+    assert "disagrees_with_rule" not in summary
+    # Downstream still reads the legacy field: TREND+UP is a bull verdict.
+    assert report["judge_summary"]["stronger_side"] == "bull"
+    assert report["judge_summary"]["regime_summary"]["regime"] == "TREND"
+
+
+def test_regime_axis_range_verdict_is_direction_neutral_with_fade_entry() -> None:
+    judge = {"agreements": [], "conflicts": ["ADX低下"], "regime": "range", "regime_confidence": 0.66, "stronger_side": "range"}
+    report = run_debate_graph(
+        technical_report={"signal": "SELL", "trend": "DOWN"},
+        sentiment_report={"score": -0.3},
+        max_rounds=1,
+        llm_override=_regime_fake_llm(judge),
+        axis="regime",
+        regime_hint=_regime_hint("RANGE", "NEUTRAL", "LIMIT_FADE"),
+    )
+    summary = report["regime_summary"]
+    assert summary["regime"] == "RANGE"
+    assert summary["entry_style"] == "LIMIT_FADE"  # default for RANGE when the judge omits it
+    assert summary["direction_if_trend"] == "NEUTRAL"
+    assert report["judge_summary"]["stronger_side"] == "neutral"
+    # The direction-axis contradiction check must not fire on the regime axis.
+    assert "テクニカル方向と議論結論が逆転" not in report["judge_summary"]["conflicts"]
+
+
+def test_regime_axis_trend_down_maps_to_bear_and_flags_disagreement_with_rule() -> None:
+    judge = {"agreements": [], "conflicts": ["ルール判定はRANGEだが戻り売りが続く"], "regime": "TREND", "direction_if_trend": "DOWN", "stronger_side": "trend"}
+    report = run_debate_graph(
+        technical_report={"signal": "SELL", "trend": "DOWN"},
+        sentiment_report={"score": 0.0},
+        max_rounds=1,
+        llm_override=_regime_fake_llm(judge),
+        axis="regime",
+        regime_hint=_regime_hint("RANGE", "NEUTRAL", "LIMIT_FADE"),
+    )
+    assert report["judge_summary"]["stronger_side"] == "bear"
+    assert report["regime_summary"]["disagrees_with_rule"] is True
+    assert report["regime_summary"]["entry_style"] == "LIMIT_PULLBACK"  # default for TREND when omitted
+
+
+def test_regime_axis_falls_back_to_rule_hint_when_judge_returns_no_regime() -> None:
+    legacy_judge = {"agreements": [], "conflicts": ["方向"], "stronger_side": "bear"}
+    report = run_debate_graph(
+        technical_report={"signal": "BUY", "trend": "UP"},
+        sentiment_report={"score": 0.1},
+        max_rounds=1,
+        llm_override=_regime_fake_llm(legacy_judge),
+        axis="regime",
+        regime_hint=_regime_hint("TREND", "UP", "STOP_BREAKOUT"),
+    )
+    summary = report["regime_summary"]
+    assert summary["source"] == "rule_based_fallback"
+    assert summary["regime"] == "TREND" and summary["direction_if_trend"] == "UP"
+    assert summary["entry_style"] == "STOP_BREAKOUT"
+    assert summary["regime_confidence"] == 0.5  # capped: the judge did not confirm it
+    assert summary["stronger_advocate"] == "neutral"
+    assert "judgeがレジームを返さなかったためルールベース判定で代替" in report["judge_summary"]["conflicts"]
+    # On the regime axis stronger_side follows the regime, not the judge's bull/bear word.
+    assert report["judge_summary"]["stronger_side"] == "bull"
+
+
+def test_regime_axis_without_hint_falls_back_to_transition_neutral() -> None:
+    report = run_debate_graph(
+        technical_report={"signal": "BUY"},
+        sentiment_report={"score": 0.1},
+        max_rounds=1,
+        llm_override=_regime_fake_llm({"agreements": [], "conflicts": [], "stronger_side": "neutral"}),
+        axis="regime",
+    )
+    assert report["regime_summary"]["regime"] == "TRANSITION"
+    assert report["regime_summary"]["entry_style"] == "NONE"
+    assert report["judge_summary"]["stronger_side"] == "neutral"
+
+
+def test_direction_axis_is_default_and_ignores_regime_keys_from_judge() -> None:
+    seen: dict[str, Any] = {}
+    judge = {"agreements": [], "conflicts": ["方向"], "stronger_side": "bear"}
+    report = run_debate_graph(
+        technical_report={"signal": "SELL", "trend": "DOWN"},
+        sentiment_report={"score": 0.0},
+        max_rounds=1,
+        llm_override=_regime_fake_llm(judge, seen),
+        regime_hint=_regime_hint(),
+    )
+    assert seen["axis"] == "direction"
+    assert report["axis"] == "direction"
+    assert report["regime_summary"] == {}
+    assert report["judge_summary"]["stronger_side"] == "bear"
+
+
+def test_run_debate_graph_uses_technical_report_regime_when_no_hint_passed() -> None:
+    seen: dict[str, Any] = {}
+    technical = {"signal": "BUY", "trend": "UP", "regime": _regime_hint("TREND", "UP")}
+    run_debate_graph(
+        technical_report=technical,
+        sentiment_report={"score": 0.1},
+        max_rounds=1,
+        llm_override=_regime_fake_llm({"agreements": [], "conflicts": [], "regime": "TREND", "direction_if_trend": "UP"}, seen),
+        axis="regime",
+    )
+    assert seen["regime_hint"]["regime"] == "TREND"
+
+
+def test_coerce_regime_summary_rejects_unknown_regime_and_clamps_confidence() -> None:
+    assert debate_graph._coerce_regime_summary({"regime": "SIDEWAYS"}) == {}
+    summary = debate_graph._coerce_regime_summary(
+        {"regime": "TREND", "regime_confidence": 1.7, "direction_if_trend": "sideways", "entry_style": "MARKET", "key_levels": {"continuation_confirms": "abc"}, "stronger_side": "bull"}
+    )
+    assert summary["regime_confidence"] == 1.0
+    assert summary["direction_if_trend"] == "NEUTRAL"
+    assert summary["entry_style"] == "LIMIT_PULLBACK"
+    assert summary["key_levels"] == {"continuation_confirms": None, "reversal_confirms": None}
+    assert summary["stronger_advocate"] == "neutral"
+    assert debate_graph._stronger_side_from_regime("TREND", "UP") == "bull"
+    assert debate_graph._stronger_side_from_regime("TREND", "DOWN") == "bear"
+    assert debate_graph._stronger_side_from_regime("TREND", "NEUTRAL") == "neutral"
+    assert debate_graph._stronger_side_from_regime("RANGE", "UP") == "neutral"
+
+
+def test_regime_axis_role_and_judge_prompts_use_trend_range_framing(monkeypatch) -> None:
+    captured: dict[str, dict[str, Any]] = {}
+
+    class _FakeResponse:
+        def __init__(self, content: str) -> None:
+            self.content = content
+            self.usage_metadata = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+    class _FakeChatOpenAI:
+        def __init__(self, model: str, temperature: float) -> None:
+            _ = (model, temperature)
+
+        def invoke(self, messages: list[Any]) -> _FakeResponse:
+            system = str(getattr(messages[0], "content", "") or "")
+            payload = json.loads(str(getattr(messages[1], "content", "{}") or "{}"))
+            key = payload.get("self_role") or ("judge" if "axis" in payload else "unknown")
+            captured[str(key)] = {"system": system, "payload": payload}
+            if key == "judge":
+                return _FakeResponse('{"agreements":[],"conflicts":[],"regime":"RANGE","regime_confidence":0.6,"entry_style":"LIMIT_FADE","stronger_side":"range"}')
+            return _FakeResponse('{"argument":"ok","confidence":0.6,"conceded_points":[]}')
+
+    monkeypatch.setattr(debate_graph, "ChatOpenAI", _FakeChatOpenAI)
+
+    state = _base_debate_state_with_levels({"supports": [], "resistances": []})
+    state["axis"] = "regime"
+    state["regime_hint"] = _regime_hint("RANGE", "NEUTRAL", "LIMIT_FADE")
+    state["bull_arguments"] = ["Trend側の主張サンプル"]
+    state["bear_arguments"] = ["Range側の主張サンプル"]
+
+    debate_graph._invoke_role_llm("bull", state)
+    debate_graph._invoke_role_llm("bear", state)
+    judge = debate_graph._invoke_judge_llm(state)
+
+    assert captured["Trend"]["system"] == debate_graph.TREND_SYSTEM_PROMPT
+    assert captured["Trend"]["payload"]["regime_hint"]["regime"] == "RANGE"
+    assert "--- 相手(Range)の主張ここから ---" in captured["Trend"]["payload"]["opponent_argument_context"]
+    assert captured["Range"]["system"] == debate_graph.RANGE_SYSTEM_PROMPT
+    assert "--- 相手(Trend)の主張ここから ---" in captured["Range"]["payload"]["opponent_argument_context"]
+    assert captured["judge"]["system"] == debate_graph.REGIME_JUDGE_SYSTEM_PROMPT
+    assert captured["judge"]["payload"]["axis"] == "regime"
+    assert captured["judge"]["payload"]["trend_arguments"] == ["Trend側の主張サンプル"]
+    assert captured["judge"]["payload"]["range_arguments"] == ["Range側の主張サンプル"]
+    assert "bull_arguments" not in captured["judge"]["payload"]
+    assert judge["ok"] is True
+    assert judge["judge_summary"]["regime_summary"]["regime"] == "RANGE"
+    assert "TREND" in debate_graph.TREND_SYSTEM_PROMPT or "トレンド継続" in debate_graph.TREND_SYSTEM_PROMPT
+    assert "逆張り" in debate_graph.RANGE_SYSTEM_PROMPT

@@ -29,7 +29,13 @@ SYSTEM_PROMPT = (
     "壁への到達は高値が上壁以上、安値が下壁以下になった時点で成立し、先に成立した側が正解になります。"
     "技術・センチメント・マクロの各レポートは参考情報であり、そのまま添付されています。"
     "確率は正直に。過去の同様の局面で実際に起きた頻度として答えること。"
-    "自信がなければ1/3ずつに近づけてよい。断定的な言葉で確率を偏らせないこと。"
+    "task.reference_base_ratesには、このタスク(同じ壁・同じ期限)で直近に実際に起きたUP/DOWN/TIMEOUTの頻度が入っている。"
+    "これが出発点である。ここから動かす具体的な理由(今この局面が過去平均と違う点)がない限り基準率に近い値を返し、"
+    "動かす場合はその理由をkey_reasonに書くこと。"
+    "『D1が下向き』『センチメントが弱気』のような材料の羅列は、それ自体では基準率から動かす理由にならない。"
+    "task.regime(ルールベースのレジーム判定)がRANGEなら壁到達より反転・TIMEOUTが起きやすく、"
+    "TRENDなら継続方向の壁到達が起きやすい、という前提で頻度を見積もること。"
+    "自信がなければ基準率をそのまま返してよい。断定的な言葉で確率を偏らせないこと。"
     "出力は次のキーだけを持つJSONのみ: "
     "{\"p_up\": float, \"p_down\": float, \"p_timeout\": float, \"key_reason\": str}。"
     "3つの確率の合計は1.0にすること。key_reasonは最も重要な根拠を日本語で1〜2文。"
@@ -92,6 +98,8 @@ def build_forecast_payload(
     sentiment_report: dict[str, Any],
     macro_report: dict[str, Any],
     debate_report: dict[str, Any] | None = None,
+    reference_base_rates: dict[str, float] | None = None,
+    regime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The exact user payload handed to the LLM (also archived per forecast)."""
     task = {
@@ -111,6 +119,10 @@ def build_forecast_payload(
             f"どちらも起きなければTIMEOUT。"
         ),
     }
+    if reference_base_rates:
+        task["reference_base_rates"] = {k: round(float(v), 3) for k, v in reference_base_rates.items()}
+    if isinstance(regime, dict) and regime:
+        task["regime"] = {k: regime.get(k) for k in ("regime", "direction", "confidence", "entry_style", "evidence") if k in regime}
     payload: dict[str, Any] = {
         "task": task,
         "technical": technical_report,

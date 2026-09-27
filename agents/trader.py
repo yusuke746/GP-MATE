@@ -58,6 +58,14 @@ SYSTEM_PROMPT = (
     "suggested_tpと最終SLの比がMIN_RISK_REWARD_RATIO(既定1.5)を下回る注文はシステムが発注しない。"
     "抵抗が近く損切り幅が取れない局面では、TPを遠ざけるのではなく、"
     "より有利な価格の押し目/戻りをpending_ordersに置くか、pending_ordersを空にすること。"
+    "【レジーム】technical.regime(ルールベース)と、存在すればjudge_summary.regime_summary(討論の裁定)が"
+    "現在の相場をTREND/RANGE/TRANSITIONで示す。方向(上か下か)より先に、この局面の種類に注文タイプを合わせること。"
+    "TREND: direction_if_trendの方向のみ。entry_styleがLIMIT_PULLBACKなら押し目/戻りのLIMIT、"
+    "STOP_BREAKOUTならkey_levels.continuation_confirmsの外側にSTOP。逆張りのpending_ordersは置かない。"
+    "RANGE(entry_style=LIMIT_FADE): 帯の端でのLIMIT(支持で買い/抵抗で売り)のみ。TPは帯の反対側の手前。ブレイク追随のSTOPは置かない。"
+    "TRANSITION(または判定が食い違う場合): 新規エントリーとpending_ordersは見送り、"
+    "trigger_conditionsに『どちらに決着したら何をするか』を書くこと。"
+    "judge_summary.regime_summaryとtechnical.regimeが食い違う場合は、根拠が具体的な方を採用し、reasoningに理由を書くこと。"
 )
 
 PENDING_ORDER_TYPES = ("BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT")
