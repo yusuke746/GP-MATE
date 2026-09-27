@@ -30,6 +30,7 @@ from agents.technical import analyze_technical, calc_extension_atr
 from analysis.forecast_labels import resolve_outcome
 from analysis.forecast_store import append_forecast, read_forecasts, save_inputs, write_forecasts
 from config import (
+    FORECAST_DEBATE_AXIS,
     FORECAST_HORIZONS,
     FORECAST_K_DOWN,
     FORECAST_K_UP,
@@ -44,6 +45,7 @@ from data import mt5_client
 from data.mt5_client import get_rates
 from data.news_client import fetch_news_with_meta
 from indicators.horizontal_levels import build_horizontal_levels
+from indicators.regime import classify_regime
 from indicators.ta_calc import add_indicators
 
 LOGGER = logging.getLogger(__name__)
@@ -139,6 +141,8 @@ def build_reports(frames: dict[str, pd.DataFrame], use_debate: bool = FORECAST_U
     if release_items:
         news_items = release_items + list(news_items)
     technical_report = analyze_technical({"direction_context": direction_context, "tp_reference_only": tp_reference_only})
+    if isinstance(technical_report, dict):
+        technical_report["regime"] = classify_regime(technical_report)
     sentiment_report = analyze_sentiment(news_items)
     if isinstance(sentiment_report, dict):
         sentiment_report["feed_meta"] = feed_meta
@@ -147,7 +151,13 @@ def build_reports(frames: dict[str, pd.DataFrame], use_debate: bool = FORECAST_U
     if use_debate:
         from agents.debate_graph import run_debate_graph  # optional, heavier
 
-        debate_report = run_debate_graph(technical_report, sentiment_report, macro_report)
+        debate_report = run_debate_graph(
+            technical_report,
+            sentiment_report,
+            macro_report,
+            axis=FORECAST_DEBATE_AXIS,
+            regime_hint=technical_report.get("regime") if isinstance(technical_report, dict) else None,
+        )
 
     return {
         "technical": technical_report,
@@ -210,6 +220,31 @@ def _sum_usage(*reports: Any) -> dict[str, int]:
     return total
 
 
+REFERENCE_BASE_RATE_MIN_ROWS = 30
+REFERENCE_BASE_RATE_WINDOW = 240
+
+
+def reference_base_rates(rows: list[dict[str, Any]], horizon: int) -> dict[str, float] | None:
+    """Realised UP/DOWN/TIMEOUT frequencies of the most recent resolved forecasts
+    with this horizon (the anchor handed to the forecaster). None until enough
+    rows exist so the first days run without an anchor rather than a noisy one."""
+    resolved = [
+        r for r in rows
+        if r.get("outcome") in ("UP", "DOWN", "TIMEOUT") and int(r.get("horizon_bars") or 0) == int(horizon)
+    ]
+    resolved.sort(key=lambda r: str(r.get("ts_utc", "")))
+    window = resolved[-REFERENCE_BASE_RATE_WINDOW:]
+    if len(window) < REFERENCE_BASE_RATE_MIN_ROWS:
+        return None
+    total = len(window)
+    return {
+        "p_up": sum(1 for r in window if r["outcome"] == "UP") / total,
+        "p_down": sum(1 for r in window if r["outcome"] == "DOWN") / total,
+        "p_timeout": sum(1 for r in window if r["outcome"] == "TIMEOUT") / total,
+        "n": total,
+    }
+
+
 def _existing_keys(rows: list[dict[str, Any]]) -> set[tuple[str, int]]:
     keys: set[tuple[str, int]] = set()
     for row in rows:
@@ -260,7 +295,8 @@ def run_once(
             summary["error"] = f"invalid p0/atr ({p0}, {atr})"
             return summary
 
-        existing = _existing_keys(read_forecasts())
+        previous_rows = read_forecasts()
+        existing = _existing_keys(previous_rows)
         pending_horizons = [h for h in horizons if (bar_time.isoformat(), int(h)) not in existing]
         if not pending_horizons:
             summary.update(ok=True, skipped="already_logged")
@@ -293,6 +329,8 @@ def run_once(
             sentiment_report=reports["sentiment"],
             macro_report=reports["macro"],
             debate_report=reports["debate"],
+            reference_base_rates=reference_base_rates(previous_rows, int(horizon)),
+            regime=reports["technical"].get("regime") if isinstance(reports["technical"], dict) else None,
         )
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         input_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
@@ -333,6 +371,9 @@ def run_once(
             "invalid_reason": result.get("invalid_reason", ""),
             "model": result.get("model", model),
             "used_debate": bool(use_debate),
+            "debate_axis": FORECAST_DEBATE_AXIS if use_debate else "",
+            "regime": (reports["technical"].get("regime") or {}).get("regime", "") if isinstance(reports["technical"], dict) else "",
+            "reference_base_rates": payload["task"].get("reference_base_rates"),
             "key_reason": result.get("key_reason", ""),
             "inputs_path": inputs_path,
             "input_hash": input_hash,

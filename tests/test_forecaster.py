@@ -96,3 +96,31 @@ def test_build_forecast_payload_states_task_numerically() -> None:
     assert "6本" in task["question"] and "4384.77" in task["question"]
     assert "debate" not in payload
     assert payload["technical"] == {"signal": "SELL"}
+
+
+def test_build_forecast_payload_anchors_on_reference_base_rates_and_regime() -> None:
+    regime = {"regime": "RANGE", "direction": "NEUTRAL", "confidence": 0.8, "entry_style": "LIMIT_FADE", "evidence": ["H4 ADX 14.0"], "score": -1, "h4_adx": 14.0}
+    payload = forecaster.build_forecast_payload(
+        symbol="GOLD#", bar_time_utc="2026-09-09T13:00:00+00:00", ts_utc="2026-09-09T14:00:00+00:00",
+        p0=4363.5, atr_h1=21.27, k_up=1.0, k_down=1.0, horizon_bars=6,
+        barrier_up=4384.77, barrier_down=4342.23,
+        technical_report={"signal": "SELL"}, sentiment_report={"score": -0.6}, macro_report={"macro_bias": "NEUTRAL"},
+        reference_base_rates={"p_up": 0.33333, "p_down": 0.41667, "p_timeout": 0.25, "n": 120},
+        regime=regime,
+    )
+    task = payload["task"]
+    assert task["reference_base_rates"] == {"p_up": 0.333, "p_down": 0.417, "p_timeout": 0.25, "n": 120}
+    assert task["regime"] == {"regime": "RANGE", "direction": "NEUTRAL", "confidence": 0.8, "entry_style": "LIMIT_FADE", "evidence": ["H4 ADX 14.0"]}
+    assert "score" not in task["regime"]
+    assert "reference_base_rates" in forecaster.SYSTEM_PROMPT and "基準率" in forecaster.SYSTEM_PROMPT
+    assert "task.regime" in forecaster.SYSTEM_PROMPT
+
+
+def test_build_forecast_payload_omits_anchor_and_regime_when_absent() -> None:
+    payload = forecaster.build_forecast_payload(
+        symbol="GOLD#", bar_time_utc="b", ts_utc="t", p0=1.0, atr_h1=1.0, k_up=1.0, k_down=1.0, horizon_bars=6,
+        barrier_up=2.0, barrier_down=0.0, technical_report={}, sentiment_report={}, macro_report={},
+        reference_base_rates=None, regime={},
+    )
+    assert "reference_base_rates" not in payload["task"]
+    assert "regime" not in payload["task"]

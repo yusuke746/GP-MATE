@@ -217,14 +217,81 @@ def test_build_reports_uses_confirmed_frames_and_optional_debate(monkeypatch) ->
 
     import agents.debate_graph as dg
 
-    monkeypatch.setattr(dg, "run_debate_graph", lambda t, s, m: debate_calls.append((t, s, m)) or {"judge_summary": {"stronger_side": "bear"}})
+    monkeypatch.setattr(dg, "run_debate_graph", lambda t, s, m, **kwargs: debate_calls.append((t, s, m, kwargs)) or {"judge_summary": {"stronger_side": "bear"}})
 
     reports = fp.build_reports(frames, use_debate=False)
-    assert reports["technical"] == {"signal": "SELL"} and reports["debate"] is None
+    assert reports["technical"]["signal"] == "SELL" and reports["debate"] is None
+    # The rule-based regime read rides on the technical report (ADX 20 on every frame -> not a trend).
+    assert reports["technical"]["regime"]["source"] == "rule_based"
+    assert reports["technical"]["regime"]["regime"] in {"RANGE", "TRANSITION"}
     assert reports["sentiment"]["feed_meta"]["feeds_live"] == 4
     assert captured["technical"]["direction_context"]["h1"]["close"] == 4363.0  # confirmed close
     assert debate_calls == []
 
+    monkeypatch.setattr(fp, "FORECAST_DEBATE_AXIS", "regime")
     reports = fp.build_reports(frames, use_debate=True)
     assert reports["debate"]["judge_summary"]["stronger_side"] == "bear"
     assert len(debate_calls) == 1
+    _, _, _, kwargs = debate_calls[0]
+    assert kwargs["axis"] == "regime"
+    assert kwargs["regime_hint"] == reports["technical"]["regime"]
+
+
+def _resolved_row(i: int, outcome: str, horizon: int = 6) -> dict:
+    return {"ts_utc": f"2026-09-{1 + i // 24:02d}T{i % 24:02d}:00:00+00:00", "outcome": outcome, "horizon_bars": horizon}
+
+
+def test_reference_base_rates_requires_enough_resolved_rows_of_same_horizon() -> None:
+    rows = [_resolved_row(i, "UP") for i in range(fp.REFERENCE_BASE_RATE_MIN_ROWS - 1)]
+    assert fp.reference_base_rates(rows, 6) is None
+    rows.append(_resolved_row(99, "DOWN", horizon=12))  # other horizon does not count
+    rows.append(_resolved_row(98, None))  # unresolved does not count
+    rows.append(_resolved_row(97, "AMBIGUOUS"))
+    assert fp.reference_base_rates(rows, 6) is None
+    rows.append(_resolved_row(96, "TIMEOUT"))
+    rates = fp.reference_base_rates(rows, 6)
+    assert rates["n"] == fp.REFERENCE_BASE_RATE_MIN_ROWS
+    assert abs(rates["p_up"] + rates["p_down"] + rates["p_timeout"] - 1.0) < 1e-9
+    assert rates["p_down"] == 0.0 and rates["p_timeout"] == 1 / fp.REFERENCE_BASE_RATE_MIN_ROWS
+
+
+def test_reference_base_rates_uses_most_recent_window_only() -> None:
+    old = [_resolved_row(i, "UP") for i in range(100)]
+    recent = [_resolved_row(100 + i, "DOWN") for i in range(fp.REFERENCE_BASE_RATE_WINDOW)]
+    rates = fp.reference_base_rates(recent + old, 6)  # unsorted on purpose
+    assert rates["n"] == fp.REFERENCE_BASE_RATE_WINDOW
+    assert rates["p_down"] == 1.0 and rates["p_up"] == 0.0
+
+
+def test_run_once_records_anchor_regime_and_axis(tmp_path, monkeypatch) -> None:
+    _patch_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        fp,
+        "build_reports",
+        lambda frames, use_debate=False: {
+            "technical": {"signal": "SELL", "regime": {"regime": "RANGE", "direction": "NEUTRAL", "confidence": 0.8, "entry_style": "LIMIT_FADE", "evidence": []}},
+            "sentiment": {"score": -0.6},
+            "macro": {"macro_bias": "NEUTRAL"},
+            "debate": {"axis": "regime", "regime_summary": {"regime": "RANGE"}, "judge_summary": {"stronger_side": "neutral"}} if use_debate else None,
+            "news_count": 3,
+        },
+    )
+    seed = [{**_resolved_row(i, "TIMEOUT" if i % 2 else "UP"), "bar_time_utc": f"seed{i}"} for i in range(40)]
+    forecast_store.write_forecasts(seed)
+    client = _forecaster_client()
+
+    fp.run_once(NOW, client=client, horizons=(6,), use_debate=False)
+    row = [r for r in forecast_store.read_forecasts() if r.get("forecast_id")][0]
+    assert row["reference_base_rates"] == {"p_up": 0.5, "p_down": 0.0, "p_timeout": 0.5, "n": 40}
+    assert row["regime"] == "RANGE" and row["debate_axis"] == "" and row["used_debate"] is False
+    sent = json.loads(client.call_json.call_args.kwargs["user_prompt"])
+    assert sent["task"]["reference_base_rates"]["p_up"] == 0.5
+    assert sent["task"]["regime"]["regime"] == "RANGE"
+    assert "debate" not in sent
+
+    monkeypatch.setattr(fp, "FORECAST_DEBATE_AXIS", "regime")
+    fp.run_once(NOW + timedelta(hours=1), client=client, horizons=(6,), use_debate=True)
+    latest = [r for r in forecast_store.read_forecasts() if r.get("forecast_id")][-1]
+    assert latest["used_debate"] is True and latest["debate_axis"] == "regime"
+    sent = json.loads(client.call_json.call_args.kwargs["user_prompt"])
+    assert sent["debate"]["regime_summary"]["regime"] == "RANGE"
