@@ -64,3 +64,36 @@ def test_normalize_sentiment_payload_defaults_to_neutral_without_data() -> None:
     assert normalized["score"] == 0.0
     assert normalized["dominant_news"] == "N/A"
     assert normalized["reasoning"].strip() != ""
+
+
+def test_sentiment_uses_analysts_bias_and_regime_view() -> None:
+    import json
+
+    payload = {
+        "gold_bias": "bearish",
+        "regime_view": "SUPPORTS_REVERSAL",
+        "new_information": ["FRB高官がインフレ再加速を警告"],
+        "price_echo_count": "3",
+        "dominant_news": "Fed official warns",
+        "reasoning": "利下げ期待の後退。",
+    }
+    client = _fake_client_returning(payload)
+    with patch("agents.sentiment.get_default_client", return_value=client):
+        result = analyze_sentiment([{"title": "n1"}, {"title": "Gold storms higher"}])
+
+    assert result["gold_bias"] == "BEARISH"
+    assert result["score"] == -0.5  # compatibility number derived from the stated bias
+    assert result["regime_view"] == "SUPPORTS_REVERSAL"
+    assert result["new_information"] == ["FRB高官がインフレ再加速を警告"]
+    assert result["price_echo_count"] == 3
+    assert result["news_count"] == 2 and result["evidence_status"] == "SUFFICIENT"
+    system = client.call_json.call_args.kwargs["system_prompt"]
+    assert "±0.3" not in system and "必ず" not in system
+    assert "新しい情報" in system
+
+
+def test_sentiment_bias_is_derived_from_score_when_only_score_given() -> None:
+    assert _normalize_sentiment_payload({"score": 0.4})["gold_bias"] == "BULLISH"
+    assert _normalize_sentiment_payload({"score": -0.05})["gold_bias"] == "NEUTRAL"
+    normalized = _normalize_sentiment_payload({"regime_view": "nonsense", "new_information": "not a list"})
+    assert normalized["regime_view"] == "UNCLEAR" and normalized["new_information"] == []

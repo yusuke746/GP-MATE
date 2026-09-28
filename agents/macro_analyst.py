@@ -1,3 +1,14 @@
+"""Macro analyst: reads the macro inputs and gives its own view.
+
+Earlier versions scored the series with a fixed weight table, told the model
+the answer ("rule_based_baseline") and then discarded the model's bias if it
+disagreed. That made the "analyst" an if-statement with a narrator. Now the
+model is handed the data with provenance notes only (what each series is, how
+fresh it is) and asked what it thinks. Nothing in code re-decides the bias.
+The only intervention is fail-safe: if the model does not answer, the report
+is NEUTRAL and marked as such.
+"""
+
 from __future__ import annotations
 
 import json
@@ -6,7 +17,6 @@ from typing import Any, Final, Literal, TypedDict
 
 from agents.base import analysis_model, get_default_client
 from agents.data.fred_client import MacroData
-from config import MACRO_LLM_CONF_MAX_DOWNSHIFT
 
 LOGGER = logging.getLogger(__name__)
 
@@ -15,33 +25,40 @@ MACRO_BIAS_VALUES: Final[tuple[Literal["BULLISH", "BEARISH", "NEUTRAL"], ...]] =
     "BEARISH",
     "NEUTRAL",
 )
+REGIME_VIEW_VALUES: Final[tuple[str, ...]] = ("SUPPORTS_CONTINUATION", "SUPPORTS_REVERSAL", "UNCLEAR")
 
 SYSTEM_PROMPT = (
-    "あなたはGOLDのマクロ環境を評価する分析官です。"
-    "与えられたmacro_data(金利・ドル・期待インフレ・投機ポジション・経済指標の結果)だけを根拠に、"
-    "macro_bias/confidence/key_drivers/reasoningをJSONで返してください。"
-    "【ドル】主軸はmacro_data.dxyの方向です。sourceがmt5:*なら日次で遅延のないドル指数(ICE-DXY相当)、"
-    "fred:DTWEXBGSなら約1週間遅れの広義ドル指数です。いずれも絶対値ではなく方向で判断し、"
-    "ドル安(DOWN)は金にポジティブ、ドル高(UP)は金にネガティブです。"
-    "【時間軸】各系列にはchange_30d(トレンド)とchange_5d(直近)があります。両者が逆向きなら"
-    "『トレンドは継続中だが直近は転換の兆し』として確信度を下げ、reasoningに明記してください。"
-    "【金利】us2y(2年債利回り)は市場が織り込む政策金利期待の日次プロキシで、fed_funds(月次)より重視すること。"
-    "us2yの低下は利下げ期待=金にポジティブ、上昇はネガティブです。"
-    "実質金利(real_rate)は2025-2026年に金との逆相関が崩れているため補助情報に留めてください。"
-    "期待インフレ(breakeven)の上昇はインフレヘッジ需要として金にポジティブです。"
-    "【ポジション】positioning.cotは投機筋(managed money)の建玉です。crowding=CROWDED_LONGは"
-    "買いが過密で反転リスク(利益確定売り)が高い、CROWDED_SHORTは踏み上げ余地がある、と読みます。"
-    "positioning.gldはSPDR金ETFの保有量で、増加は実需流入(ポジティブ)、減少は流出(ネガティブ)です。"
-    "【指標】recent_releasesは直近の高インパクト米指標で、actual/forecast/surpriseが入ります。"
-    "surpriseの符号と大きさを最優先の『新情報』として扱い、first_order_readは一次的な読みに過ぎないので"
-    "現在のレジーム(例: 弱いデータで利下げ期待が高まり金が買われる)に照らして解釈してください。"
-    "upcoming_eventsは今後24時間の予定で、直前なら方向感を強く出さない理由になります。"
-    "絶対に例外を投げず、安全側の判断を優先してください。"
-    "confidenceはルールベースの暫定値を上限とし、下げる理由(直近指標サプライズ、イベント直前、"
-    "時間軸の逆行など)がある場合のみ低い値を返すこと。上げる理由はreasoningに書くだけでよい。"
+    "あなたはGOLD(XAU/USD)のマクロ環境を評価する分析官です。"
+    "与えられたmacro_dataだけを材料に、あなた自身の判断で、いまのマクロ環境が金価格にとって"
+    "強気(BULLISH)・弱気(BEARISH)・中立(NEUTRAL)のどれかを述べてください。"
+    "系列ごとの採点表や『この方向ならこう読む』という固定の規則はありません。あなたの読みがそのまま採用されます。"
+    "教科書的な関係(ドル・金利・期待インフレ・ポジション)が現在も成り立っているかどうかも、"
+    "与えられた数値から自分で判断してください。成り立っていないと考える根拠があればそう書いてよい。"
+    "あわせて、マクロ要因はいまの価格トレンドの継続を支えるか(SUPPORTS_CONTINUATION)、"
+    "反転を促すか(SUPPORTS_REVERSAL)、どちらとも言えないか(UNCLEAR)を答え、"
+    "その読みが崩れる条件(invalidation: 例『次回CPIが予想を上回る』『ドル指数が◯◯を上抜く』)を1つ書いてください。"
+    "材料が乏しい、または互いに打ち消し合うときはNEUTRAL/UNCLEARでよく、無理に方向を出さないこと。"
+    "確信度の数値は求めません。強い読みなら、その根拠となる系列名と数値をkey_driversに具体的に列挙してください。"
+    "出力は次のキーだけを持つJSON: "
+    "{macro_bias: 'BULLISH'|'BEARISH'|'NEUTRAL', regime_view: 'SUPPORTS_CONTINUATION'|'SUPPORTS_REVERSAL'|'UNCLEAR', "
+    "key_drivers: string[], invalidation: string, reasoning: string(日本語)}"
 )
 
-FALLBACK_REASONING = "FREDまたはLLMの利用に失敗したため、安全側で中立判定。"
+# Provenance only: what each field is and how fresh it is. No "this means gold up".
+DATA_NOTES: Final[dict[str, str]] = {
+    "dxy": "ドル指数。source が mt5:* なら日次で遅延なし(ICE-DXY相当の先物/合成)、fred:DTWEXBGS なら約1週間遅れの広義ドル指数。direction は30日変化の符号、direction_5d は5日変化の符号。",
+    "us2y": "米2年債利回り(日次)。change_30d / change_5d は同期間の変化幅(pt)。",
+    "us10y": "米10年債利回り(日次)。",
+    "fed_funds": "実効FF金利(月次)。",
+    "real_rate": "10年TIPS実質利回り(日次)。",
+    "breakeven": "10年ブレークイーブン期待インフレ率(日次)。",
+    "positioning.cot": "CFTC COT の managed money ネットポジション。net_percentile_window は直近ウィンドウ内の百分位、crowding はその百分位から機械的に付けたラベル(CROWDED_LONG / CROWDED_SHORT / NORMAL)。",
+    "positioning.gld": "SPDR Gold Shares の保有量(unit 参照)。change_5d は5日変化。任意項目で、無い場合もある。",
+    "recent_releases": "直近48時間の高インパクト米指標。actual / forecast / previous / surprise(actual-forecast)。actual_source が fred:* なら FRED の系列から補完した実績値。",
+    "upcoming_events": "今後24時間の高インパクト予定と hours_ahead。",
+}
+
+FALLBACK_REASONING = "マクロ分析官が回答しなかったため、安全側で中立扱い。"
 
 
 class MacroAnalysisMeta(TypedDict):
@@ -51,338 +68,79 @@ class MacroAnalysisMeta(TypedDict):
     error: str
 
 
-class MacroAnalysisResult(TypedDict):
+class MacroAnalysisResult(TypedDict, total=False):
     macro_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"]
-    confidence: float
+    regime_view: str
     key_drivers: list[str]
+    invalidation: str
     reasoning: str
+    source: str
     _meta: MacroAnalysisMeta
 
 
 def _empty_usage() -> dict[str, int]:
-    return {
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-    }
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
-def _clamp_confidence(value: float) -> float:
-    return max(0.0, min(1.0, value))
-
-
-def _normalize_bias(value: Any) -> Literal["BULLISH", "BEARISH", "NEUTRAL"]:
-    text = str(value or "").upper()
+def _normalize_bias(value: Any) -> Literal["BULLISH", "BEARISH", "NEUTRAL"] | None:
+    text = str(value or "").upper().strip()
     if text in {"BULLISH", "BEARISH", "NEUTRAL"}:
         return text  # type: ignore[return-value]
-    return "NEUTRAL"
+    return None
 
 
-def _direction_text(value: str) -> str:
-    return {"UP": "上昇", "DOWN": "下落", "FLAT": "横ばい"}.get(value, "不明")
+def _normalize_regime_view(value: Any) -> str:
+    text = str(value or "").upper().strip()
+    return text if text in REGIME_VIEW_VALUES else "UNCLEAR"
 
 
-def _is_positive_direction(value: str) -> bool:
-    return value == "DOWN"
-
-
-def _is_negative_direction(value: str) -> bool:
-    return value == "UP"
-
-
-DXY_WEIGHT: Final[float] = 0.60
-RATES_WEIGHT: Final[float] = 0.18
-BREAKEVEN_WEIGHT: Final[float] = 0.12
-# A 5-day move against the 30-day trend takes back part of the trend score
-# (turning-point warning); a confirming 5-day move adds a little conviction.
-SHORT_TERM_CONFLICT_FRACTION: Final[float] = 0.5
-SHORT_TERM_CONFIRM_BONUS: Final[float] = 0.08
-POSITIONING_WEIGHT: Final[float] = 0.10
-GLD_FLOW_WEIGHT: Final[float] = 0.08
-
-
-def _dir(block: Any, key: str = "direction") -> str:
-    if not isinstance(block, dict):
-        return "FLAT"
-    return str(block.get(key, "FLAT") or "FLAT").upper()
-
-
-def _trend_with_short_term(
-    block: Any,
-    weight: float,
-    positive_when: str,
-    label: str,
-    key_drivers: list[str],
-) -> float:
-    """Score one series: 30d direction carries ``weight``; the 5d direction
-    either confirms (small bonus) or conflicts (claws back half)."""
-    trend = _dir(block, "direction")
-    short = _dir(block, "direction_5d")
-    negative_when = "UP" if positive_when == "DOWN" else "DOWN"
-    if trend == positive_when:
-        score = weight
-        note = f"{label}は30日で金に追い風の方向"
-    elif trend == negative_when:
-        score = -weight
-        note = f"{label}は30日で金に逆風の方向"
-    else:
-        key_drivers.append(f"{label}は30日で横ばい")
-        return 0.0
-
-    if short != "FLAT" and short != trend:
-        score *= 1.0 - SHORT_TERM_CONFLICT_FRACTION
-        note += "だが直近5日は逆行(転換の兆し、確信度を下げる)"
-    elif short == trend:
-        score += SHORT_TERM_CONFIRM_BONUS if score > 0 else -SHORT_TERM_CONFIRM_BONUS
-        note += "で直近5日も同方向(継続を確認)"
-    key_drivers.append(note)
-    return score
-
-
-def _score_positioning(positioning: Any, key_drivers: list[str]) -> float:
-    if not isinstance(positioning, dict):
-        return 0.0
-    score = 0.0
-    cot = positioning.get("cot")
-    if isinstance(cot, dict) and bool(cot.get("_meta", {}).get("ok")):
-        crowding = str(cot.get("crowding", "NORMAL"))
-        pct = cot.get("net_percentile_window")
-        if crowding == "CROWDED_LONG":
-            score -= POSITIONING_WEIGHT
-            key_drivers.append(f"COT: 投機筋の買いが過密(ネットロング百分位{pct})、利益確定売りの反転リスク")
-        elif crowding == "CROWDED_SHORT":
-            score += POSITIONING_WEIGHT
-            key_drivers.append(f"COT: 投機筋の買いが薄い(百分位{pct})、踏み上げ余地")
-        else:
-            key_drivers.append(f"COT: 投機筋ポジションは中立圏(百分位{pct})")
-    gld = positioning.get("gld")
-    if isinstance(gld, dict) and bool(gld.get("_meta", {}).get("ok")):
-        direction = str(gld.get("direction_5d", "FLAT"))
-        if direction == "UP":
-            score += GLD_FLOW_WEIGHT
-            key_drivers.append(f"GLD保有量が5日で増加({gld.get('change_5d')}{gld.get('unit', 't')})、ETF資金流入")
-        elif direction == "DOWN":
-            score -= GLD_FLOW_WEIGHT
-            key_drivers.append(f"GLD保有量が5日で減少({gld.get('change_5d')}{gld.get('unit', 't')})、ETF資金流出")
-        else:
-            key_drivers.append("GLD保有量は5日で横ばい")
-    return score
-
-
-def _describe_releases(macro_data: Any, key_drivers: list[str]) -> None:
-    releases = macro_data.get("recent_releases") if isinstance(macro_data, dict) else None
-    if isinstance(releases, list):
-        for release in releases[:4]:
-            if not isinstance(release, dict) or release.get("actual") is None:
-                continue
-            unit = release.get("unit") or ""
-            key_drivers.append(
-                f"指標 {release.get('title')}: 結果{release.get('actual')}{unit} "
-                f"予想{release.get('forecast')}{unit} (サプライズ{release.get('surprise')})"
-            )
-    upcoming = macro_data.get("upcoming_events") if isinstance(macro_data, dict) else None
-    if isinstance(upcoming, list) and upcoming:
-        first = upcoming[0]
-        if isinstance(first, dict):
-            key_drivers.append(f"予定: {first.get('title')} まで{first.get('hours_ahead')}時間")
-
-
-def _score_macro_environment(fred_data: MacroData) -> tuple[Literal["BULLISH", "BEARISH", "NEUTRAL"], float, list[str], str]:
-    dxy = fred_data.get("dxy", {})
-    fed_funds = fred_data.get("fed_funds", {})
-    us2y = fred_data.get("us2y", {})
-    breakeven = fred_data.get("breakeven", {})
-    real_rate = fred_data.get("real_rate", {})
-
-    dxy_direction = _dir(dxy)
-    fed_direction = _dir(fed_funds)
-    breakeven_direction = _dir(breakeven)
-    real_rate_direction = _dir(real_rate)
-
-    score = 0.0
-    key_drivers: list[str] = []
-
-    dxy_label = "ドル指数" + ("(MT5日次)" if str(dxy.get("source", "")).startswith("mt5") else "(DTWEXBGS)")
-    score += _trend_with_short_term(dxy, DXY_WEIGHT, positive_when="DOWN", label=dxy_label, key_drivers=key_drivers)
-    if dxy_direction == "DOWN":
-        key_drivers.append("ドル安で金に追い風")
-    elif dxy_direction == "UP":
-        key_drivers.append("ドル高で金に逆風")
-
-    # Policy-rate expectations: daily 2y yield when present, monthly fed funds otherwise.
-    if isinstance(us2y, dict) and us2y.get("value") is not None:
-        score += _trend_with_short_term(us2y, RATES_WEIGHT, positive_when="DOWN", label="2年債利回り(利下げ期待)", key_drivers=key_drivers)
-        if fed_direction == "DOWN":
-            key_drivers.append("FEDFUNDS(月次)も低下方向")
-        elif fed_direction == "UP":
-            key_drivers.append("FEDFUNDS(月次)は上昇方向")
-    elif fed_direction == "DOWN":
-        score += RATES_WEIGHT
-        key_drivers.append("FEDFUNDSが低下方向で、利下げ期待が金に追い風")
-    elif fed_direction == "UP":
-        score -= RATES_WEIGHT
-        key_drivers.append("FEDFUNDSが上昇方向で、引き締め継続が金に逆風")
-    else:
-        key_drivers.append("FEDFUNDSは横ばいで、政策金利要因は中立寄り")
-
-    if breakeven_direction == "UP":
-        score += BREAKEVEN_WEIGHT
-        key_drivers.append("期待インフレ率が上昇しており、インフレヘッジ需要で金に追い風")
-    elif breakeven_direction == "DOWN":
-        score -= BREAKEVEN_WEIGHT
-        key_drivers.append("期待インフレ率が低下しており、インフレヘッジ需要はやや後退")
-    else:
-        key_drivers.append("期待インフレ率は横ばいで、ヘッジ需要の変化は限定的")
-
-    score += _score_positioning(fred_data.get("positioning"), key_drivers)
-    _describe_releases(fred_data, key_drivers)
-
-    if real_rate_direction == "UP":
-        key_drivers.append(
-            "実質金利は上昇方向だが、2025-2026年は逆相関が崩れているため参考情報に留める"
-        )
-    elif real_rate_direction == "DOWN":
-        key_drivers.append(
-            "実質金利は低下方向だが、2025-2026年は補助的な文脈情報としてのみ扱う"
-        )
-    else:
-        key_drivers.append("実質金利は横ばいで、補助情報としての影響は小さい")
-
-    if score >= 0.25:
-        macro_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = "BULLISH"
-    elif score <= -0.25:
-        macro_bias = "BEARISH"
-    else:
-        macro_bias = "NEUTRAL"
-
-    confidence = _clamp_confidence(0.5 + min(0.35, abs(score) * 0.35))
-
-    reasoning = (
-        f"主軸のドル要因は{_direction_text(dxy_direction)}で、"
-        f"政策金利は{_direction_text(fed_direction)}、期待インフレは{_direction_text(breakeven_direction)}。"
-        "実質金利は2025-2026年の構造変化により補助的に扱い、単純な逆相関では判定しない。"
-    )
-    return macro_bias, confidence, key_drivers, reasoning
-
-
-def _build_neutral_result(error: str, model: str = "none", ok: bool = False) -> MacroAnalysisResult:
+def _build_neutral_result(error: str, model: str = "none", ok: bool = False, source: str = "fail_safe") -> MacroAnalysisResult:
     return {
         "macro_bias": "NEUTRAL",
-        "confidence": 0.5,
-        "key_drivers": ["FRED取得失敗またはLLM失敗のため安全側で中立"],
+        "regime_view": "UNCLEAR",
+        "key_drivers": ["マクロ分析が得られなかったため安全側で中立"],
+        "invalidation": "",
         "reasoning": FALLBACK_REASONING,
-        "_meta": {
-            "ok": ok,
-            "model": model,
-            "usage": _empty_usage(),
-            "error": error,
-        },
+        "source": source,
+        "_meta": {"ok": ok, "model": model, "usage": _empty_usage(), "error": error},
     }
 
 
-def _merge_llm_result(
-    baseline: MacroAnalysisResult,
-    llm_payload: dict[str, Any],
-) -> MacroAnalysisResult:
-    # The rule-based bias/confidence are authoritative. The LLM narrative is
-    # adopted only when its own conclusion agrees with that bias — otherwise the
-    # final payload would state e.g. bias=BULLISH with a reasoning text that
-    # concludes NEUTRAL, and downstream agents cannot tell which to trust.
-    llm_bias = _normalize_bias(llm_payload.get("macro_bias"))
-    reasoning = str(llm_payload.get("reasoning") or "").strip()
-    if reasoning and llm_bias != baseline["macro_bias"]:
-        LOGGER.warning(
-            "macro_analyst: LLM bias %s disagrees with rule-based bias %s; keeping rule-based reasoning",
-            llm_bias,
-            baseline["macro_bias"],
-        )
-        reasoning = ""
-
-    key_drivers_raw = llm_payload.get("key_drivers", baseline["key_drivers"])
-    key_drivers = [str(item) for item in key_drivers_raw] if isinstance(key_drivers_raw, list) else baseline["key_drivers"]
-
-    # Confidence: the LLM may only pull the rule-based value DOWN (by at most
-    # MACRO_LLM_CONF_MAX_DOWNSHIFT) and only when its bias agrees with the
-    # rule-based one. Upward revisions are ignored. This keeps the number the
-    # debate gate / trader see consistent with the narrative they also see.
-    llm_confidence = _parse_confidence(llm_payload.get("confidence"))
-    baseline_confidence = float(baseline["confidence"])
-    confidence = baseline_confidence
-    confidence_source = "rule_based"
-    if llm_confidence is not None and llm_bias == baseline["macro_bias"] and llm_confidence < baseline_confidence:
-        confidence = max(baseline_confidence - MACRO_LLM_CONF_MAX_DOWNSHIFT, llm_confidence)
-        confidence_source = "llm_downshift"
-        LOGGER.info(
-            "macro_analyst: LLM confidence %.3f below rule-based %.3f; using %.3f",
-            llm_confidence,
-            baseline_confidence,
-            confidence,
-        )
-
-    meta = dict(baseline["_meta"])
-    meta["llm_confidence"] = llm_confidence
-    meta["confidence_source"] = confidence_source
-    return {
-        "macro_bias": baseline["macro_bias"],
-        "confidence": _clamp_confidence(round(confidence, 4)),
-        "key_drivers": key_drivers,
-        "reasoning": reasoning or baseline["reasoning"],
-        "_meta": meta,  # type: ignore[typeddict-item]
-    }
-
-
-def _parse_confidence(value: Any) -> float | None:
-    """LLM confidence as float in [0, 1]; None when missing or malformed."""
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed != parsed or parsed < 0.0 or parsed > 1.0:
-        return None
-    return parsed
+def _analyst_input(macro_data: MacroData) -> dict[str, Any]:
+    """The data as handed to the analyst: a copy without code-made interpretations."""
+    data: dict[str, Any] = {}
+    for key, value in dict(macro_data).items():
+        if key == "_meta":
+            continue
+        if key == "recent_releases" and isinstance(value, list):
+            # first_order_read is a code-made "hawkish/dovish" hint; the analyst
+            # is asked to read the surprise, not to be told what it means.
+            data[key] = [
+                {k: v for k, v in item.items() if k != "first_order_read"} if isinstance(item, dict) else item
+                for item in value
+            ]
+            continue
+        data[key] = value
+    return data
 
 
 def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
     meta = fred_data.get("_meta", {}) if isinstance(fred_data, dict) else {}
     if not isinstance(meta, dict) or not bool(meta.get("ok", False)):
-        return _build_neutral_result("FRED data unavailable", model=str(meta.get("model", "none") if isinstance(meta, dict) else "none"))
-
-    baseline_bias, baseline_confidence, key_drivers, reasoning = _score_macro_environment(fred_data)
-    baseline: MacroAnalysisResult = {
-        "macro_bias": baseline_bias,
-        "confidence": baseline_confidence,
-        "key_drivers": key_drivers,
-        "reasoning": reasoning,
-        "_meta": {
-            "ok": True,
-            "model": "rule_based",
-            "usage": _empty_usage(),
-            "error": "",
-        },
-    }
+        return _build_neutral_result(
+            "FRED data unavailable",
+            model=str(meta.get("model", "none") if isinstance(meta, dict) else "none"),
+            source="no_data",
+        )
 
     user_prompt = json.dumps(
         {
-            "macro_data": fred_data,
-            "rule_based_baseline": {
-                "macro_bias": baseline_bias,
-                "confidence": baseline_confidence,
-                "note": "ルールベースの暫定判定。指標サプライズやポジションの偏りが強ければreasoningで補正理由を述べること",
-            },
-            "requirements": {
-                "dxy_priority": "macro_data.dxyの方向(30d)と直近(5d)を最重要視し、絶対値ではなく方向で判定する",
-                "rates_priority": "us2y(2年債)を政策金利期待の主指標とし、fed_fundsは背景情報",
-                "releases_priority": "recent_releasesのsurpriseを最新の新情報として最優先で解釈する",
-                "real_rate_caveat": "2025-2026年は実質金利と金の逆相関が崩れているため単純弱気に使わない",
-                "output_format": {
-                    "macro_bias": MACRO_BIAS_VALUES,
-                    "confidence": "0.0-1.0",
-                    "key_drivers": "list[str]",
-                    "reasoning": "string",
-                },
-            },
+            "macro_data": _analyst_input(fred_data),
+            "data_notes": DATA_NOTES,
+            "question": (
+                "この環境は金価格にとって BULLISH / BEARISH / NEUTRAL のどれか。"
+                "いまの価格トレンドの継続を支えるか、反転を促すか。読みが崩れる条件は何か。"
+            ),
         },
         ensure_ascii=False,
     )
@@ -393,12 +151,7 @@ def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
             system_prompt=SYSTEM_PROMPT,
             user_prompt=user_prompt,
             model=analysis_model(),
-            fallback_payload={
-                "macro_bias": baseline_bias,
-                "confidence": baseline_confidence,
-                "key_drivers": key_drivers,
-                "reasoning": reasoning,
-            },
+            fallback_payload={},
         )
     except Exception as exc:
         return _build_neutral_result(f"LLM call failed: {exc}", model=analysis_model())
@@ -406,23 +159,35 @@ def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
     if not bool(result.ok):
         return _build_neutral_result(result.error or "LLM call failed", model=result.model)
 
-    payload = dict(result.payload)
-    merged = _merge_llm_result(baseline, payload)
-    merge_meta = merged.get("_meta", {})
-    merged["_meta"] = {
-        "ok": True,
-        "model": result.model,
-        "usage": {
+    payload = dict(result.payload) if isinstance(result.payload, dict) else {}
+    bias = _normalize_bias(payload.get("macro_bias"))
+    if bias is None:
+        LOGGER.warning("macro_analyst: no valid macro_bias in LLM output; treating as NEUTRAL")
+        fallback = _build_neutral_result("macro_bias missing or invalid", model=result.model, ok=True, source="invalid_output")
+        fallback["_meta"]["usage"] = {
             "prompt_tokens": result.usage.prompt_tokens,
             "completion_tokens": result.usage.completion_tokens,
             "total_tokens": result.usage.total_tokens,
+        }
+        return fallback
+
+    key_drivers_raw = payload.get("key_drivers", [])
+    key_drivers = [str(item) for item in key_drivers_raw if str(item).strip()] if isinstance(key_drivers_raw, list) else []
+    return {
+        "macro_bias": bias,
+        "regime_view": _normalize_regime_view(payload.get("regime_view")),
+        "key_drivers": key_drivers,
+        "invalidation": str(payload.get("invalidation", "") or ""),
+        "reasoning": str(payload.get("reasoning", "") or "").strip() or "(reasoning なし)",
+        "source": "analyst",
+        "_meta": {
+            "ok": True,
+            "model": result.model,
+            "usage": {
+                "prompt_tokens": result.usage.prompt_tokens,
+                "completion_tokens": result.usage.completion_tokens,
+                "total_tokens": result.usage.total_tokens,
+            },
+            "error": "",
         },
-        "error": "",
-        "llm_confidence": merge_meta.get("llm_confidence"),
-        "confidence_source": merge_meta.get("confidence_source", "rule_based"),
-    }  # type: ignore[typeddict-item]
-    merged["macro_bias"] = baseline_bias
-    # merged["confidence"] already carries the rule-based value or the
-    # bounded LLM downshift decided in _merge_llm_result.
-    merged["key_drivers"] = key_drivers
-    return merged
+    }

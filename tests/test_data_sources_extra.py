@@ -1,6 +1,6 @@
 """Tests for the gold-specific data-source overhaul: 5-day FRED changes,
 optional series, calendar event parsing, feed health metadata, synthetic
-dollar index, and the revised macro scoring."""
+dollar index, and the data handed to the macro analyst."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from unittest.mock import Mock, patch
 
 from agents.data import fred_client
-from agents.macro_analyst import _score_macro_environment
+from agents.macro_analyst import _analyst_input, analyze_macro_environment
 from data import mt5_client, news_client
 
 
@@ -172,7 +172,7 @@ def test_synthesize_dollar_index_uses_common_dates_only() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Macro scoring
+# Macro analyst input: facts in, code-made interpretations out
 # --------------------------------------------------------------------------- #
 def _macro(**overrides):
     base = {
@@ -187,50 +187,45 @@ def _macro(**overrides):
     return base
 
 
-def test_confirming_short_term_moves_raise_confidence() -> None:
-    bias, conf, drivers, _ = _score_macro_environment(_macro())
-    assert bias == "BULLISH"
-    assert conf > 0.8
-    assert any("同方向" in d for d in drivers)
-
-
-def test_conflicting_5d_move_claws_back_trend_score() -> None:
-    confirming = _score_macro_environment(_macro())
-    conflicting = _score_macro_environment(
-        _macro(dxy={"value": 98.0, "change_30d": -1.0, "direction": "DOWN", "change_5d": 0.6, "direction_5d": "UP", "source": "mt5:USDX"})
-    )
-    assert conflicting[1] < confirming[1]
-    assert any("転換の兆し" in d for d in conflicting[2])
-
-
-def test_us2y_takes_over_from_fed_funds_when_present() -> None:
-    # 2y yield rising (hawkish) while monthly fed funds is flat -> rates leg negative.
-    data = _macro(us2y={"value": 3.9, "change_30d": 0.3, "direction": "UP", "change_5d": 0.1, "direction_5d": "UP"})
-    _, _, drivers, _ = _score_macro_environment(data)
-    assert any("2年債利回り" in d and "逆風" in d for d in drivers)
-
-
-def test_crowded_long_positioning_and_gld_outflow_lower_score() -> None:
-    plain = _score_macro_environment(_macro())
-    crowded = _score_macro_environment(
-        _macro(
-            positioning={
-                "cot": {"crowding": "CROWDED_LONG", "net_percentile_window": 92.0, "_meta": {"ok": True}},
-                "gld": {"direction_5d": "DOWN", "change_5d": -4.2, "_meta": {"ok": True}},
-                "_meta": {"ok": True},
-            }
-        )
-    )
-    assert crowded[1] < plain[1]
-    assert any("過密" in d for d in crowded[2])
-    assert any("流出" in d for d in crowded[2])
-
-
-def test_releases_are_described_in_key_drivers() -> None:
+def test_analyst_input_keeps_series_positioning_and_releases_but_drops_first_order_read() -> None:
     data = _macro(
-        recent_releases=[{"title": "Non-Farm Employment Change", "actual": 142.0, "forecast": 75.0, "surprise": 67.0, "unit": "K"}],
+        positioning={
+            "cot": {"crowding": "CROWDED_LONG", "net_percentile_window": 92.0, "_meta": {"ok": True}},
+            "gld": {"direction_5d": "DOWN", "change_5d": -4.2, "_meta": {"ok": True}},
+            "_meta": {"ok": True},
+        },
+        recent_releases=[{"title": "Non-Farm Employment Change", "actual": 142.0, "forecast": 75.0, "surprise": 67.0, "unit": "K",
+                          "first_order_read": "hawkish_surprise(gold_negative_first_order)"}],
         upcoming_events=[{"title": "FOMC Statement", "hours_ahead": 4.0}],
     )
-    _, _, drivers, _ = _score_macro_environment(data)
-    assert any("Non-Farm" in d and "サプライズ67.0" in d for d in drivers)
-    assert any("FOMC Statement" in d for d in drivers)
+    handed = _analyst_input(data)
+    assert "_meta" not in handed
+    assert handed["dxy"]["direction_5d"] == "DOWN" and handed["us2y"]["change_5d"] == -0.05
+    assert handed["positioning"]["cot"]["crowding"] == "CROWDED_LONG"
+    assert handed["recent_releases"][0]["surprise"] == 67.0
+    assert "first_order_read" not in handed["recent_releases"][0]
+    assert handed["upcoming_events"][0]["title"] == "FOMC Statement"
+
+
+def test_macro_analyst_sends_data_notes_without_directional_rules() -> None:
+    import json
+
+    fake_result = Mock()
+    fake_result.ok = True
+    fake_result.payload = {"macro_bias": "BEARISH", "regime_view": "SUPPORTS_REVERSAL", "key_drivers": ["us2y +0.3pt"], "invalidation": "x", "reasoning": "r"}
+    fake_result.model = "m"
+    fake_result.error = ""
+    fake_result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    client = Mock()
+    client.call_json.return_value = fake_result
+    with patch("agents.macro_analyst.get_default_client", return_value=client):
+        result = analyze_macro_environment(_macro())
+    assert result["macro_bias"] == "BEARISH"  # the analyst's call, even though the dollar is falling
+    sent = json.loads(client.call_json.call_args.kwargs["user_prompt"])
+    assert "rule_based_baseline" not in sent
+    assert "data_notes" in sent and "dxy" in sent["data_notes"]
+    system = client.call_json.call_args.kwargs["system_prompt"]
+    for forbidden in ("ドル安(DOWN)は金にポジティブ", "必ず", "上限とし"):
+        assert forbidden not in system
+    for forbidden in ("ポジティブ", "ネガティブ", "追い風", "逆風"):
+        assert forbidden not in json.dumps(sent["data_notes"], ensure_ascii=False)

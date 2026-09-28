@@ -67,7 +67,9 @@ def _print_macro_result(result: MacroAnalysisResult) -> None:
     meta = result.get("_meta", {})
     print("\n=== Macro Analyst Output ===")
     print(f"macro_bias: {result.get('macro_bias')}")
-    print(f"confidence: {float(result.get('confidence', 0.0) or 0.0):.3f}")
+    print(f"regime_view: {result.get('regime_view')}")
+    print(f"invalidation: {result.get('invalidation', '')}")
+    print(f"source: {result.get('source', '')}")
     print(f"key_drivers: {result.get('key_drivers', [])}")
     print(f"reasoning: {result.get('reasoning', '')}")
     print(

@@ -6,6 +6,8 @@ from agents.technical import analyze_technical
 
 
 def _fake_llm_result() -> Mock:
+    # Legacy-shaped answer (no execution_trend): the analyst did not answer
+    # the question, so these tests exercise the rule-based fail-safe path.
     result = Mock()
     result.ok = True
     result.payload = {
@@ -206,3 +208,85 @@ def test_calc_extension_atr_handles_invalid_inputs() -> None:
     assert calc_extension_atr(close=105.0, bb_mid=100.0, atr=10.0) == 0.5
     assert calc_extension_atr(close=105.0, bb_mid=100.0, atr=0.0) is None
     assert calc_extension_atr(close=105.0, bb_mid=0.0, atr=10.0) is None
+
+
+def _analyst_client(payload: dict) -> Mock:
+    result = Mock()
+    result.ok = True
+    result.payload = payload
+    result.model = "gpt-5.6-terra"
+    result.error = ""
+    result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    client = Mock()
+    client.call_json.return_value = result
+    return client
+
+
+def test_fallback_path_is_marked_and_keeps_rule_based_read() -> None:
+    with patch("agents.technical.get_default_client", return_value=_patch_client()):
+        result = analyze_technical({"d1": _bullish_frame(), "h4": _bullish_frame(), "h1": _bullish_frame()})
+    assert result["source"] == "rule_based_fallback"
+    assert result["reasoning"].startswith("【ルールベース代替】")
+    assert result["regime_view"] == "UNCLEAR"
+    assert result["rule_based_view"]["execution_trend"] == "UP"
+
+
+def test_analyst_view_overrides_rule_based_read() -> None:
+    import json
+
+    # Indicators are bullish on every frame (the old scorer says UP/ALIGNED/BUY);
+    # the analyst reads exhaustion at resistance and says RANGE / MEAN_REVERSION.
+    client = _analyst_client(
+        {
+            "d1_trend": "UP",
+            "execution_trend": "RANGE",
+            "alignment": "MIXED",
+            "regime_view": "MEAN_REVERSION",
+            "direction_if_trend": "UP",
+            "key_prices": {"supports": [96.5, "95.0"], "resistances": [101.5], "invalidation": "102.2"},
+            "evidence": ["H4 LOWER_HIGH", "未充填の弱気FVG 101.0-101.8"],
+            "what_would_change_view": "H4終値で101.8上抜け",
+            "reasoning": "上位足は上だが執行足は抵抗帯で失速。",
+        }
+    )
+    payload = {
+        "direction_context": {
+            "d1": _bullish_frame(),
+            "h4": _bullish_frame(),
+            "h1": _bullish_frame(),
+            "structure": {"h4": {"swings": {"highs": [101.0, 100.5], "last_high_pattern": "LOWER_HIGH"}, "fair_value_gaps": []}},
+        },
+        "tp_reference_only": {"levels": {"supports": [{"price": 96.5}], "resistances": [{"price": 101.5}]}},
+    }
+    with patch("agents.technical.get_default_client", return_value=client):
+        result = analyze_technical(payload)
+
+    assert result["source"] == "analyst"
+    assert result["trend"] == "RANGE" and result["signal"] == "NEUTRAL"
+    assert result["d1_trend"] == "UP" and result["execution_trend"] == "RANGE" and result["alignment"] == "MIXED"
+    assert result["regime_view"] == "MEAN_REVERSION"
+    assert result["direction_if_trend"] == "NEUTRAL"  # only meaningful for TREND_CONTINUATION
+    assert result["key_levels"]["analyst"] == {"supports": [96.5, 95.0], "resistances": [101.5], "invalidation": 102.2}
+    assert result["key_levels"]["horizontal_levels"]["resistances"][0]["price"] == 101.5  # factual part kept
+    assert result["evidence"][1].startswith("未充填")
+    assert result["what_would_change_view"] == "H4終値で101.8上抜け"
+    assert result["reasoning"] == "上位足は上だが執行足は抵抗帯で失速。"
+    assert result["rule_based_view"] == {"trend": "UP", "d1_trend": "UP", "execution_trend": "UP", "alignment": "ALIGNED"}
+    # The analyst saw the structure facts and the horizontal levels, and no answer key.
+    user_prompt = client.call_json.call_args.kwargs["user_prompt"]
+    sent = json.loads(user_prompt[user_prompt.index("{"):])
+    assert sent["structure"]["h4"]["swings"]["last_high_pattern"] == "LOWER_HIGH"
+    assert sent["horizontal_levels"]["supports"][0]["price"] == 96.5
+    assert "baseline" not in json.dumps(sent) and "score" not in json.dumps(sent)
+    system = client.call_json.call_args.kwargs["system_prompt"]
+    assert "必ず" not in system and "UNCLEAR" in system
+
+
+def test_analyst_call_failure_falls_back_safely() -> None:
+    client = _analyst_client({"execution_trend": "UP"})
+    client.call_json.return_value.ok = False
+    client.call_json.return_value.error = "timeout"
+    with patch("agents.technical.get_default_client", return_value=client):
+        result = analyze_technical({"d1": _bearish_frame(), "h4": _bearish_frame(), "h1": _bearish_frame()})
+    assert result["source"] == "rule_based_fallback"
+    assert result["trend"] == "DOWN" and result["_meta"]["ok"] is False and result["_meta"]["error"] == "timeout"

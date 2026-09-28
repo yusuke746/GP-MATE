@@ -149,7 +149,8 @@ def test_decide_trade_completes_when_suggested_tp_is_missing() -> None:
     assert result["suggested_tp_basis"] == ""
 
 
-def test_existing_action_confidence_directional_bias_logic_is_preserved() -> None:
+def test_trader_neutral_bias_is_not_overridden_by_macro() -> None:
+    # The trader said NEUTRAL; a confident macro bias used to be injected here.
     result = _run_with_payload(
         llm_payload={
             "action": "BUY",
@@ -173,7 +174,7 @@ def test_existing_action_confidence_directional_bias_logic_is_preserved() -> Non
 
     assert result["action"] == "BUY"
     assert result["confidence"] == 0.8
-    assert result["directional_bias"] == "BULLISH"
+    assert result["directional_bias"] == "NEUTRAL"
     assert result["trigger_conditions"] == ["4055上抜け"]
 
 

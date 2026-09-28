@@ -7,7 +7,7 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 
 - Symbol: XAU/USD (XM symbol auto-detected, currently GOLD#)
 - Timeframes: H4 for trend, H1 for entries
-- Architecture: multi-agent analysis (technical, sentiment, debate, trader)
+- Architecture: three analysts (technical, macro, sentiment) give their own reads, discuss trend vs reversal as a panel, then a trader decides
 - Risk-first policy: fail-safe HOLD on uncertainty or failures
 
 ## Project Structure
@@ -63,6 +63,33 @@ the trade log.
 - `python scripts/calibrate_forecasts.py` — fits shrink / shrink+tilt transforms on the first half of the record and tests them on the second half; a fitted weight near 0 means the probabilities carry no usable signal
 - `python scripts/ablate_forecasts.py` — re-forecasts archived inputs with reports removed to attribute the error
 
+## Analysts and the panel debate
+
+The three analysts are asked for their own reading and nothing in code
+re-decides it. The technical analyst receives the multi-timeframe indicator
+snapshots, the horizontal levels and price-structure facts from
+`indicators/structure.py` (recent swing highs/lows and unfilled fair value
+gaps) and answers with D1 / execution trend, alignment, a `regime_view`
+(TREND_CONTINUATION / MEAN_REVERSION / UNCLEAR), key prices and an
+invalidation price. The macro analyst receives the FRED / dollar-index /
+positioning / release data with provenance notes only (what a series is and how
+fresh it is, not what it means for gold) and answers with `macro_bias`,
+`regime_view` and an invalidation condition; it is not asked for a confidence
+number. The sentiment analyst is asked what is *new* in the headlines and
+whether it supports continuation or reversal. Rule-based reads survive only as
+fail-safes: a technical report falling back to them is marked
+`source=rule_based_fallback`, a macro analyst that does not answer is NEUTRAL.
+
+With `DEBATE_AXIS=panel` the same three analysts discuss one question, "trend
+continuation or reversal?", with no assigned sides. Each reads the other two
+reports and the statements so far, may agree, disagree or change their view,
+and states what would change it. A chair summarises agreements, conflicts, the
+panel regime (TREND / RANGE / TRANSITION), `entry_style`, key levels and the
+consensus (UNANIMOUS / MAJORITY / SPLIT); if the chair fails, a plain majority
+of the stated views is used and marked `vote_fallback`. The trader is told to
+set a directional bias and pending orders only when the panel points the same
+way, and otherwise to stay flat. A few entries per day is the intended pace.
+
 ## Regime (Trend vs Range)
 
 `indicators/regime.py` classifies every cycle as TREND / RANGE / TRANSITION from
@@ -73,11 +100,11 @@ The read is attached to the technical report, handed to the debate as
 and to the forecast logger, and is written to the trade log
 (`regime`, `regime_confidence`, `entry_style`, `regime_source`).
 
-`DEBATE_AXIS` selects what the debate argues about: `direction` (Bull vs Bear,
-default) or `regime` (a Trend-continuation advocate vs a Range/mean-reversion
-advocate; the judge returns `regime_summary` and `stronger_side` is derived from
-it). The forecast logger uses `FORECAST_DEBATE_AXIS` (default `regime`) so the two
-axes can be compared on Brier score before production is switched.
+`DEBATE_AXIS` selects the debate format: `panel` (see above), `direction`
+(legacy Bull vs Bear, default until the forecast A/B is done) or `regime`
+(legacy Trend advocate vs Range advocate). The forecast logger uses
+`FORECAST_DEBATE_AXIS` (default `panel`) so formats can be compared on Brier
+score before production is switched with `DEBATE_AXIS=panel`.
 
 ## Tests
 

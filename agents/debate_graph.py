@@ -7,7 +7,7 @@ import time
 from operator import add
 from typing import Any, Callable, Literal, TypedDict, cast
 
-from config import MACRO_DEBATE_CONF_THRESHOLD, MODEL_DEBATE
+from config import MODEL_DEBATE
 
 try:
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -117,6 +117,7 @@ REGIME_JUDGE_SYSTEM_PROMPT = (
 
 AXIS_DIRECTION = "direction"
 AXIS_REGIME = "regime"
+AXIS_PANEL = "panel"
 REGIME_VALUES = {"TREND", "RANGE", "TRANSITION"}
 ENTRY_STYLES = {"STOP_BREAKOUT", "LIMIT_PULLBACK", "LIMIT_FADE", "NONE"}
 
@@ -286,6 +287,10 @@ def _technical_direction(technical_report: dict[str, Any]) -> Literal["BUY", "SE
 
 
 def _sentiment_direction(sentiment_report: dict[str, Any]) -> Literal["BULLISH", "BEARISH", "NEUTRAL"]:
+    # The analyst's stated bias wins; the numeric score is a compatibility field.
+    stated = str(sentiment_report.get("gold_bias", "") or "").upper()
+    if stated in {"BULLISH", "BEARISH", "NEUTRAL"}:
+        return cast(Literal["BULLISH", "BEARISH", "NEUTRAL"], stated)
     score = float(sentiment_report.get("score", 0.0) or 0.0)
     if score >= 0.15:
         return "BULLISH"
@@ -358,7 +363,6 @@ def should_execute_debate(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
     macro_report: dict[str, Any] | None = None,
-    macro_conf_threshold: float = MACRO_DEBATE_CONF_THRESHOLD,
 ) -> DebateGateDecision:
     technical_dir = _technical_direction(technical_report)
     sentiment_dir = _sentiment_direction(sentiment_report)
@@ -405,15 +409,13 @@ def should_execute_debate(
             "estimated_confidence": estimated,
         }
 
-    macro_conf = float((macro_report or {}).get("confidence", 0.0) or 0.0)
-    if (
-        _macro_is_reliable(macro_report)
-        and macro_dir in {"BULLISH", "BEARISH"}
-        and macro_conf >= macro_conf_threshold
-    ):
+    # The macro analyst no longer reports a confidence number. A directional
+    # macro view against a neutral technical read is an open trend-vs-range
+    # question, so it goes to the panel.
+    if _macro_is_reliable(macro_report) and macro_dir in {"BULLISH", "BEARISH"} and technical_dir == "NEUTRAL":
         return {
             "should_debate": True,
-            "reason": f"議論実行（マクロが強い方向性: {macro_dir} conf={macro_conf:.2f}）",
+            "reason": f"議論実行（マクロが方向性を示すがテクニカルは中立: {macro_dir}）",
             "technical_direction": technical_dir,
             "sentiment_direction": sentiment_dir,
             "macro_direction": macro_dir,
@@ -1560,10 +1562,20 @@ def run_debate_graph(
     regime_summary and stronger_side is derived from it). Defaults to
     config.DEBATE_AXIS. Safe policy: any failure returns a HOLD-friendly report.
     """
-    resolved_axis = AXIS_REGIME if str(axis if axis is not None else DEBATE_AXIS).lower() == AXIS_REGIME else AXIS_DIRECTION
+    requested_axis = str(axis if axis is not None else DEBATE_AXIS).lower()
     hint = dict(regime_hint) if isinstance(regime_hint, dict) else (
         dict(technical_report.get("regime")) if isinstance(technical_report.get("regime"), dict) else {}
     )
+    if requested_axis == AXIS_PANEL:
+        # No assigned sides: the three analysts discuss trend vs reversal.
+        from agents.panel_debate import run_panel_debate
+
+        try:
+            return run_panel_debate(technical_report, sentiment_report, macro_report, regime_hint=hint)
+        except Exception as exc:
+            LOGGER.warning("run_panel_debate failed: %s", exc)
+            return _failed_report(AXIS_PANEL, exc)
+    resolved_axis = AXIS_REGIME if requested_axis == AXIS_REGIME else AXIS_DIRECTION
     initial_state: DebateState = {
         "technical_report": technical_report,
         "sentiment_report": sentiment_report,
@@ -1639,42 +1651,46 @@ def run_debate_graph(
         }
     except Exception as exc:
         LOGGER.warning("run_debate_graph failed: %s", exc)
-        return {
-            "axis": resolved_axis,
-            "regime_summary": {},
-            "bull_arguments": ["Bull分析失敗"],
-            "bear_arguments": ["Bear分析失敗"],
-            "bull_conceded_points": [],
-            "bear_conceded_points": [],
-            "round_count": 0,
-            "bull_confidence": 0.0,
-            "bear_confidence": 0.0,
-            "prev_bull_confidence": 0.0,
-            "bull_confidence_history": [0.5],
-            "bear_confidence_history": [0.5],
-            "bull_ok_history": [],
-            "bear_ok_history": [],
-            "judge_summary": {
-                "agreements": [],
-                "conflicts": ["議論エンジン障害のため判断不可", "議論不完全（bull失敗, bear失敗, judge失敗）"],
-                "confidence_shift": {"bull": [], "bear": []},
-                "stronger_side": "neutral",
+        return _failed_report(resolved_axis, exc)
+
+
+def _failed_report(resolved_axis: str, exc: Exception) -> dict[str, Any]:
+    return {
+        "axis": resolved_axis,
+        "regime_summary": {},
+        "bull_arguments": ["Bull分析失敗"],
+        "bear_arguments": ["Bear分析失敗"],
+        "bull_conceded_points": [],
+        "bear_conceded_points": [],
+        "round_count": 0,
+        "bull_confidence": 0.0,
+        "bear_confidence": 0.0,
+        "prev_bull_confidence": 0.0,
+        "bull_confidence_history": [0.5],
+        "bear_confidence_history": [0.5],
+        "bull_ok_history": [],
+        "bear_ok_history": [],
+        "judge_summary": {
+            "agreements": [],
+            "conflicts": ["議論エンジン障害のため判断不可", "議論不完全（bull失敗, bear失敗, judge失敗）"],
+            "confidence_shift": {"bull": [], "bear": []},
+            "stronger_side": "neutral",
+        },
+        "_meta": {
+            "ok": False,
+            "engine": "langgraph",
+            "model": DEBATE_MODEL,
+            "bull_ok": False,
+            "bear_ok": False,
+            "judge_ok": False,
+            "bull_error": str(exc),
+            "bear_error": str(exc),
+            "judge_error": str(exc),
+            "error": str(exc),
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
             },
-            "_meta": {
-                "ok": False,
-                "engine": "langgraph",
-                "model": DEBATE_MODEL,
-                "bull_ok": False,
-                "bear_ok": False,
-                "judge_ok": False,
-                "bull_error": str(exc),
-                "bear_error": str(exc),
-                "judge_error": str(exc),
-                "error": str(exc),
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
-            },
-        }
+        },
+    }
