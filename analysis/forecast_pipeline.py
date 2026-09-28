@@ -25,7 +25,7 @@ from agents.data.releases import releases_as_news_items
 from agents.forecaster import build_forecast_payload
 from agents.forecaster import forecast as run_forecaster
 from agents.macro_analyst import analyze_macro_environment
-from agents.sentiment import analyze_sentiment
+from agents.sentiment import analyze_sentiment, sentiment_for_feed_state
 from agents.technical import analyze_technical, calc_extension_atr
 from analysis.forecast_labels import resolve_outcome
 from analysis.forecast_store import append_forecast, read_forecasts, save_inputs, write_forecasts
@@ -41,7 +41,9 @@ from config import (
     MODEL_FORECAST,
     SYMBOL,
 )
-from data import mt5_client
+from data.confirmed_bars import bar_times_to_utc as _bar_times_to_utc
+from data.confirmed_bars import drop_forming_bars as _drop_forming_bars
+from data.confirmed_bars import get_confirmed_rates
 from data.mt5_client import get_rates
 from data.news_client import fetch_news_with_meta
 from indicators.horizontal_levels import build_horizontal_levels
@@ -51,7 +53,6 @@ from indicators.ta_calc import add_indicators
 
 LOGGER = logging.getLogger(__name__)
 
-TIMEFRAME_HOURS = {"D1": 24, "H4": 4, "H1": 1}
 RATES_BARS = 300
 MAX_RESOLVE_BARS = 2000
 
@@ -59,38 +60,16 @@ MAX_RESOLVE_BARS = 2000
 # --------------------------------------------------------------------------- #
 # Bars
 # --------------------------------------------------------------------------- #
-def bar_times_to_utc(frame: pd.DataFrame) -> pd.DataFrame:
-    """MT5 bar times are server wall-clock stamped as UTC; reinterpret them.
-
-    Uses the same rule as closed-deal timestamps (MT5_SERVER_TIMEZONE). With
-    no timezone configured the frame is returned unchanged (legacy: as UTC).
-    """
-    if frame is None or frame.empty or "time" not in frame.columns:
-        return frame
-    if mt5_client.SERVER_TZ is None:
-        return frame
-    converted = frame.copy()
-    converted["time"] = pd.to_datetime(
-        [mt5_client._deal_epoch_to_utc(int(pd.Timestamp(t).timestamp())) for t in converted["time"]],
-        utc=True,
-    )
-    return converted
-
-
-def drop_forming_bars(frame: pd.DataFrame, now_utc: datetime, timeframe: str) -> pd.DataFrame:
-    """Keep only bars whose close time (start + timeframe) is <= now."""
-    if frame is None or frame.empty or "time" not in frame.columns:
-        return frame
-    hours = TIMEFRAME_HOURS.get(timeframe.upper(), 1)
-    close_times = pd.to_datetime(frame["time"], utc=True) + pd.Timedelta(hours=hours)
-    return frame[close_times <= pd.Timestamp(now_utc)].reset_index(drop=True)
+# bar_times_to_utc / drop_forming_bars live in data.confirmed_bars (shared with
+# main.py); re-exported here for existing callers and tests.
+bar_times_to_utc = _bar_times_to_utc
+drop_forming_bars = _drop_forming_bars
 
 
 def load_confirmed_frames(now_utc: datetime) -> dict[str, pd.DataFrame]:
     frames: dict[str, pd.DataFrame] = {}
     for timeframe in ("D1", "H4", "H1"):
-        raw = get_rates(SYMBOL, timeframe, RATES_BARS)
-        confirmed = drop_forming_bars(bar_times_to_utc(raw), now_utc, timeframe)
+        confirmed, _meta = get_confirmed_rates(SYMBOL, timeframe, RATES_BARS, now_utc, fetch=get_rates)
         frames[timeframe] = add_indicators(confirmed) if not confirmed.empty else confirmed
     return frames
 
@@ -145,7 +124,7 @@ def build_reports(frames: dict[str, pd.DataFrame], use_debate: bool = FORECAST_U
     technical_report = analyze_technical({"direction_context": direction_context, "tp_reference_only": tp_reference_only})
     if isinstance(technical_report, dict):
         technical_report["regime"] = classify_regime(technical_report)
-    sentiment_report = analyze_sentiment(news_items)
+    sentiment_report = sentiment_for_feed_state(news_items, feed_meta) or analyze_sentiment(news_items)
     if isinstance(sentiment_report, dict):
         sentiment_report["feed_meta"] = feed_meta
 

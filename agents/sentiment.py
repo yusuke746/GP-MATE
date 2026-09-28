@@ -115,6 +115,69 @@ def _normalize_sentiment_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def feed_health(feed_meta: Any) -> str:
+    """GOOD (all feeds answered) / DEGRADED (some) / BAD (none) / UNKNOWN (no meta)."""
+    if not isinstance(feed_meta, dict):
+        return "UNKNOWN"
+    try:
+        total = int(feed_meta.get("feeds_total", 0) or 0)
+        live = int(feed_meta.get("feeds_live", 0) or 0)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if total <= 0:
+        return "UNKNOWN"
+    if live <= 0:
+        return "BAD"
+    return "GOOD" if live >= total else "DEGRADED"
+
+
+def _no_llm_report(*, evidence_status: str, reasoning: str, health: str, news_count: int) -> dict[str, Any]:
+    return {
+        "score": 0.0,
+        "gold_bias": "NEUTRAL",
+        "regime_view": "UNCLEAR",
+        "new_information": [],
+        "price_echo_count": 0,
+        "dominant_news": "N/A",
+        "reasoning": reasoning,
+        "news_count": news_count,
+        "evidence_status": evidence_status,
+        "feed_health": health,
+        "_meta": {
+            "ok": True,
+            "model": "none",
+            "error": "",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        },
+    }
+
+
+def sentiment_for_feed_state(news_items: list[dict[str, Any]], feed_meta: Any) -> dict[str, Any] | None:
+    """Decide from the feed state whether the analyst should run at all.
+
+    BAD feeds (nothing answered): INSUFFICIENT, the trader holds, regardless
+    of how many items arrived by other routes.
+    Feeds fine but zero items: NO_NEWS, neutral, trading continues.
+    Otherwise None: run the analyst.
+    """
+    health = feed_health(feed_meta)
+    if health == "BAD":
+        return _no_llm_report(
+            evidence_status="INSUFFICIENT",
+            reasoning="ニュースフィードが全て取得できず判断材料不足。安全側で見送り。",
+            health=health,
+            news_count=len(news_items),
+        )
+    if len(news_items) == 0 and health in {"GOOD", "DEGRADED"}:
+        return _no_llm_report(
+            evidence_status="NO_NEWS",
+            reasoning="フィードは正常だが新規ニュースなし。ニュースは中立として扱う。",
+            health=health,
+            news_count=0,
+        )
+    return None
+
+
 def analyze_sentiment(news_items: list[dict[str, Any]]) -> dict[str, Any]:
     if len(news_items) == 0:
         return {

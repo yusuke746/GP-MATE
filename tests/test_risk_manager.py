@@ -390,3 +390,22 @@ def test_build_risk_plan_null_suggested_tp_keeps_2r_fallback() -> None:
     assert plan["tp_source"] == "fallback_2r"
     assert plan["sl_source"] == "fallback_atr"
     assert plan["effective_rr"] == pytest.approx(2.0, abs=1e-6)
+
+
+def test_build_risk_plan_net_rr_after_spread_decides_and_is_logged() -> None:
+    from risk.risk_manager import build_risk_plan
+
+    # BUY at 100, ATR 2 -> SL 97 (3.0), suggested TP 104.6 (4.6): gross 1.53 passes, net with 0.5 spread fails.
+    plan = build_risk_plan("BUY", 100.0, 2.0, 1_000_000.0, suggested_tp=104.6, spread_usd=0.5)
+    assert plan["ok"] is False and plan["reason"] == "low_rr"
+    assert plan["gross_rr"] == 1.5333 and plan["net_rr"] == 1.1714 and plan["spread_cost"] == 0.5
+    assert plan["effective_rr"] == plan["net_rr"] and plan["rr_rejection_reason"] == "net_rr_below_min"
+
+    ok_plan = build_risk_plan("BUY", 100.0, 2.0, 1_000_000.0, suggested_tp=104.6, spread_usd=0.0)
+    assert ok_plan["ok"] is True and ok_plan["net_rr"] == ok_plan["gross_rr"] == 1.5333 and ok_plan["rr_rejection_reason"] == ""
+
+    no_info = build_risk_plan("SELL", 100.0, 2.0, 1_000_000.0, suggested_tp=95.4, spread_usd=None)  # type: ignore[arg-type]
+    assert no_info["ok"] is True and no_info["spread_cost"] == 0.0
+
+    gross_fail = build_risk_plan("BUY", 100.0, 2.0, 1_000_000.0, suggested_tp=103.0, spread_usd=0.5)
+    assert gross_fail["rr_rejection_reason"] == "gross_rr_below_min"

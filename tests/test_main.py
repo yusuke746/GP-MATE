@@ -190,6 +190,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
                 "recent_low_20": 89.0,
             }
         ]
+        * main.MIN_CONFIRMED_BARS
     )
     monkeypatch.setattr(main, "get_rates", lambda symbol, tf, bars: rates)
     monkeypatch.setattr(main, "add_indicators", lambda df: df)
@@ -250,7 +251,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
             "ok": True,
             "action": "BUY",
             "lot": 0.01,
@@ -1007,7 +1008,7 @@ def test_run_once_places_pending_order_on_hold_with_plan(tmp_path: Path, monkeyp
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
             "ok": action in {"BUY", "SELL"},
             "action": action if action in {"BUY", "SELL"} else "HOLD",
             "lot": 0.01,
@@ -1054,7 +1055,7 @@ def test_run_once_records_none_proposed_when_hold_has_no_pending_plan(tmp_path: 
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
             "ok": False,
             "action": "HOLD",
             "lot": 0.0,
@@ -1192,7 +1193,7 @@ def test_run_once_market_order_skipped_on_low_rr_is_logged(tmp_path: Path, monke
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
             "ok": False,
             "action": "HOLD",
             "lot": 0.0,
@@ -1250,7 +1251,7 @@ def _hold_with_pending_plan(monkeypatch: pytest.MonkeyPatch, placed: list[dict[s
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
             "ok": action in {"BUY", "SELL"},
             "action": action if action in {"BUY", "SELL"} else "HOLD",
             "lot": 0.01,
@@ -1341,7 +1342,7 @@ def test_run_once_logs_weak_bias_drop_with_intended_order(tmp_path: Path, monkey
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
             "ok": False, "action": "HOLD", "lot": 0.0, "sl": 0.0, "tp": 0.0,
         },
     )
@@ -1460,3 +1461,178 @@ def test_run_once_logs_judge_regime_and_passes_axis_to_debate(tmp_path: Path, mo
     assert row["entry_style"] == "LIMIT_PULLBACK"
     assert row["regime_source"] == "judge"
     assert row["stronger_side"] == "bull"
+
+
+def _timed_rates(bars: int, end_open: datetime, hours: int = 1, close: float = 100.0) -> pd.DataFrame:
+    from datetime import timedelta
+
+    rows = []
+    for i in range(bars):
+        rows.append({
+            "time": end_open - timedelta(hours=hours * (bars - 1 - i)),
+            "open": close, "high": close + 1, "low": close - 1, "close": close,
+            "rsi_14": 58.0, "macd": 1.0, "macd_signal": 0.5, "macd_hist": 0.5,
+            "bb_upper": 110.0, "bb_mid": 100.0, "bb_lower": 90.0, "atr_14": 2.0, "adx_14": 20.0,
+            "recent_high_20": 111.0, "recent_low_20": 89.0,
+        })
+    frame = pd.DataFrame(rows)
+    frame["time"] = pd.to_datetime(frame["time"], utc=True)
+    return frame
+
+
+def test_build_market_reports_uses_closed_bars_only_and_reports_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC as _UTC
+
+    from data import mt5_client
+
+    monkeypatch.setattr(mt5_client, "SERVER_TZ", None)
+    now = datetime(2026, 9, 28, 12, 0, 5, tzinfo=_UTC)  # 5s after the 08:00 NY H1 bar opened
+    forming = {"H1": datetime(2026, 9, 28, 12, 0, tzinfo=_UTC), "H4": datetime(2026, 9, 28, 12, 0, tzinfo=_UTC), "D1": datetime(2026, 9, 28, 0, 0, tzinfo=_UTC)}
+    hours = {"H1": 1, "H4": 4, "D1": 24}
+    captured: dict[str, Any] = {}
+
+    def fake_rates(symbol, tf, count):
+        # MT5 returns the forming bar last; give it a wild close so use is detectable.
+        frame = _timed_rates(count, forming[tf], hours=hours[tf])
+        frame.loc[frame.index[-1], "close"] = 9999.0
+        return frame
+
+    monkeypatch.setattr(main, "get_rates", fake_rates)
+    monkeypatch.setattr(main, "add_indicators", lambda df: df)
+    monkeypatch.setattr(main, "build_horizontal_levels", lambda **kwargs: {"supports": [], "resistances": []})
+    monkeypatch.setattr(main, "fetch_news_with_meta", lambda hours=24: ([], {"feeds_total": 3, "feeds_live": 3}))
+    monkeypatch.setattr(main, "get_macro_data", lambda force_refresh=False: {})
+    monkeypatch.setattr(main, "build_macro_inputs", lambda macro_data: macro_data)
+    monkeypatch.setattr(main, "analyze_macro_environment", lambda macro_data: {"macro_bias": "NEUTRAL", "_meta": {"ok": True}})
+
+    def _capture(payload):
+        captured["payload"] = payload
+        return {"signal": "NEUTRAL", "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}}
+
+    monkeypatch.setattr(main, "analyze_technical", _capture)
+
+    d1, h4, h1, news_items, macro_report, technical_report, sentiment_report, bars_meta = main._build_market_reports(now)
+
+    assert len(h1) == 300 and float(h1["close"].iloc[-1]) == 100.0  # forming bar gone, count preserved
+    assert captured["payload"]["direction_context"]["h1"]["close"] == 100.0
+    assert bars_meta["H1"]["dropped_open_bar"] is True and bars_meta["H1"]["closed_bar_count"] == 300
+    assert bars_meta["H1"]["last_closed_bar_time"] == "2026-09-28T12:00:00+00:00"
+    assert bars_meta["H4"]["last_closed_bar_time"] == "2026-09-28T12:00:00+00:00"
+    assert bars_meta["D1"]["last_closed_bar_time"] == "2026-09-28T00:00:00+00:00"
+    assert bars_meta["H1"]["bar_age_seconds"] == 5
+    fields = main._bars_log_fields(bars_meta)
+    assert fields["last_closed_bar_h1"] == "2026-09-28T12:00:00+00:00" and fields["dropped_open_bar"] is True
+    assert fields["closed_bar_count"] == 300 and fields["bar_age_seconds"] == 5
+    # Healthy feeds with no items: neutral NO_NEWS report, analyst not called.
+    assert sentiment_report["evidence_status"] == "NO_NEWS" and sentiment_report["feed_health"] == "GOOD"
+    for column in ("last_closed_bar_h1", "dropped_open_bar", "closed_bar_count", "bar_age_seconds", "news_feed_health", "judge_status", "panel_agreement", "net_rr", "gross_rr", "spread_cost", "rr_rejection_reason"):
+        assert column in main.TRADE_LOG_COLUMNS
+
+
+def test_run_once_holds_when_confirmed_bars_are_insufficient(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    short = pd.DataFrame([{"close": 100.0, "rsi_14": 50.0, "macd_hist": 0.0, "bb_upper": 110.0, "bb_mid": 100.0, "bb_lower": 90.0, "atr_14": 2.0, "recent_high_20": 111.0, "recent_low_20": 89.0}] * (main.MIN_CONFIRMED_BARS - 1))
+    monkeypatch.setattr(main, "get_rates", lambda symbol, tf, bars: short)
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD"
+    assert result["filter_reason"] == "Insufficient confirmed bars"
+    assert "H1=59" in result["reasoning"]
+    row = _read_single_row(log_path)
+    assert row["filter_reason"] == "Insufficient confirmed bars" and row["closed_bar_count"] == "59"
+
+
+def _action_aware_risk_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The common fixture's risk plan always says BUY; these tests need it to follow the action."""
+    monkeypatch.setattr(
+        main,
+        "build_risk_plan",
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
+            "ok": action in {"BUY", "SELL"},
+            "action": action if action in {"BUY", "SELL"} else "HOLD",
+            "lot": 0.01,
+            "sl": 95.0,
+            "tp": 110.0,
+            "reason": "OK" if action in {"BUY", "SELL"} else "Invalid action",
+        },
+    )
+
+
+def test_run_once_holds_when_news_feeds_are_dead_but_trades_on_healthy_zero_news(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    _action_aware_risk_plan(monkeypatch)
+    monkeypatch.setattr(main, "fetch_news_with_meta", lambda hours: ([], {"feeds_total": 3, "feeds_live": 0}))
+    seen: dict[str, Any] = {}
+
+    def _trader(technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None):
+        seen["evidence_status"] = sentiment_report.get("evidence_status")
+        from agents.trader import decide_trade as real_decide  # noqa: F401  (the real trader is not called; emulate its rule)
+
+        action = "HOLD" if sentiment_report.get("evidence_status") == "INSUFFICIENT" else "BUY"
+        return {"action": action, "confidence": 0.8, "reasoning": "t", "risk_level": "MID", "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}}
+
+    monkeypatch.setattr(main, "decide_trade", _trader)
+    result = main.run_once(baseline_spread=10.0)
+    assert seen["evidence_status"] == "INSUFFICIENT" and result["action"] == "HOLD"
+    row = _read_single_row(log_path)
+    assert row["news_feed_health"] == "BAD" and row["news_feeds_live"] == "0/3"
+
+    # Same cycle with healthy feeds and no items: the trader may act.
+    (tmp_path / "b").mkdir(exist_ok=True)
+    log_path2 = _patch_run_once_common(monkeypatch, tmp_path / "b")
+    _action_aware_risk_plan(monkeypatch)
+    monkeypatch.setattr(main, "fetch_news_with_meta", lambda hours: ([], {"feeds_total": 3, "feeds_live": 3}))
+    monkeypatch.setattr(main, "decide_trade", _trader)
+    result = main.run_once(baseline_spread=10.0)
+    assert seen["evidence_status"] == "NO_NEWS" and result["action"] == "BUY"
+    assert _read_single_row(log_path2)["news_feed_health"] == "GOOD"
+
+
+def test_run_once_holds_when_panel_chair_failed(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    _action_aware_risk_plan(monkeypatch)
+    monkeypatch.setattr(
+        main,
+        "should_execute_debate",
+        lambda technical_report, sentiment_report, macro_report: {"should_debate": True, "reason": "議論実行", "technical_direction": "BUY", "sentiment_direction": "NEUTRAL", "macro_direction": "NEUTRAL", "alignment": "MIXED", "estimated_confidence": 0.55},
+    )
+    monkeypatch.setattr(
+        main,
+        "run_debate_graph",
+        lambda technical_report, sentiment_report, macro_report, **kwargs: {
+            "axis": "panel",
+            "regime_summary": {"regime": "TREND", "regime_confidence": None, "panel_agreement": 0.6, "panel_votes_available": 3, "panel_vote_distribution": {"TREND_CONTINUATION": 2, "MEAN_REVERSION": 1, "UNCLEAR": 0}, "panel_consensus_type": "MAJORITY", "entry_style": "LIMIT_PULLBACK", "source": "vote_fallback_log_only"},
+            "judge_summary": {"conflicts": ["議長が回答しなかったため分析官の多数決で代替"], "stronger_side": "bull", "confidence_shift": {"bull": [], "bear": []}},
+            "_meta": {"ok": False, "judge_ok": False, "judge_status": "FAILED", "judge_error": "invalid chair output", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+        },
+    )
+    result = main.run_once(baseline_spread=10.0)
+    assert result["action"] == "HOLD" and "議論エンジン失敗" in result["reasoning"]
+    row = _read_single_row(log_path)
+    assert row["judge_status"] == "FAILED" and row["judge_parse_ok"] == "False"
+    assert row["regime_source"] == "vote_fallback_log_only" and row["regime_confidence"] == ""
+    assert row["panel_agreement"] == "0.6" and row["panel_votes_available"] == "3" and row["panel_consensus_type"] == "MAJORITY"
+    assert json.loads(row["panel_vote_distribution"])["TREND_CONTINUATION"] == 2
+
+
+def test_run_once_rejects_market_order_when_net_rr_after_spread_is_too_low(tmp_path: Path, monkeypatch) -> None:
+    from risk.risk_manager import build_risk_plan as real_build_risk_plan
+
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "build_risk_plan", real_build_risk_plan)
+    monkeypatch.setattr(main, "get_spread_price", lambda symbol: 0.5)
+    # ATR 2.0 -> SL 3.0 below 100; TP suggested at 104.6: gross 1.53, net (4.6-0.5)/(3.0+0.5)=1.17
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+            "action": "BUY", "confidence": 0.8, "reasoning": "t", "risk_level": "MID", "suggested_tp": 104.6,
+            "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
+        },
+    )
+    result = main.run_once(baseline_spread=10.0)
+    assert result["action"] == "HOLD" and result["filter_reason"] == "skipped_low_rr"
+    row = _read_single_row(log_path)
+    assert row["gross_rr"] == "1.5333" and row["net_rr"] == "1.1714" and row["spread_cost"] == "0.5"
+    assert row["rr_rejection_reason"] == "net_rr_below_min" and row["effective_rr"] == "1.1714"

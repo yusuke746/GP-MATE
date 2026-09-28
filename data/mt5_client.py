@@ -288,6 +288,25 @@ def get_spread(symbol: str) -> float:
         disconnect()
 
 
+def get_spread_price(symbol: str) -> float | None:
+    """Current ask - bid in price units (USD for XAUUSD); None when unavailable."""
+    if not connect():
+        return None
+    try:
+        if mt5 is None or not _ensure_symbol(symbol):
+            return None
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+        spread = float(tick.ask - tick.bid)
+        return spread if spread >= 0 else None
+    except Exception as exc:
+        LOGGER.exception("get_spread_price exception: %s", exc)
+        return None
+    finally:
+        disconnect()
+
+
 def get_baseline_spread(
     symbol: str,
     samples: int = 20,
