@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from agents.base import decision_model, get_default_client
-from config import CLOSE_CONFIDENCE_THRESHOLD, SYMBOL, MACRO_AGAINST_CLOSE_THRESHOLD
+from config import CLOSE_CONFIDENCE_THRESHOLD, SYMBOL
 
 SYSTEM_PROMPT = (
     "あなたは保有ポジションを評価するトレーダーです。"
@@ -12,9 +12,9 @@ SYSTEM_PROMPT = (
     "明確に逆方向の根拠が強い場合のみCLOSEを選び、それ以外はHOLDを優先してください。"
     "逆方向でも確信が弱い場合は慌てて決済せずHOLDにしてください。"
     "同方向または中立ならHOLDにしてください。"
-    "macro_context.macro_vs_position が AGAINST かつ macro_confidence が高い場合は、"
-    "保有方向にマクロの逆風が強いことを意味するため、CLOSE寄りの検討材料として重視してください。"
-    "ただし逆風が単一材料のみで確信が弱い場合はHOLDを維持してください。"
+    "macro_context.macro_vs_position が AGAINST の場合は保有方向にマクロの逆風があることを意味する。"
+    "macro.key_drivers の根拠が具体的で複数あるならCLOSE寄りの検討材料とし、"
+    "単一材料のみならHOLDを維持してください。"
     "confidenceは判断の確からしさ(0-1)を正直に申告すること。"
     "決済可否の閾値判定はシステム側で行うため、閾値を意識して数値を調整しないこと。"
     "必ず evaluate_position_action 関数を呼び出して返答してください。"
@@ -66,7 +66,6 @@ def evaluate_position(
 
     position_side = str(position_context.get("type", "") or "").upper()
     macro_bias = str((macro_report or {}).get("macro_bias", "NEUTRAL") or "NEUTRAL").upper()
-    macro_conf = float((macro_report or {}).get("confidence", 0.0) or 0.0)
     macro_vs_position = "NEUTRAL"
     if macro_bias == "BULLISH":
         macro_vs_position = "ALIGNED" if position_side == "BUY" else ("AGAINST" if position_side == "SELL" else "NEUTRAL")
@@ -74,10 +73,8 @@ def evaluate_position(
         macro_vs_position = "ALIGNED" if position_side == "SELL" else ("AGAINST" if position_side == "BUY" else "NEUTRAL")
     macro_context = {
         "macro_bias": macro_bias,
-        "macro_confidence": macro_conf,
         "position_side": position_side,
         "macro_vs_position": macro_vs_position,
-        "against_close_threshold": MACRO_AGAINST_CLOSE_THRESHOLD,
         "macro_reliable": bool((macro_report or {}).get("_meta", {}).get("ok", False)),
     }
 

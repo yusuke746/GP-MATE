@@ -1,32 +1,46 @@
+"""News sentiment analyst.
+
+The analyst is asked what is *new* in the headlines and whether that supports
+the current price trend continuing or reversing. It is no longer told how to
+weight particular headline types; it is told what the headlines are and asked
+for its reading. A numeric ``score`` is still emitted for the trade log and
+the debate gate, derived from the analyst's stated bias when it does not give
+one itself.
+"""
+
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Final
 
 from agents.base import analysis_model, get_default_client
 
 LOGGER = logging.getLogger(__name__)
 
+REGIME_VIEW_VALUES: Final[tuple[str, ...]] = ("SUPPORTS_CONTINUATION", "SUPPORTS_REVERSAL", "UNCLEAR")
+BIAS_SCORE: Final[dict[str, float]] = {"BULLISH": 0.5, "BEARISH": -0.5, "NEUTRAL": 0.0}
+
 SYSTEM_PROMPT = (
-    "あなたはGOLD(XAU/USD)のニュースセンチメント専門家です。"
-    "ニュース全体が『金価格にとって』強気か弱気かを評価してください。"
-    "注意: 株高・リスクオン材料は株式には強気でも、安全資産の金には中立〜弱気になり得る。"
-    "必ず金価格への影響として評価すること。"
-    "重要: 価格の値動きをそのまま記述しただけの見出し"
-    "(例:『Gold storms higher』『金が最高値更新』『金が急落』)は、"
-    "すでに価格に織り込まれた遅行情報でありテクニカル分析と独立した証拠にならない。"
-    "そのような見出し単体のscore寄与は±0.3以内に抑え、"
-    "金利・ドル・地政学・需給など将来に影響する材料を重視すること。"
-    "出力形式: 必ずトップレベルに次の3キーを持つJSONのみを返すこと: "
-    "score(-1〜1の総合値。全ニュースを1つに集約した金にとっての方向), "
-    "dominant_news(最も影響の大きい見出し), reasoning(日本語の説明)。"
-    "ニュースごとの個別評価をevaluationsキーに含めてもよいが、"
-    "総合scoreのトップレベル出力を省略してはならない。"
+    "あなたはGOLD(XAU/USD)のニュースを読む専門家です。"
+    "与えられた見出し(と、あれば本文の抜粋・経済指標の結果)だけを材料に、あなた自身の判断で答えてください。"
+    "見出しの種類ごとの採点規則はありません。あなたの読みがそのまま採用されます。"
+    "答える問い: (1) この中で『金価格にとって新しい情報』は何か(すでに起きた値動きをなぞるだけの見出しと区別する)。"
+    "(2) 新しい情報を総合すると、金にとって強気・弱気・中立のどれか。"
+    "(3) それはいまの価格トレンドの継続を支えるか、反転を促すか、どちらとも言えないか。"
+    "(4) 最も影響の大きい見出しはどれか。"
+    "株式やドルへの影響ではなく、金価格への影響として評価すること。"
+    "材料が乏しい、または互いに打ち消し合うときはNEUTRAL/UNCLEARでよく、無理に方向を出さないこと。"
+    "出力は次のキーだけを持つJSON: "
+    "{gold_bias: 'BULLISH'|'BEARISH'|'NEUTRAL', regime_view: 'SUPPORTS_CONTINUATION'|'SUPPORTS_REVERSAL'|'UNCLEAR', "
+    "new_information: string[](新しい情報の要約、無ければ空), price_echo_count: number(値動きをなぞるだけの見出しの本数), "
+    "dominant_news: string, reasoning: string(日本語)}"
 )
 
 FALLBACK_RESPONSE: dict[str, Any] = {
     "score": 0.0,
+    "gold_bias": "NEUTRAL",
+    "regime_view": "UNCLEAR",
     "dominant_news": "N/A",
     "reasoning": "ニュース分析失敗のため中立判定。",
     "news_count": 0,
@@ -42,12 +56,13 @@ def _safe_float_or_none(value: Any) -> float | None:
 
 
 def _normalize_sentiment_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Guarantee a top-level aggregate score/dominant_news/reasoning.
+    """Guarantee gold_bias / regime_view / score / dominant_news / reasoning.
 
-    Some models return only per-item `evaluations` despite the format
-    instruction; without this, downstream direction logic reads score=0.0
-    (always NEUTRAL). Aggregate from the items when the top level is missing.
+    ``score`` comes from the analyst if given, else from ``gold_bias``, else
+    from the mean of per-item ``evaluations`` (some models still return those),
+    else 0.0. It exists for the log and the debate gate, not as the analysis.
     """
+    bias = str(payload.get("gold_bias", "") or "").upper().strip()
     score = _safe_float_or_none(payload.get("score"))
 
     evaluations = payload.get("evaluations")
@@ -60,38 +75,40 @@ def _normalize_sentiment_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if item_score is not None:
                 items.append((item_score, item))
 
+    if score is None and bias in BIAS_SCORE:
+        score = BIAS_SCORE[bias]
     if score is None and items:
         score = sum(value for value, _ in items) / len(items)
-        LOGGER.info(
-            "sentiment: top-level score missing; aggregated %.3f from %d item evaluations",
-            score,
-            len(items),
-        )
-
+        LOGGER.info("sentiment: top-level score missing; aggregated %.3f from %d item evaluations", score, len(items))
     if score is None:
         score = 0.0
-
     payload["score"] = max(-1.0, min(1.0, score))
+
+    if bias not in BIAS_SCORE:
+        bias = "BULLISH" if payload["score"] >= 0.15 else ("BEARISH" if payload["score"] <= -0.15 else "NEUTRAL")
+    payload["gold_bias"] = bias
+
+    regime_view = str(payload.get("regime_view", "") or "").upper().strip()
+    payload["regime_view"] = regime_view if regime_view in REGIME_VIEW_VALUES else "UNCLEAR"
+
+    new_info = payload.get("new_information")
+    payload["new_information"] = [str(x) for x in new_info if str(x).strip()] if isinstance(new_info, list) else []
+    try:
+        payload["price_echo_count"] = int(payload.get("price_echo_count") or 0)
+    except (TypeError, ValueError):
+        payload["price_echo_count"] = 0
 
     if not str(payload.get("dominant_news", "") or "").strip():
         if items:
             _, dominant = max(items, key=lambda pair: abs(pair[0]))
-            payload["dominant_news"] = str(
-                dominant.get("title") or dominant.get("dominant_news") or "N/A"
-            )
+            payload["dominant_news"] = str(dominant.get("title") or dominant.get("dominant_news") or "N/A")
         else:
             payload["dominant_news"] = "N/A"
 
     if not str(payload.get("reasoning", "") or "").strip():
         if items:
-            parts = [
-                str(item.get("reasoning", "") or "").strip()
-                for _, item in items
-                if str(item.get("reasoning", "") or "").strip()
-            ]
-            payload["reasoning"] = (
-                " / ".join(parts[:4]) if parts else "個別評価の平均から総合スコアを算出。"
-            )
+            parts = [str(item.get("reasoning", "") or "").strip() for _, item in items if str(item.get("reasoning", "") or "").strip()]
+            payload["reasoning"] = " / ".join(parts[:4]) if parts else "個別評価の平均から総合スコアを算出。"
         else:
             payload["reasoning"] = "総合スコアの根拠が取得できなかったため中立寄りで扱う。"
 
@@ -102,6 +119,10 @@ def analyze_sentiment(news_items: list[dict[str, Any]]) -> dict[str, Any]:
     if len(news_items) == 0:
         return {
             "score": 0.0,
+            "gold_bias": "NEUTRAL",
+            "regime_view": "UNCLEAR",
+            "new_information": [],
+            "price_echo_count": 0,
             "dominant_news": "N/A",
             "reasoning": "ニュースが取得できず判断材料不足。安全側で見送りを推奨。",
             "news_count": 0,
@@ -110,17 +131,13 @@ def analyze_sentiment(news_items: list[dict[str, Any]]) -> dict[str, Any]:
                 "ok": True,
                 "model": "none",
                 "error": "",
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             },
         }
 
     user_prompt = (
-        "以下ニュースが金(XAU/USD)にとって強気/中立/弱気かを評価し、"
-        "全体を1つに集約したscore(-1~1)をトップレベルに算出してください。\n"
+        "以下の見出し群について、金にとって新しい情報は何か、総合して強気/弱気/中立のどれか、"
+        "いまのトレンドの継続を支えるか反転を促すかを、あなた自身の判断で答えてください。\n"
         f"{json.dumps(news_items, ensure_ascii=False)}"
     )
 
