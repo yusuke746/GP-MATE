@@ -63,9 +63,6 @@ class Settings:
     close_confidence_threshold: float
     max_daily_loss_pct: float
     consecutive_loss_limit: int
-    macro_debate_conf_threshold: float
-    macro_bias_carry_threshold: float
-    macro_against_close_threshold: float
 
     atr_multiplier_sl: float
     risk_reward_ratio: float
@@ -263,9 +260,6 @@ def load_settings() -> Settings:
         close_confidence_threshold=_get_env_float("CLOSE_CONFIDENCE_THRESHOLD", 0.7),
         max_daily_loss_pct=_get_env_float("MAX_DAILY_LOSS_PCT", 0.03),
         consecutive_loss_limit=_get_env_int("CONSECUTIVE_LOSS_LIMIT", 3),
-        macro_debate_conf_threshold=_get_env_float("MACRO_DEBATE_CONF_THRESHOLD", 0.65),
-        macro_bias_carry_threshold=_get_env_float("MACRO_BIAS_CARRY_THRESHOLD", 0.65),
-        macro_against_close_threshold=_get_env_float("MACRO_AGAINST_CLOSE_THRESHOLD", 0.70),
         atr_multiplier_sl=_get_env_float("ATR_MULTIPLIER_SL", 1.5),
         risk_reward_ratio=_get_env_float("RISK_REWARD_RATIO", 2.0),
         breakeven_buffer=_get_env_float("BREAKEVEN_BUFFER", 0.1),
@@ -312,9 +306,6 @@ CONFIDENCE_THRESHOLD: Final[float] = settings.confidence_threshold
 CLOSE_CONFIDENCE_THRESHOLD: Final[float] = settings.close_confidence_threshold
 MAX_DAILY_LOSS_PCT: Final[float] = settings.max_daily_loss_pct
 CONSECUTIVE_LOSS_LIMIT: Final[int] = settings.consecutive_loss_limit
-MACRO_DEBATE_CONF_THRESHOLD: Final[float] = settings.macro_debate_conf_threshold
-MACRO_BIAS_CARRY_THRESHOLD: Final[float] = settings.macro_bias_carry_threshold
-MACRO_AGAINST_CLOSE_THRESHOLD: Final[float] = settings.macro_against_close_threshold
 
 ATR_MULTIPLIER_SL: Final[float] = settings.atr_multiplier_sl
 RISK_REWARD_RATIO: Final[float] = settings.risk_reward_ratio
@@ -393,7 +384,6 @@ MIN_RISK_REWARD_RATIO: Final[float] = _get_env_float("MIN_RISK_REWARD_RATIO", 1.
 # The LLM may only LOWER the rule-based macro confidence (never raise it), and
 # by at most this much, so its narrative and the number handed downstream
 # (debate gate, trader) cannot disagree by more than one notch.
-MACRO_LLM_CONF_MAX_DOWNSHIFT: Final[float] = _get_env_float("MACRO_LLM_CONF_MAX_DOWNSHIFT", 0.15)
 
 # --------------------------------------------------------------------------- #
 # Pending-order placement window
@@ -451,5 +441,10 @@ FORECAST_SAMPLES: Final[int] = max(1, _get_env_int("FORECAST_SAMPLES", 1))
 # therefore which order type fits?). Production keeps "direction" until the
 # forecast-only A/B (FORECAST_DEBATE_AXIS) shows the regime axis calibrates
 # better; flip with DEBATE_AXIS=regime.
+# "panel": the three analysts (technical / macro / sentiment) discuss
+# "trend continuation or reversal?" with no assigned sides; a chair summarises.
 DEBATE_AXIS: Final[str] = _get_env_str("DEBATE_AXIS", "direction").lower()
-FORECAST_DEBATE_AXIS: Final[str] = _get_env_str("FORECAST_DEBATE_AXIS", "regime").lower()
+FORECAST_DEBATE_AXIS: Final[str] = _get_env_str("FORECAST_DEBATE_AXIS", "panel").lower()
+# Panel rounds: 1 = each analyst speaks once after reading the others' reports
+# (3 calls + chair). 2 adds a reply round (6 calls + chair).
+PANEL_DEBATE_ROUNDS: Final[int] = max(1, min(3, _get_env_int("PANEL_DEBATE_ROUNDS", 1)))
