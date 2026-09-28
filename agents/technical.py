@@ -6,11 +6,27 @@ from typing import Any, Final, Literal, TypedDict, cast
 from agents.base import analysis_model, get_default_client
 
 SYSTEM_PROMPT = (
-    "あなたは経験20年のテクニカルアナリストです。"
-    "与えられたデータのみで判断し、必ずJSONで返してください。"
-    "出力JSONのトップレベルには必ず reasoning キー（日本語の説明文字列）を含めること。"
-    "summary や details など別のキー名に説明を書いてはならない。"
+    "あなたはGOLD(XAU/USD)のテクニカル分析官です。"
+    "与えられた多時間軸(D1/H4/H1)の指標スナップショット、水平帯(supports/resistances)、"
+    "価格構造(直近スイングの高値安値の並び、未充填のFVG)だけを材料に、自分の判断で相場を読んでください。"
+    "採点表や『この条件ならこう答える』という固定の規則はありません。あなたの読みがそのまま採用されます。"
+    "答える問い: (1) D1の方向と執行足(H4/H1)の方向、その整合性。"
+    "(2) いまはトレンド継続局面(押し目買い/戻り売りやブレイク追随が機能する)か、"
+    "反転・平均回帰局面(帯の端で反対方向に戻りやすい)か、判断できないか。"
+    "(3) その読みを支える具体的な価格(支持・抵抗)と、読みが崩れる価格(invalidation)。"
+    "根拠が弱いときはRANGEやUNCLEARと答えてよく、無理に方向を出す必要はありません。"
+    "複数の独立した根拠(例: 上位足のスイング構造とFVGと水平帯が同じ価格帯を指す)が重なるときだけ、"
+    "evidenceにそれを列挙して強い読みとしてください。"
+    "出力は次のキーだけを持つJSON: "
+    "{d1_trend: 'UP'|'DOWN'|'RANGE', execution_trend: 'UP'|'DOWN'|'RANGE', "
+    "alignment: 'ALIGNED'|'DIVERGENT'|'MIXED', "
+    "regime_view: 'TREND_CONTINUATION'|'MEAN_REVERSION'|'UNCLEAR', "
+    "direction_if_trend: 'UP'|'DOWN'|'NEUTRAL', "
+    "key_prices: {supports: number[], resistances: number[], invalidation: number|null}, "
+    "evidence: string[], what_would_change_view: string, reasoning: string(日本語)}"
 )
+
+REGIME_VIEW_VALUES: Final[tuple[str, ...]] = ("TREND_CONTINUATION", "MEAN_REVERSION", "UNCLEAR")
 
 TIMEFRAME_TREND_VALUES: Final[tuple[Literal["UP", "DOWN", "RANGE"], ...]] = (
     "UP",
@@ -357,58 +373,136 @@ def _build_legacy_baseline(indicator_payload: dict[str, Any], horizontal_levels:
     return result
 
 
+def _enum(value: Any, allowed: tuple[str, ...] | set[str]) -> str | None:
+    text = str(value or "").upper().strip()
+    return text if text in allowed else None
+
+
+def _price_list(value: Any) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    out: list[float] = []
+    for item in value:
+        try:
+            out.append(round(float(item), 5))
+        except (TypeError, ValueError):
+            continue
+    return out[:6]
+
+
+def _analyst_view(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The LLM's own read, validated. None when it did not answer the question
+    (then the rule-based baseline is used as a fail-safe, and says so)."""
+    execution_trend = _enum(payload.get("execution_trend"), TIMEFRAME_TREND_VALUES)
+    if execution_trend is None:
+        return None
+    d1_trend = _enum(payload.get("d1_trend"), TIMEFRAME_TREND_VALUES) or "RANGE"
+    alignment = _enum(payload.get("alignment"), ALIGNMENT_VALUES) or _alignment_from_trends(
+        cast(Literal["UP", "DOWN", "RANGE"], d1_trend), cast(Literal["UP", "DOWN", "RANGE"], execution_trend)
+    )
+    regime_view = _enum(payload.get("regime_view"), REGIME_VIEW_VALUES) or "UNCLEAR"
+    direction = _enum(payload.get("direction_if_trend"), ("UP", "DOWN", "NEUTRAL")) or "NEUTRAL"
+    if regime_view != "TREND_CONTINUATION":
+        direction = "NEUTRAL"
+    key_prices_raw = payload.get("key_prices") if isinstance(payload.get("key_prices"), dict) else {}
+    invalidation = None
+    try:
+        if key_prices_raw.get("invalidation") is not None:
+            invalidation = round(float(key_prices_raw.get("invalidation")), 5)
+    except (TypeError, ValueError):
+        invalidation = None
+    evidence_raw = payload.get("evidence")
+    evidence = [str(x) for x in evidence_raw if str(x).strip()] if isinstance(evidence_raw, list) else []
+    return {
+        "d1_trend": d1_trend,
+        "execution_trend": execution_trend,
+        "alignment": alignment,
+        "regime_view": regime_view,
+        "direction_if_trend": direction,
+        "key_prices": {
+            "supports": _price_list(key_prices_raw.get("supports")),
+            "resistances": _price_list(key_prices_raw.get("resistances")),
+            "invalidation": invalidation,
+        },
+        "evidence": evidence,
+        "what_would_change_view": str(payload.get("what_would_change_view", "") or ""),
+        "reasoning": str(payload.get("reasoning") or payload.get("summary") or "").strip(),
+    }
+
+
 def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
     direction_payload = _extract_direction_context(indicator_payload)
     tp_reference_only = _extract_tp_reference_only(indicator_payload)
     horizontal_levels = _extract_horizontal_levels(direction_payload, tp_reference_only)
 
     has_multi_timeframe = any(key in direction_payload for key in ("h4", "h1", "d1", "execution"))
+    # Rule-based read: fail-safe only. It is what the report falls back to when
+    # the analyst does not answer; it no longer overrides the analyst.
     baseline = (
         _build_multitimeframe_baseline(direction_payload, horizontal_levels)
         if has_multi_timeframe
         else _build_legacy_baseline(direction_payload, horizontal_levels)
     )
 
-    if has_multi_timeframe:
-        user_prompt = (
-            "以下の多時間軸インジケータ情報から、D1と執行足(H4/H1)の整合性を説明してください。\n"
-            "重要: D1は大局、H4/H1は執行足として扱い、alignmentをALIGNED/DIVERGENT/MIXEDで要約してください。\n"
-            "D1が無い/壊れている場合は、執行足のみで安全側に判断してください。\n"
-            "注意: tp_reference_only は利確ターゲット専用であり、方向判断には使わないでください。\n"
-            '出力形式: {"alignment": "ALIGNED|DIVERGENT|MIXED", "reasoning": "日本語の説明"} のJSONのみ。\n'
-            f"{json.dumps(direction_payload, ensure_ascii=False)}"
-        )
-    else:
-        user_prompt = (
-            "以下のインジケータ情報から、trend/signal/key_levels/reasoningをJSONで返してください。\n"
-            "注意: tp_reference_only は利確ターゲット専用であり、方向判断には使わないでください。\n"
-            f"{json.dumps(direction_payload, ensure_ascii=False)}"
-        )
+    analyst_input = {
+        "timeframes": {
+            key: direction_payload.get(key)
+            for key in ("d1", "h4", "h1", "execution")
+            if isinstance(direction_payload.get(key), dict)
+        },
+        "technical_notes": direction_payload.get("technical", {}),
+        "structure": direction_payload.get("structure", {}),
+        "horizontal_levels": horizontal_levels,
+    }
+    user_prompt = (
+        "以下の材料から、D1と執行足(H4/H1)の方向、いまがトレンド継続か反転(平均回帰)か判断不能か、"
+        "鍵となる価格と読みが崩れる価格を、あなた自身の判断で答えてください。\n"
+        "horizontal_levelsは複数時間軸のスイングとキリ番から機械的に集めた水平帯、"
+        "structureは直近スイングの並びと未充填FVGの事実です。意味づけはあなたが行ってください。\n"
+        f"{json.dumps(analyst_input, ensure_ascii=False)}"
+    )
 
     result = get_default_client().call_json(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         model=analysis_model(),
-        fallback_payload=dict(baseline),
+        fallback_payload={},
     )
 
-    payload = dict(result.payload)
-    merged: TechnicalAnalysisResult = dict(baseline)
-    for key in ("reasoning", "key_levels", "trend", "signal"):
-        if key in payload:
-            merged[key] = payload[key]
+    payload = dict(result.payload) if isinstance(result.payload, dict) else {}
+    view = _analyst_view(payload) if bool(result.ok) else None
 
-    merged["trend"] = baseline["trend"]
-    merged["signal"] = baseline["signal"]
+    merged: TechnicalAnalysisResult = dict(baseline)
+    if view is not None:
+        execution_trend = cast(Literal["UP", "DOWN", "RANGE"], view["execution_trend"])
+        merged["trend"] = execution_trend
+        merged["signal"] = _direction_to_signal(execution_trend)
+        merged["d1_trend"] = cast(Literal["UP", "DOWN", "RANGE"], view["d1_trend"])
+        merged["execution_trend"] = execution_trend
+        merged["alignment"] = cast(Literal["ALIGNED", "DIVERGENT", "MIXED"], view["alignment"])
+        merged["reasoning"] = view["reasoning"] or baseline["reasoning"]
+        source = "analyst"
+    else:
+        merged["reasoning"] = "【ルールベース代替】" + baseline["reasoning"]
+        source = "rule_based_fallback"
+
+    # key_levels keeps the factual part (snapshots, horizontal levels) and adds
+    # the analyst's own price picks under "analyst".
+    key_levels = dict(baseline["key_levels"])
+    key_levels["analyst"] = view["key_prices"] if view is not None else {"supports": [], "resistances": [], "invalidation": None}
+    merged["key_levels"] = key_levels
     merged["rsi_14"] = baseline["rsi_14"]
-    merged["key_levels"] = baseline["key_levels"]
-    # Some models put their narrative under "summary" despite the format
-    # instruction; accept it as a fallback so the LLM call is not wasted.
-    llm_reasoning = str(payload.get("reasoning") or payload.get("summary") or "").strip()
-    merged["reasoning"] = llm_reasoning or baseline["reasoning"]
-    merged["d1_trend"] = baseline["d1_trend"]
-    merged["execution_trend"] = baseline["execution_trend"]
-    merged["alignment"] = baseline["alignment"]
+    merged["regime_view"] = view["regime_view"] if view is not None else "UNCLEAR"  # type: ignore[typeddict-unknown-key]
+    merged["direction_if_trend"] = view["direction_if_trend"] if view is not None else "NEUTRAL"  # type: ignore[typeddict-unknown-key]
+    merged["evidence"] = view["evidence"] if view is not None else []  # type: ignore[typeddict-unknown-key]
+    merged["what_would_change_view"] = view["what_would_change_view"] if view is not None else ""  # type: ignore[typeddict-unknown-key]
+    merged["source"] = source  # type: ignore[typeddict-unknown-key]
+    merged["rule_based_view"] = {  # type: ignore[typeddict-unknown-key]
+        "trend": baseline["trend"],
+        "d1_trend": baseline["d1_trend"],
+        "execution_trend": baseline["execution_trend"],
+        "alignment": baseline["alignment"],
+    }
     if isinstance(indicator_payload.get("direction_context"), dict):
         merged["direction_context"] = dict(direction_payload)
     if isinstance(indicator_payload.get("tp_reference_only"), dict):

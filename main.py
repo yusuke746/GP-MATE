@@ -65,6 +65,7 @@ from agents.technical import EXTENSION_ATR_CAUTION, calc_extension_atr
 from indicators.ta_calc import add_indicators
 from indicators.horizontal_levels import build_horizontal_levels
 from indicators.regime import classify_regime
+from indicators.structure import build_structure_context
 from risk.risk_manager import build_risk_plan, check_filters
 from risk.breakeven import should_move_to_breakeven
 
@@ -923,6 +924,8 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
                 "note": _extension_note(d1_extension),
             },
         },
+        # Price-structure facts (swings, unfilled FVGs) for the analyst to interpret.
+        "structure": build_structure_context({"d1": d1, "h4": h4, "h1": h1}),
     }
     tp_reference_only = _build_tp_reference_only(
         horizontal_levels=horizontal_levels,

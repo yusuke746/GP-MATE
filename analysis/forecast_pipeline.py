@@ -46,6 +46,7 @@ from data.mt5_client import get_rates
 from data.news_client import fetch_news_with_meta
 from indicators.horizontal_levels import build_horizontal_levels
 from indicators.regime import classify_regime
+from indicators.structure import build_structure_context
 from indicators.ta_calc import add_indicators
 
 LOGGER = logging.getLogger(__name__)
@@ -126,6 +127,7 @@ def build_reports(frames: dict[str, pd.DataFrame], use_debate: bool = FORECAST_U
                 "note": trading_main._extension_note(d1_extension),
             },
         },
+        "structure": build_structure_context({"d1": d1, "h4": h4, "h1": h1}),
     }
     tp_reference_only = trading_main._build_tp_reference_only(
         horizontal_levels=horizontal_levels,
