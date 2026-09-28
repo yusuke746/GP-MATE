@@ -90,6 +90,31 @@ of the stated views is used and marked `vote_fallback`. The trader is told to
 set a directional bias and pending orders only when the panel points the same
 way, and otherwise to stay flat. A few entries per day is the intended pace.
 
+## Data integrity and fail-safes
+
+- **Closed bars only.** `data/confirmed_bars.py` fetches a margin of extra
+  bars, converts MT5 server time to UTC, drops the forming bar and keeps the
+  last 300 closed bars before any indicator, swing, gap or level is computed.
+  Both the trading loop and the forecast logger use it. The trade log records
+  `last_closed_bar_h1/h4/d1`, `dropped_open_bar`, `closed_bar_count` and
+  `bar_age_seconds`; fewer than 60 closed bars on any timeframe is a HOLD.
+- **Chair failure is a HOLD.** The panel chair gets one retry; if its output
+  is still missing or outside the enums, `judge_status=FAILED`, the report is
+  not ok and the trading loop holds. The analysts' majority vote is kept for
+  the log only (`regime_source=vote_fallback_log_only`).
+- **Symmetric panel rounds.** In round 1 every analyst sees the three reports
+  and no statements, so speaking order cannot anchor anyone; round 2 (optional)
+  shows everyone the same round-1 statements. `panel_agreement` (0.8 / 0.6 /
+  0.4 for unanimous / majority / split, with `panel_votes_available` and the
+  vote distribution) is an agreement measure, not a probability, and is never
+  used as an order threshold.
+- **Feed state before news count.** Dead feeds (`news_feed_health=BAD`) make
+  the sentiment evidence INSUFFICIENT and the trader holds; healthy feeds with
+  no items are `NO_NEWS` (neutral) and trading continues.
+- **RR net of spread.** `net_rr = (tp - spread) / (sl + spread)` must reach
+  `MIN_RISK_REWARD_RATIO`; `gross_rr`, `spread_cost`, `net_rr` and
+  `rr_rejection_reason` are logged.
+
 ## Regime (Trend vs Range)
 
 `indicators/regime.py` classifies every cycle as TREND / RANGE / TRANSITION from

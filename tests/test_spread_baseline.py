@@ -63,6 +63,7 @@ def test_run_once_holds_when_spread_exceeds_multiplier(tmp_path: Path, monkeypat
                     "recent_low_20": 2280.0,
                 }
             ]
+            * main.MIN_CONFIRMED_BARS
         )
 
     monkeypatch.setattr(main, "get_rates", lambda symbol, tf, count: _dummy_df())
@@ -104,7 +105,7 @@ def test_run_once_holds_when_spread_exceeds_multiplier(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         main,
         "build_risk_plan",
-        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None: {
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
             "ok": True,
             "action": "BUY",
             "lot": 0.1,

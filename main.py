@@ -23,7 +23,7 @@ from agents.data.macro_inputs import build_macro_inputs
 from agents.data.releases import releases_as_news_items
 from agents.evaluate_position import evaluate_position
 from agents.macro_analyst import analyze_macro_environment
-from agents.sentiment import analyze_sentiment
+from agents.sentiment import analyze_sentiment, sentiment_for_feed_state
 from agents.technical import analyze_technical
 from agents.trader import decide_trade
 from config import (
@@ -45,6 +45,7 @@ from config import (
     SPREAD_SAMPLES,
     SYMBOL,
 )
+from data.confirmed_bars import get_confirmed_rates
 from data.mt5_client import (
     cancel_pending_orders,
     close_position,
@@ -55,6 +56,7 @@ from data.mt5_client import (
     get_positions,
     get_rates,
     get_spread,
+    get_spread_price,
     get_usd_jpy_rate,
     modify_sl,
     place_pending_order,
@@ -176,7 +178,27 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "regime_confidence",
     "entry_style",
     "regime_source",
+    "judge_status",
+    "panel_agreement",
+    "panel_votes_available",
+    "panel_vote_distribution",
+    "panel_consensus_type",
+    "news_feed_health",
+    "gross_rr",
+    "spread_cost",
+    "net_rr",
+    "rr_rejection_reason",
+    "last_closed_bar_h1",
+    "last_closed_bar_h4",
+    "last_closed_bar_d1",
+    "dropped_open_bar",
+    "closed_bar_count",
+    "bar_age_seconds",
 )
+
+# Fewest closed bars a judgment may be based on (indicators need ~26 for
+# MACD / 20 for BB and highs / 14 for ATR and ADX, plus warm-up).
+MIN_CONFIRMED_BARS = 60
 
 
 def _ensure_trade_log_header() -> None:
@@ -809,6 +831,24 @@ def _default_debate_log_fields() -> dict[str, Any]:
         "regime_confidence": "",
         "entry_style": "",
         "regime_source": "",
+        "judge_status": "",
+        "panel_agreement": "",
+        "panel_votes_available": "",
+        "panel_vote_distribution": "",
+        "panel_consensus_type": "",
+    }
+
+
+def _panel_log_fields(debate_report: Any) -> dict[str, Any]:
+    """panel_* columns from the panel debate's regime_summary ('' otherwise)."""
+    summary = debate_report.get("regime_summary") if isinstance(debate_report, dict) else None
+    if not isinstance(summary, dict) or "panel_agreement" not in summary:
+        return {}
+    return {
+        "panel_agreement": summary.get("panel_agreement", ""),
+        "panel_votes_available": summary.get("panel_votes_available", ""),
+        "panel_vote_distribution": _safe_json_dumps(summary.get("panel_vote_distribution", {}), default="{}"),
+        "panel_consensus_type": str(summary.get("panel_consensus_type", "") or ""),
     }
 
 
@@ -852,6 +892,7 @@ def _extract_debate_log_fields(
 ) -> dict[str, Any]:
     fields = _default_debate_log_fields()
     fields.update(_regime_log_fields(technical_report, debate_report))
+    fields.update(_panel_log_fields(debate_report))
 
     should_debate = bool(gate.get("should_debate", False))
     fields["debate_executed"] = should_debate
@@ -884,14 +925,47 @@ def _extract_debate_log_fields(
         if "judge_ok" in debate_meta:
             fields["judge_parse_ok"] = bool(debate_meta.get("judge_ok"))
         fields["judge_error"] = str(debate_meta.get("judge_error", "") or "")
+        fields["judge_status"] = str(debate_meta.get("judge_status", "") or "")
 
     return fields
 
 
-def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    d1 = add_indicators(get_rates(SYMBOL, "D1", 300))
-    h4 = add_indicators(get_rates(SYMBOL, "H4", 300))
-    h1 = add_indicators(get_rates(SYMBOL, "H1", 300))
+def _bars_log_fields(bars_meta: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Which closed bars a decision used (trade-log columns)."""
+    h1 = bars_meta.get("H1", {}) if isinstance(bars_meta, dict) else {}
+    return {
+        "last_closed_bar_h1": str(h1.get("last_closed_bar_time", "") or ""),
+        "last_closed_bar_h4": str((bars_meta.get("H4", {}) if isinstance(bars_meta, dict) else {}).get("last_closed_bar_time", "") or ""),
+        "last_closed_bar_d1": str((bars_meta.get("D1", {}) if isinstance(bars_meta, dict) else {}).get("last_closed_bar_time", "") or ""),
+        "dropped_open_bar": h1.get("dropped_open_bar", ""),
+        "closed_bar_count": h1.get("closed_bar_count", ""),
+        "bar_age_seconds": h1.get("bar_age_seconds", ""),
+    }
+
+
+def _insufficient_bars_reason(bars_meta: dict[str, dict[str, Any]], minimum: int = MIN_CONFIRMED_BARS) -> str:
+    """'' when every timeframe has at least ``minimum`` closed bars, else why not."""
+    short = [
+        f"{tf}={int((bars_meta.get(tf, {}) or {}).get('closed_bar_count', 0) or 0)}"
+        for tf in ("D1", "H4", "H1")
+        if int((bars_meta.get(tf, {}) or {}).get("closed_bar_count", 0) or 0) < minimum
+    ]
+    return f"confirmed bars below {minimum}: " + ", ".join(short) if short else ""
+
+
+def _build_market_reports(
+    now_utc: datetime | None = None,
+) -> tuple[Any, Any, Any, list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    # Closed bars only: the forming bar MT5 returns last is dropped BEFORE any
+    # indicator, swing, gap or level is computed (shared with the forecast logger).
+    now = now_utc or datetime.now(UTC)
+    bars_meta: dict[str, dict[str, Any]] = {}
+    frames: dict[str, Any] = {}
+    for timeframe in ("D1", "H4", "H1"):
+        confirmed, meta = get_confirmed_rates(SYMBOL, timeframe, 300, now, fetch=get_rates)
+        bars_meta[timeframe] = meta
+        frames[timeframe] = add_indicators(confirmed) if not confirmed.empty else confirmed
+    d1, h4, h1 = frames["D1"], frames["H4"], frames["H1"]
 
     h1_latest = _extract_latest_features(h1) if not h1.empty else {}
     h4_latest = _extract_latest_features(h4) if not h4.empty else {}
@@ -956,10 +1030,23 @@ def _build_market_reports() -> tuple[Any, Any, Any, list[dict[str, Any]], dict[s
             technical_report["regime"] = classify_regime(technical_report)
         except Exception as exc:
             LOGGER.warning("classify_regime failed safely: %s", exc)
-    sentiment_report = analyze_sentiment(news_items)
+    # Feed state first: dead feeds -> INSUFFICIENT (hold); healthy feeds with
+    # nothing new -> NO_NEWS (neutral, no analyst call); otherwise analyse.
+    sentiment_report = sentiment_for_feed_state(news_items, feed_meta) or analyze_sentiment(news_items)
     if isinstance(sentiment_report, dict):
         sentiment_report["feed_meta"] = feed_meta
-    return d1, h4, h1, news_items, macro_report, technical_report, sentiment_report
+    return d1, h4, h1, news_items, macro_report, technical_report, sentiment_report, bars_meta
+
+
+def _feed_health_label(sentiment_report: Any) -> str:
+    if not isinstance(sentiment_report, dict):
+        return ""
+    label = sentiment_report.get("feed_health")
+    if label:
+        return str(label)
+    from agents.sentiment import feed_health
+
+    return feed_health(sentiment_report.get("feed_meta"))
 
 
 def _feed_health_text(sentiment_report: Any) -> str:
@@ -1110,10 +1197,17 @@ def _pending_intent_fields(pendings: Any) -> dict[str, Any]:
 def _risk_plan_log_fields(risk_plan: dict[str, Any]) -> dict[str, Any]:
     """sl_source / tp_source / effective_rr for the trade log ('' when absent)."""
     rr = risk_plan.get("effective_rr", "")
+    gross = risk_plan.get("gross_rr", "")
+    net = risk_plan.get("net_rr", "")
+    spread_cost = risk_plan.get("spread_cost", "")
     return {
         "sl_source": str(risk_plan.get("sl_source", "") or ""),
         "tp_source": str(risk_plan.get("tp_source", "") or ""),
         "effective_rr": rr if rr not in (None, "") else "",
+        "gross_rr": gross if gross not in (None, "") else "",
+        "spread_cost": spread_cost if spread_cost not in (None, "") else "",
+        "net_rr": net if net not in (None, "") else "",
+        "rr_rejection_reason": str(risk_plan.get("rr_rejection_reason", "") or ""),
     }
 
 
@@ -1128,6 +1222,7 @@ def _handle_pending_orders(
     balance: float,
     trader_confidence: float,
     now_iso: str,
+    spread_usd: float = 0.0,
 ) -> dict[str, Any]:
     """Place the trader's conditional entry as a broker-side pending order.
 
@@ -1201,6 +1296,7 @@ def _handle_pending_orders(
             suggested_tp=pending.get("tp"),
             suggested_sl=pending.get("sl"),
             jpy_usd_rate=jpy_usd_rate,
+            spread_usd=spread_usd,
         )
         plan_fields = {**intent, **_risk_plan_log_fields(risk_plan)}
         if not bool(risk_plan.get("ok")):
@@ -1520,12 +1616,22 @@ def run_once(
 
         positions = get_positions(SYMBOL)
 
-        d1, h4, h1, news_items, macro_report, technical_report, sentiment_report = _build_market_reports()
+        d1, h4, h1, news_items, macro_report, technical_report, sentiment_report, bars_meta = _build_market_reports()
+        bars_log = _bars_log_fields(bars_meta)
         if h4.empty or h1.empty:
             return _blocked_hold_result(
                 now_iso,
                 reasoning="価格データ取得に失敗",
                 filter_reason="Price data unavailable",
+                extra=bars_log,
+            )
+        insufficient = _insufficient_bars_reason(bars_meta)
+        if insufficient:
+            return _blocked_hold_result(
+                now_iso,
+                reasoning=f"確定足が不足しているためHOLD ({insufficient})",
+                filter_reason="Insufficient confirmed bars",
+                extra=bars_log,
             )
 
         gate, debate_report, debate_fallback_report = _build_debate_and_decision_reports(
@@ -1631,6 +1737,8 @@ def run_once(
                 "decision_model": _extract_model_name(evaluation_report),
                 "news_count": len(news_items),
                 "news_feeds_live": _feed_health_text(sentiment_report),
+                "news_feed_health": _feed_health_label(sentiment_report),
+                **bars_log,
                 "error": str(execution_result.get("reason", "")),
                 **debate_log_fields,
                 "position_direction": position_direction,
@@ -1654,6 +1762,7 @@ def run_once(
         )
 
         spread = get_spread(SYMBOL)
+        spread_usd = get_spread_price(SYMBOL) or 0.0
         filter_result = check_filters(
             confidence=float(trader_report.get("confidence", 0.0) or 0.0),
             spread=spread,
@@ -1690,6 +1799,7 @@ def run_once(
             suggested_tp=trader_report.get("suggested_tp"),
             suggested_sl=trader_report.get("suggested_sl"),
             jpy_usd_rate=jpy_usd_rate,
+            spread_usd=spread_usd,
         )
 
         order_result: dict[str, Any] = {
@@ -1706,8 +1816,10 @@ def run_once(
             market_filter_ok = False
             market_filter_reason = "skipped_low_rr"
             LOGGER.info(
-                "Market order skipped: effective RR %.2f below minimum (sl_source=%s tp_source=%s)",
-                float(risk_plan.get("effective_rr", 0.0) or 0.0),
+                "Market order skipped: net RR %.2f (gross %.2f, spread %.2f) below minimum (sl_source=%s tp_source=%s)",
+                float(risk_plan.get("net_rr", 0.0) or 0.0),
+                float(risk_plan.get("gross_rr", 0.0) or 0.0),
+                float(risk_plan.get("spread_cost", 0.0) or 0.0),
                 risk_plan.get("sl_source", ""),
                 risk_plan.get("tp_source", ""),
             )
@@ -1753,8 +1865,10 @@ def run_once(
             "analysis_model": _extract_model_name(technical_report),
             "decision_model": _extract_model_name(trader_report),
             "news_count": len(news_items),
-                "news_feeds_live": _feed_health_text(sentiment_report),
+            "news_feeds_live": _feed_health_text(sentiment_report),
+            "news_feed_health": _feed_health_label(sentiment_report),
             "error": str(order_result.get("reason", "")),
+            **bars_log,
             "directional_bias": str(trader_report.get("directional_bias", "") or ""),
             "bias_strength": trader_report.get("bias_strength", ""),
             "trigger_conditions": _safe_json_dumps(trader_report.get("trigger_conditions", []), default="[]"),
@@ -1775,6 +1889,7 @@ def run_once(
                     balance=balance,
                     trader_confidence=float(trader_report.get("confidence", 0.0) or 0.0),
                     now_iso=now_iso,
+                    spread_usd=spread_usd,
                 )
             else:
                 # The trader explains whether nothing was proposed or the

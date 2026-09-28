@@ -192,15 +192,20 @@ def build_risk_plan(
     rr: float = RISK_REWARD_RATIO,
     jpy_usd_rate: float | None = None,
     min_rr: float = MIN_RISK_REWARD_RATIO,
+    spread_usd: float = 0.0,
 ) -> dict[str, float | str | bool]:
     """Build lot/SL/TP plan with safe fallback for invalid cases.
 
     This function never raises and is suitable for production call paths.
 
-    After SL and TP are final, the effective reward/risk is checked against
-    ``min_rr``. A plan below it returns ``ok: False, reason: "low_rr"`` with
-    the SL/TP left exactly as computed (never re-shaped) so the caller can
-    log the geometry the AI actually proposed.
+    After SL and TP are final, the reward/risk NET of the current spread is
+    checked against ``min_rr``: crossing the spread costs on entry and again
+    on exit, so net_rr = (tp_distance - spread) / (sl_distance + spread).
+    ``gross_rr`` (no spread) is reported alongside. A plan below ``min_rr``
+    returns ``ok: False, reason: "low_rr"`` with the SL/TP left exactly as
+    computed (never re-shaped) so the caller can log the geometry the AI
+    actually proposed. ``spread_usd`` <= 0 or invalid means "no spread
+    information", in which case net equals gross.
     """
     normalized_action = action.upper().strip()
     if normalized_action not in {"BUY", "SELL"}:
@@ -262,7 +267,13 @@ def build_risk_plan(
 
         sl_distance = abs(entry_price - sl)
         tp_distance = abs(final_tp - entry_price)
-        effective_rr = round(tp_distance / sl_distance, 4) if sl_distance > 0 else 0.0
+        try:
+            spread_cost = float(spread_usd) if spread_usd is not None and float(spread_usd) > 0 else 0.0
+        except (TypeError, ValueError):
+            spread_cost = 0.0
+        gross_rr = round(tp_distance / sl_distance, 4) if sl_distance > 0 else 0.0
+        net_rr = round((tp_distance - spread_cost) / (sl_distance + spread_cost), 4) if sl_distance + spread_cost > 0 else 0.0
+        effective_rr = net_rr
         if effective_rr < min_rr:
             # The AI's TP is its reasoning; the SL was widened by the floor.
             # Sending that combination would be a different trade from the
@@ -277,6 +288,10 @@ def build_risk_plan(
                 "tp_2r": tp_2r,
                 "tp_source": tp_source,
                 "effective_rr": effective_rr,
+                "gross_rr": gross_rr,
+                "spread_cost": round(spread_cost, 5),
+                "net_rr": net_rr,
+                "rr_rejection_reason": "net_rr_below_min" if gross_rr >= min_rr else "gross_rr_below_min",
                 "reason": "low_rr",
             }
 
@@ -310,6 +325,10 @@ def build_risk_plan(
             "tp_2r": tp_2r,
             "tp_source": tp_source,
             "effective_rr": effective_rr,
+            "gross_rr": gross_rr,
+            "spread_cost": round(spread_cost, 5),
+            "net_rr": net_rr,
+            "rr_rejection_reason": "",
             "reason": "OK",
         }
     except Exception as exc:

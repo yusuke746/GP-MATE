@@ -97,3 +97,19 @@ def test_sentiment_bias_is_derived_from_score_when_only_score_given() -> None:
     assert _normalize_sentiment_payload({"score": -0.05})["gold_bias"] == "NEUTRAL"
     normalized = _normalize_sentiment_payload({"regime_view": "nonsense", "new_information": "not a list"})
     assert normalized["regime_view"] == "UNCLEAR" and normalized["new_information"] == []
+
+
+def test_feed_health_and_feed_state_reports() -> None:
+    from agents.sentiment import feed_health, sentiment_for_feed_state
+
+    assert feed_health({"feeds_total": 4, "feeds_live": 4}) == "GOOD"
+    assert feed_health({"feeds_total": 4, "feeds_live": 2}) == "DEGRADED"
+    assert feed_health({"feeds_total": 4, "feeds_live": 0}) == "BAD"
+    assert feed_health(None) == "UNKNOWN" and feed_health({"feeds_total": 0}) == "UNKNOWN"
+
+    dead = sentiment_for_feed_state([{"title": "release: NFP"}], {"feeds_total": 4, "feeds_live": 0})
+    assert dead["evidence_status"] == "INSUFFICIENT" and dead["feed_health"] == "BAD" and dead["news_count"] == 1
+    quiet = sentiment_for_feed_state([], {"feeds_total": 4, "feeds_live": 3})
+    assert quiet["evidence_status"] == "NO_NEWS" and quiet["gold_bias"] == "NEUTRAL" and quiet["feed_health"] == "DEGRADED"
+    assert sentiment_for_feed_state([{"title": "x"}], {"feeds_total": 4, "feeds_live": 4}) is None  # run the analyst
+    assert sentiment_for_feed_state([], None) is None  # unknown state: legacy INSUFFICIENT path in analyze_sentiment
