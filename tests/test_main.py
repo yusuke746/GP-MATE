@@ -1334,7 +1334,7 @@ def test_handle_pending_orders_reports_intended_order_on_skip(tmp_path: Path, mo
     )
     assert placed == []
     assert outcome["status"] == "skipped_distance:0.03atr"
-    assert outcome["fields"] == {"pending_type": "SELL_STOP", "pending_price": 4405.89}
+    assert outcome["fields"] == {"pending_type": "SELL_STOP", "pending_price": 4405.89, "pending_level_id": ""}
 
 
 def test_run_once_logs_weak_bias_drop_with_intended_order(tmp_path: Path, monkeypatch) -> None:
@@ -1636,3 +1636,66 @@ def test_run_once_rejects_market_order_when_net_rr_after_spread_is_too_low(tmp_p
     row = _read_single_row(log_path)
     assert row["gross_rr"] == "1.5333" and row["net_rr"] == "1.1714" and row["spread_cost"] == "0.5"
     assert row["rr_rejection_reason"] == "net_rr_below_min" and row["effective_rr"] == "1.1714"
+
+
+def test_decision_layers_separate_state_direction_setup_and_executability() -> None:
+    technical = {"regime": {"regime": "TREND", "direction": "UP", "entry_style": "STOP_BREAKOUT"}}
+    panel_trend = {"regime_summary": {"regime": "TREND", "direction_if_trend": "UP", "entry_style": "LIMIT_PULLBACK", "source": "judge"}, "_meta": {"ok": True}}
+    trader_hold_pending = {"directional_bias": "BULLISH", "pending_orders": [{"type": "BUY_LIMIT", "price": 4300.0}], "trigger_conditions": ["4300 押し目"]}
+
+    placed = main._decision_layers(technical, panel_trend, trader_hold_pending, final_action="HOLD", order_sent=False, market_filter_ok=True, market_filter_reason="OK", pending_status="placed")
+    assert placed == {"market_state": "TREND", "direction": "UP", "setup": "PULLBACK", "executability": "WAIT", "executability_reason": "pending order placed, waiting for the trigger"}
+
+    too_far = main._decision_layers(technical, panel_trend, trader_hold_pending, final_action="HOLD", order_sent=False, market_filter_ok=True, market_filter_reason="OK", pending_status="skipped_distance:3.20atr")
+    assert too_far["executability"] == "BLOCKED" and too_far["executability_reason"] == "skipped_distance:3.20atr"
+    assert too_far["market_state"] == "TREND"  # the market did not change; only the execution did
+
+    sent = main._decision_layers(technical, panel_trend, {"directional_bias": "BULLISH"}, final_action="BUY", order_sent=True, market_filter_ok=True, market_filter_reason="OK", pending_status="")
+    assert sent["executability"] == "EXECUTABLE" and sent["setup"] == "PULLBACK"
+
+    low_rr = main._decision_layers(technical, panel_trend, {"directional_bias": "BULLISH"}, final_action="HOLD", order_sent=False, market_filter_ok=False, market_filter_reason="skipped_low_rr", pending_status="none_proposed")
+    assert low_rr["executability"] == "BLOCKED" and low_rr["executability_reason"] == "skipped_low_rr"
+
+    # Chair failed: the market state is UNKNOWN, not whatever the vote said.
+    failed = {"regime_summary": {"regime": "TREND", "direction_if_trend": "UP", "entry_style": "LIMIT_PULLBACK", "source": "vote_fallback_log_only"}, "_meta": {"ok": False, "judge_status": "FAILED"}}
+    unknown = main._decision_layers(technical, failed, {"directional_bias": "NEUTRAL"}, final_action="HOLD", order_sent=False, market_filter_ok=True, market_filter_reason="OK", pending_status="")
+    assert unknown["market_state"] == "UNKNOWN" and unknown["direction"] == "NEUTRAL" and unknown["executability"] == "BLOCKED"
+
+    # No debate: the rule-based regime fills the state; a RANGE with a limit order is a FADE.
+    skipped = {"judge_summary": {"stronger_side": "neutral"}, "_meta": {"ok": True, "debate_executed": False}}
+    range_rule = {"regime": {"regime": "RANGE", "direction": "NEUTRAL", "entry_style": "LIMIT_FADE"}}
+    fade = main._decision_layers(range_rule, skipped, {"directional_bias": "BEARISH", "pending_orders": [{"type": "SELL_LIMIT", "price": 4400.0}]}, final_action="HOLD", order_sent=False, market_filter_ok=True, market_filter_reason="OK", pending_status="placed")
+    assert fade["market_state"] == "RANGE" and fade["direction"] == "DOWN" and fade["setup"] == "FADE"
+    for column in ("market_state", "direction", "setup", "executability", "executability_reason", "pending_level_id", "tp_level_id", "sl_level_id", "analyst_data_quality"):
+        assert column in main.TRADE_LOG_COLUMNS
+
+
+def test_run_once_logs_layers_level_ids_and_analyst_quality(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "analyze_technical",
+        lambda payload: {
+            "signal": "BUY", "trend": "UP", "alignment": "ALIGNED", "rsi_14": 58.0, "data_quality": "GOOD", "abstain_reason": None,
+            "counter_evidence": ["H1 LOWER_HIGH"], "direction_context": payload.get("direction_context", {}),
+            "_meta": {"usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}},
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "decide_trade",
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+            "action": "BUY", "confidence": 0.8, "reasoning": "t", "risk_level": "MID", "suggested_tp_level_id": "ROUND_150", "suggested_sl_level_id": "H4_SWING_LOW_1",
+            "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
+        },
+    )
+    result = main.run_once(baseline_spread=10.0)
+    assert result["action"] == "BUY"
+    row = _read_single_row(log_path)
+    assert row["market_state"] == "RANGE"  # the fixture's frames have ADX 0 -> rule-based RANGE
+    assert row["setup"] == "FADE"
+    assert row["executability"] == "EXECUTABLE" and row["executability_reason"] == "market order sent"
+    assert row["tp_level_id"] == "ROUND_150" and row["sl_level_id"] == "H4_SWING_LOW_1"
+    quality = json.loads(row["analyst_data_quality"])
+    assert quality["technical"] == {"data_quality": "GOOD", "abstain": False, "counter_evidence": 1}
+    assert quality["sentiment"]["data_quality"] == "GOOD"  # NO_NEWS report

@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from agents.base import decision_model, get_default_client
+from indicators.price_levels import resolve_level
 from config import CONFIDENCE_THRESHOLD, SYMBOL
 
 SYSTEM_PROMPT = (
@@ -18,8 +19,10 @@ SYSTEM_PROMPT = (
     "action(BUY/SELL/HOLD)の方向判断はtechnical/macro/sentiment/debateに基づき、"
     "technical_report内のtp_reference_onlyを方向判断に使ってはならない。"
     "tp_reference_onlyはsuggested_tpの算出にのみ使用する。"
-    "actionがBUY/SELLの場合、tp_reference_onlyのlevels/round_numbers/prev_day/moving_averagesを参照し、"
-    "反発が予想される強レベルの手前にsuggested_tpを数値で設定すること。"
+    "【水準の指定】価格は自分で作らない。technical.direction_context.price_levels に level_id 付きの候補水準があるので、"
+    "suggested_tp_level_id / suggested_sl_level_id / pending_orders[].entry_level_id (と任意の tp_level_id, sl_level_id) は"
+    "その level_id で指定すること。候補に無い水準の指値はシステムが受け付けない。"
+    "actionがBUY/SELLの場合、反発が予想される強レベルの手前の候補を suggested_tp_level_id に指定すること。"
     "複数根拠が重なるほど強いのでconfluence_noteを重視すること。"
     "direction_context.technical.extensionがD1の伸び切り(BBミドルから2ATR超の乖離)を"
     "示す場合、直近の急騰・急落に追随するエントリーは平均回帰による反転リスクが高い。"
@@ -49,7 +52,7 @@ SYSTEM_PROMPT = (
     "HOLDで見送る場合でも、directional_biasが明確でtrigger_conditionsに"
     "具体的な発動価格条件があるなら、その中で最も優位な1件をpending_ordersに"
     "構造化して返すこと。ブレイク待ちはBUY_STOP/SELL_STOP、"
-    "押し目・戻り待ちはBUY_LIMIT/SELL_LIMITを使い、priceに発動価格を数値で設定する。"
+    "押し目・戻り待ちはBUY_LIMIT/SELL_LIMITを使い、entry_level_idに発動水準のlevel_idを設定する。"
     "伸び切り警戒中の順方向エントリーは、ブレイク追随ではなく押し目/戻りのLIMIT型を優先すること。"
     "pending_ordersのtpは任意で、設定時は2R上限が適用される。"
     "予約に値する明確な条件がなければpending_ordersは空配列にすること。"
@@ -84,17 +87,25 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
             "directional_bias": {"type": "string", "enum": ["BULLISH", "BEARISH", "NEUTRAL"]},
             "bias_strength": {"type": "number", "description": "方向性バイアスの強さ0-1"},
             "trigger_conditions": {"type": "array", "items": {"type": "string"}, "description": "バイアス発動の価格条件"},
+            "suggested_tp_level_id": {
+                "type": ["string", "null"],
+                "description": "利確目標の候補水準 level_id (price_levels から)。無ければnull",
+            },
             "suggested_tp": {
                 "type": ["number", "null"],
-                "description": "利確目標価格。反発が予想される強レベルの手前に置く。算出できなければnull",
+                "description": "利確目標価格(level_id が使えない場合の補助。候補水準に近い値のみ)。算出できなければnull",
             },
             "suggested_tp_basis": {
                 "type": "string",
                 "description": "suggested_tpの根拠(例: キリ番4000と前日安値が重なる4023の手前)",
             },
+            "suggested_sl_level_id": {
+                "type": ["string", "null"],
+                "description": "シナリオ否定点の候補水準 level_id (price_levels から)。無ければnull",
+            },
             "suggested_sl": {
                 "type": ["number", "null"],
-                "description": "シナリオ否定点となる構造水準そのもの(マージン不要、バッファはシステム付与)。算出できなければnull",
+                "description": "シナリオ否定点となる構造水準そのもの(level_id が使えない場合の補助。マージン不要、バッファはシステム付与)。算出できなければnull",
             },
             "suggested_sl_basis": {
                 "type": "string",
@@ -107,12 +118,15 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
                     "type": "object",
                     "properties": {
                         "type": {"type": "string", "enum": ["BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT"]},
-                        "price": {"type": "number", "description": "発動価格"},
+                        "entry_level_id": {"type": ["string", "null"], "description": "発動水準の level_id (price_levels から)"},
+                        "price": {"type": ["number", "null"], "description": "発動価格(level_id が使えない場合の補助。候補水準に近い値のみ受理)"},
+                        "tp_level_id": {"type": ["string", "null"], "description": "任意の利確目標の level_id"},
+                        "sl_level_id": {"type": ["string", "null"], "description": "任意の損切り(シナリオ否定点)の level_id"},
                         "tp": {"type": ["number", "null"], "description": "任意の利確目標(2R上限適用)"},
                         "sl": {"type": ["number", "null"], "description": "任意の損切り=シナリオ否定点の構造水準そのもの(バッファはシステム付与、範囲外はATRベースに自動フォールバック)"},
                         "basis": {"type": "string", "description": "この予約の根拠(日本語)"},
                     },
-                    "required": ["type", "price"],
+                    "required": ["type"],
                 },
             },
         },
@@ -160,17 +174,49 @@ def _extract_current_price_for_tp_sanity(technical_report: dict[str, Any]) -> fl
     return None
 
 
+def _levels_and_atr(technical_report: dict[str, Any]) -> tuple[list[dict[str, Any]], float | None]:
+    context = technical_report.get("direction_context") if isinstance(technical_report, dict) else None
+    if not isinstance(context, dict):
+        return [], None
+    levels = context.get("price_levels") if isinstance(context.get("price_levels"), list) else []
+    h1 = context.get("h1") if isinstance(context.get("h1"), dict) else {}
+    return levels, _safe_float_or_none(h1.get("atr_14"))
+
+
+def _anchor(levels: list[dict[str, Any]], level_id: Any, price: Any, atr: float | None) -> dict[str, Any]:
+    """Resolve a level_id (preferred) or a raw price against the catalogue.
+
+    With an empty catalogue raw prices pass through unanchored (legacy
+    behaviour); with a catalogue, an unknown id or a far-off price is rejected.
+    """
+    if level_id not in (None, ""):
+        resolved = resolve_level(levels, str(level_id), atr=atr)
+        if resolved["anchored"]:
+            return resolved
+        # Unknown id: fall back to the raw price if one was also given.
+        if price in (None, ""):
+            return resolved
+    resolved = resolve_level(levels, price, atr=atr)
+    if resolved["reason"] == "no_catalogue":
+        resolved["anchored"] = True  # nothing to anchor to; accept as given (legacy behaviour)
+    return resolved
+
+
 def _validate_pending_orders(
     raw: Any,
     action: str,
     directional_bias: str,
     bias_strength: float,
     current_price: float | None,
+    levels: list[dict[str, Any]] | None = None,
+    atr: float | None = None,
 ) -> list[dict[str, Any]]:
     """Validate model-proposed pending orders.
 
     Only meaningful for HOLD with a clear directional bias; each order must be
-    on the bias side and on the correct side of the current price for its type.
+    on the bias side and on the correct side of the current price for its
+    type, and its trigger must be a catalogue level (by id, or a price within
+    tolerance of one) when a catalogue is available.
     """
     if action != "HOLD":
         return []
@@ -188,7 +234,10 @@ def _validate_pending_orders(
         order_type = str(item.get("type", "") or "").upper().strip()
         if order_type not in PENDING_ORDER_TYPES:
             continue
-        price = _safe_float_or_none(item.get("price"))
+        anchor = _anchor(levels or [], item.get("entry_level_id", item.get("level_id")), item.get("price"), atr)
+        if not anchor["anchored"]:
+            continue
+        price = _safe_float_or_none(anchor["price"])
         if price is None or price <= 0:
             continue
         if directional_bias == "BULLISH" and not order_type.startswith("BUY"):
@@ -205,7 +254,9 @@ def _validate_pending_orders(
             if order_type == "SELL_LIMIT" and price <= current_price:
                 continue
 
-        pending_sl = _safe_float_or_none(item.get("sl"))
+        tp_anchor = _anchor(levels or [], item.get("tp_level_id"), item.get("tp"), atr)
+        sl_anchor = _anchor(levels or [], item.get("sl_level_id"), item.get("sl"), atr)
+        pending_sl = _safe_float_or_none(sl_anchor["price"]) if sl_anchor["anchored"] else None
         if pending_sl is not None:
             # SL must be on the loss side of the trigger price; drop it (not
             # the whole order) when inverted — ATR fallback applies downstream.
@@ -218,8 +269,11 @@ def _validate_pending_orders(
             {
                 "type": order_type,
                 "price": round(price, 5),
-                "tp": _safe_float_or_none(item.get("tp")),
+                "entry_level_id": anchor["level_id"],
+                "tp": _safe_float_or_none(tp_anchor["price"]) if tp_anchor["anchored"] else None,
+                "tp_level_id": tp_anchor["level_id"] if tp_anchor["anchored"] else None,
                 "sl": pending_sl,
+                "sl_level_id": sl_anchor["level_id"] if pending_sl is not None else None,
                 "basis": str(item.get("basis", "") or ""),
             }
         )
@@ -256,6 +310,8 @@ def _describe_pending_proposal(
     directional_bias: str,
     bias_strength: float,
     validated: list[dict[str, Any]],
+    levels: list[dict[str, Any]] | None = None,
+    atr: float | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Explain why a proposed pending order survived or was dropped.
 
@@ -270,6 +326,7 @@ def _describe_pending_proposal(
         proposal = {
             "type": str(items[0].get("type", "") or "").upper().strip(),
             "price": _safe_float_or_none(items[0].get("price")),
+            "entry_level_id": items[0].get("entry_level_id"),
         }
     if validated:
         return "", proposal
@@ -281,6 +338,10 @@ def _describe_pending_proposal(
         return "skipped_no_bias", proposal
     if bias_strength < PENDING_MIN_BIAS_STRENGTH:
         return f"skipped_weak_bias:{bias_strength:.2f}", proposal
+    first = items[0]
+    anchor = _anchor(levels or [], first.get("entry_level_id", first.get("level_id")), first.get("price"), atr)
+    if not anchor["anchored"]:
+        return f"skipped_unanchored_price:{anchor['reason']}", proposal
     return "skipped_invalid_proposal", proposal
 
 
@@ -359,6 +420,17 @@ def decide_trade(
     payload["risk_level"] = risk_level
 
     current_price = _extract_current_price_for_tp_sanity(technical_report)
+    price_levels, atr_h1 = _levels_and_atr(technical_report)
+    # TP / SL: a level_id is preferred; a raw price is kept (the risk manager
+    # bounds it) but its anchoring is recorded for the log.
+    tp_anchor = _anchor(price_levels, payload.get("suggested_tp_level_id"), payload.get("suggested_tp"), atr_h1)
+    sl_anchor = _anchor(price_levels, payload.get("suggested_sl_level_id"), payload.get("suggested_sl"), atr_h1)
+    payload["suggested_tp"] = tp_anchor["price"] if tp_anchor["anchored"] else _safe_float_or_none(payload.get("suggested_tp"))
+    payload["suggested_sl"] = sl_anchor["price"] if sl_anchor["anchored"] else _safe_float_or_none(payload.get("suggested_sl"))
+    payload["suggested_tp_level_id"] = tp_anchor["level_id"] if tp_anchor["anchored"] else None
+    payload["suggested_sl_level_id"] = sl_anchor["level_id"] if sl_anchor["anchored"] else None
+    payload["tp_anchor_reason"] = tp_anchor["reason"]
+    payload["sl_anchor_reason"] = sl_anchor["reason"]
     suggested_tp = _safe_float_or_none(payload.get("suggested_tp"))
     if action == "HOLD":
         suggested_tp = None
@@ -392,6 +464,8 @@ def decide_trade(
         directional_bias=directional_bias,
         bias_strength=float(payload.get("bias_strength", 0.0) or 0.0),
         current_price=current_price,
+        levels=price_levels,
+        atr=atr_h1,
     )
     payload["pending_validation"], payload["pending_proposal"] = _describe_pending_proposal(
         raw=raw_pending_orders,
@@ -399,6 +473,8 @@ def decide_trade(
         directional_bias=directional_bias,
         bias_strength=float(payload.get("bias_strength", 0.0) or 0.0),
         validated=payload["pending_orders"],
+        levels=price_levels,
+        atr=atr_h1,
     )
 
     payload["_meta"] = {

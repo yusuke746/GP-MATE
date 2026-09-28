@@ -66,6 +66,7 @@ from data.news_client import fetch_news_with_meta, is_high_impact_soon
 from agents.technical import EXTENSION_ATR_CAUTION, calc_extension_atr
 from indicators.ta_calc import add_indicators
 from indicators.horizontal_levels import build_horizontal_levels
+from indicators.price_levels import build_price_levels
 from indicators.regime import classify_regime
 from indicators.structure import build_structure_context
 from risk.risk_manager import build_risk_plan, check_filters
@@ -194,6 +195,15 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "dropped_open_bar",
     "closed_bar_count",
     "bar_age_seconds",
+    "market_state",
+    "direction",
+    "setup",
+    "executability",
+    "executability_reason",
+    "pending_level_id",
+    "tp_level_id",
+    "sl_level_id",
+    "analyst_data_quality",
 )
 
 # Fewest closed bars a judgment may be based on (indicators need ~26 for
@@ -1007,6 +1017,15 @@ def _build_market_reports(
         h4_frame=h4,
         current_price=float(h1_latest.get("close", 0.0) or 0.0),
     )
+    # ID-tagged candidate levels: analysts, chair and trader refer to these by
+    # level_id instead of inventing prices.
+    direction_context["price_levels"] = build_price_levels(
+        current_price=float(h1_latest.get("close", 0.0) or 0.0),
+        atr=float(h1_latest.get("atr_14", 0.0) or 0.0),
+        horizontal_levels=horizontal_levels,
+        structure=direction_context.get("structure"),
+        tp_reference=tp_reference_only,
+    )
 
     news_items, feed_meta = fetch_news_with_meta(hours=24)
     # FRED series + live dollar index + positioning + calendar surprises.
@@ -1185,13 +1204,115 @@ def _pending_intent_fields(pendings: Any) -> dict[str, Any]:
     from the CSV alone (which order, at what price, why it was not placed)."""
     first = pendings[0] if isinstance(pendings, list) and pendings and isinstance(pendings[0], dict) else None
     if first is None:
-        return {"pending_type": "", "pending_price": ""}
+        return {"pending_type": "", "pending_price": "", "pending_level_id": ""}
     price = first.get("price")
     try:
         price_value: Any = round(float(price), 5) if price not in (None, "") else ""
     except (TypeError, ValueError):
         price_value = ""
-    return {"pending_type": str(first.get("type", "") or "").upper(), "pending_price": price_value}
+    return {
+        "pending_type": str(first.get("type", "") or "").upper(),
+        "pending_price": price_value,
+        "pending_level_id": str(first.get("entry_level_id", "") or ""),
+    }
+
+
+SETUP_BY_ENTRY_STYLE = {"STOP_BREAKOUT": "BREAKOUT", "LIMIT_PULLBACK": "PULLBACK", "LIMIT_FADE": "FADE", "NONE": "NONE"}
+
+
+def _decision_layers(
+    technical_report: Any,
+    debate_report: Any,
+    trader_report: Any,
+    *,
+    final_action: str,
+    order_sent: bool,
+    market_filter_ok: bool,
+    market_filter_reason: str,
+    pending_status: str,
+) -> dict[str, Any]:
+    """The four decision layers, written out separately for the log.
+
+    market_state (TREND / RANGE / TRANSITION / UNKNOWN): what kind of market.
+    direction (UP / DOWN / NEUTRAL): which way, if any.
+    setup (PULLBACK / BREAKOUT / FADE / NONE): the strategy shape.
+    executability (EXECUTABLE / WAIT / BLOCKED) + reason: whether an order
+    can be sent right now. Classifying a market as TREND is not the same as
+    being able to trade it this cycle; this keeps the two apart.
+    """
+    summary = debate_report.get("regime_summary") if isinstance(debate_report, dict) else None
+    meta = debate_report.get("_meta") if isinstance(debate_report, dict) else None
+    rule = technical_report.get("regime") if isinstance(technical_report, dict) else None
+    debate_ran = isinstance(meta, dict) and "ok" in meta and not bool(meta.get("debate_executed") is False)
+    judge_usable = isinstance(summary, dict) and bool(summary.get("regime")) and str(summary.get("source", "")) not in {"vote_fallback_log_only"}
+
+    if debate_ran and isinstance(meta, dict) and not bool(meta.get("ok", True)):
+        market_state = "UNKNOWN"
+        direction = "NEUTRAL"
+        entry_style = "NONE"
+    elif judge_usable:
+        market_state = str(summary.get("regime", "TRANSITION") or "TRANSITION")
+        direction = str(summary.get("direction_if_trend", "NEUTRAL") or "NEUTRAL")
+        entry_style = str(summary.get("entry_style", "NONE") or "NONE")
+    elif isinstance(rule, dict) and rule.get("regime"):
+        market_state = str(rule.get("regime"))
+        direction = str(rule.get("direction", "NEUTRAL") or "NEUTRAL")
+        entry_style = str(rule.get("entry_style", "NONE") or "NONE")
+    else:
+        market_state, direction, entry_style = "UNKNOWN", "NEUTRAL", "NONE"
+    if market_state != "TREND":
+        direction = "NEUTRAL"
+        if isinstance(trader_report, dict):
+            bias = str(trader_report.get("directional_bias", "") or "").upper()
+            direction = {"BULLISH": "UP", "BEARISH": "DOWN"}.get(bias, "NEUTRAL")
+
+    setup = SETUP_BY_ENTRY_STYLE.get(entry_style, "NONE")
+    pendings = trader_report.get("pending_orders") if isinstance(trader_report, dict) else None
+    first = pendings[0] if isinstance(pendings, list) and pendings and isinstance(pendings[0], dict) else None
+    if first is not None:
+        order_type = str(first.get("type", "") or "").upper()
+        setup = "BREAKOUT" if order_type.endswith("STOP") else ("FADE" if market_state == "RANGE" else "PULLBACK")
+    if final_action in {"BUY", "SELL"} and setup == "NONE":
+        setup = "PULLBACK" if market_state == "TREND" else ("FADE" if market_state == "RANGE" else "NONE")
+
+    if final_action in {"BUY", "SELL"} and order_sent:
+        executability, reason = "EXECUTABLE", "market order sent"
+    elif final_action in {"BUY", "SELL"}:
+        executability, reason = "BLOCKED", market_filter_reason or "order not sent"
+    elif not market_filter_ok and market_filter_reason not in {"", "OK"}:
+        executability, reason = "BLOCKED", market_filter_reason
+    elif pending_status == "placed":
+        executability, reason = "WAIT", "pending order placed, waiting for the trigger"
+    elif pending_status.startswith("skipped_"):
+        executability, reason = "BLOCKED", pending_status
+    elif market_state in {"TRANSITION", "UNKNOWN"}:
+        executability, reason = "BLOCKED", f"market_state={market_state}"
+    else:
+        triggers = trader_report.get("trigger_conditions") if isinstance(trader_report, dict) else None
+        if isinstance(triggers, list) and triggers:
+            executability, reason = "WAIT", "trigger conditions not met"
+        else:
+            executability, reason = "BLOCKED", pending_status or "no setup"
+
+    return {
+        "market_state": market_state,
+        "direction": direction,
+        "setup": setup,
+        "executability": executability,
+        "executability_reason": reason,
+    }
+
+
+def _analyst_quality_fields(technical_report: Any, macro_report: Any, sentiment_report: Any) -> dict[str, Any]:
+    quality = {}
+    for name, report in (("technical", technical_report), ("macro", macro_report), ("sentiment", sentiment_report)):
+        if isinstance(report, dict):
+            quality[name] = {
+                "data_quality": report.get("data_quality", ""),
+                "abstain": bool(report.get("abstain_reason")),
+                "counter_evidence": len(report.get("counter_evidence", []) or []) if isinstance(report.get("counter_evidence"), list) else 0,
+            }
+    return {"analyst_data_quality": _safe_json_dumps(quality, default="{}")}
 
 
 def _risk_plan_log_fields(risk_plan: dict[str, Any]) -> dict[str, Any]:
@@ -1905,6 +2026,21 @@ def run_once(
         pending_fields = pending_outcome.get("fields")
         if isinstance(pending_fields, dict):
             result.update(pending_fields)
+        result.update(
+            _decision_layers(
+                technical_report,
+                debate_report,
+                trader_report,
+                final_action=final_action,
+                order_sent=bool(order_result.get("success", False)),
+                market_filter_ok=market_filter_ok,
+                market_filter_reason=market_filter_reason,
+                pending_status=result["pending_status"],
+            )
+        )
+        result["tp_level_id"] = str(trader_report.get("suggested_tp_level_id", "") or "") if isinstance(trader_report, dict) else ""
+        result["sl_level_id"] = str(trader_report.get("suggested_sl_level_id", "") or "") if isinstance(trader_report, dict) else ""
+        result.update(_analyst_quality_fields(technical_report, macro_report, sentiment_report))
         _append_trade_log(result)
         pending_row = pending_outcome.get("log_row")
         if isinstance(pending_row, dict):

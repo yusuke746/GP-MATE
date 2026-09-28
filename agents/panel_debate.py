@@ -22,6 +22,7 @@ import logging
 from typing import Any, Final, Literal
 
 from agents.base import get_default_client
+from indicators.price_levels import accepted, resolve_level
 from config import MODEL_DEBATE, PANEL_DEBATE_ROUNDS
 
 LOGGER = logging.getLogger(__name__)
@@ -51,11 +52,14 @@ PANEL_SYSTEM_PROMPT = (
     "他の分析官に同意してもよいし、反対してもよいし、説得されて見解を変えてもよい"
     "(自分のレポートの見解から変えたらchanged_view=trueにし、どの数値・水準で変えたかをchange_reasonに書く)。"
     "反論は求めません。根拠のない主張はしないこと。根拠が弱ければUNCLEARと答えること。"
+    "自分の結論に反する材料(counter_evidence)も探して列挙すること(無ければ空)。"
+    "水準は自分で作らず、price_levels(technical レポート内の候補一覧)の level_id で答えること。"
     "regime_hintはコードによる機械的な暫定判定で、参考情報にすぎません。従う必要はありません。"
     "出力は次のキーだけを持つJSON: "
     "{regime_view: 'TREND_CONTINUATION'|'MEAN_REVERSION'|'UNCLEAR', direction_if_trend: 'UP'|'DOWN'|'NEUTRAL', "
     "statement: string(日本語、自分の専門からの見解と根拠), responses_to_others: string[](他の分析官の具体的な論点への応答、無ければ空), "
-    "key_prices: {continuation_confirms: number|null, reversal_confirms: number|null}, "
+    "counter_evidence: string[], "
+    "key_levels: {continuation_level_id: string|null, reversal_level_id: string|null}, "
     "what_would_change_view: string, changed_view: boolean, change_reason: string}"
 )
 
@@ -63,8 +67,35 @@ DEBATE_PROTOCOL_VERSION: Final[str] = "panel-v2-symmetric-round1"
 JUDGE_MAX_ATTEMPTS: Final[int] = 2
 STATEMENT_KEYS: Final[tuple[str, ...]] = (
     "role", "round", "regime_view", "direction_if_trend", "statement", "responses_to_others",
-    "key_prices", "what_would_change_view", "changed_view", "change_reason",
+    "counter_evidence", "key_prices", "what_would_change_view", "changed_view", "change_reason",
 )
+
+
+def _resolve_key_levels(raw: Any, levels: list[dict[str, Any]] | None, atr: float | None) -> dict[str, Any]:
+    """continuation/reversal references (ids, or legacy raw prices) -> prices + ids."""
+    block = raw if isinstance(raw, dict) else {}
+    out: dict[str, Any] = {}
+    for name in ("continuation", "reversal"):
+        ref = block.get(f"{name}_level_id", block.get(f"{name}_confirms"))
+        resolved = resolve_level(levels, ref, atr=atr)
+        ok = accepted(resolved)
+        out[f"{name}_confirms"] = round(float(resolved["price"]), 5) if ok else None
+        out[f"{name}_level_id"] = resolved["level_id"] if ok else None
+        out[f"{name}_unresolved"] = None if ok or ref in (None, "") else str(ref)
+    return out
+
+
+def _levels_of(technical_report: Any) -> tuple[list[dict[str, Any]], float | None]:
+    context = technical_report.get("direction_context") if isinstance(technical_report, dict) else None
+    if not isinstance(context, dict):
+        return [], None
+    levels = context.get("price_levels") if isinstance(context.get("price_levels"), list) else []
+    h1 = context.get("h1") if isinstance(context.get("h1"), dict) else {}
+    try:
+        atr = float(h1.get("atr_14")) if h1.get("atr_14") is not None else None
+    except (TypeError, ValueError):
+        atr = None
+    return levels, atr
 
 PANEL_JUDGE_SYSTEM_PROMPT = (
     "あなたは分析官パネル(テクニカル・マクロ・ニュース)の討論を整理する議長です。"
@@ -72,13 +103,14 @@ PANEL_JUDGE_SYSTEM_PROMPT = (
     "パネルとしての結論はTREND(継続・順張りが機能)/RANGE(反転・逆張りが機能)/TRANSITION(結論が割れる、または判断できない)のどれか、"
     "TRENDならその方向(direction_if_trend)と、待てる押し目/戻りがあるならLIMIT_PULLBACK、伸び切っておらずブレイクを追えるならSTOP_BREAKOUT、"
     "RANGEならLIMIT_FADE、TRANSITIONならNONE(entry_style)。"
-    "発言に出た価格から、継続が確認される価格(continuation_confirms)と反転が確認される価格(reversal_confirms)を拾うこと(無ければnull)。"
+    "発言者が参照した level_id の中から、継続が確認される水準(continuation_level_id)と反転が確認される水準(reversal_level_id)を選ぶこと"
+    "(発言に無い水準を作らない。無ければnull)。各発言の counter_evidence も対立点の整理に使うこと。"
     "consensusは3人の見解が一致ならUNANIMOUS、2対1ならMAJORITY、それ以外はSPLIT。"
     "UNCLEARが多い、または見解が割れる場合は無理にTREND/RANGEにせずTRANSITIONとすること。"
     "出力は次のキーだけを持つJSON: "
     "{agreements: string[], conflicts: string[], regime: 'TREND'|'RANGE'|'TRANSITION', "
     "direction_if_trend: 'UP'|'DOWN'|'NEUTRAL', entry_style: 'STOP_BREAKOUT'|'LIMIT_PULLBACK'|'LIMIT_FADE'|'NONE', "
-    "key_levels: {continuation_confirms: number|null, reversal_confirms: number|null}, "
+    "key_levels: {continuation_level_id: string|null, reversal_level_id: string|null}, "
     "consensus: 'UNANIMOUS'|'MAJORITY'|'SPLIT', summary: string(日本語)}"
 )
 
@@ -109,13 +141,19 @@ def _add_usage(total: dict[str, int], part: dict[str, int]) -> None:
         total[key] += int(part.get(key, 0) or 0)
 
 
-def _statement_from_payload(role: str, round_index: int, payload: dict[str, Any]) -> dict[str, Any]:
+def _statement_from_payload(
+    role: str,
+    round_index: int,
+    payload: dict[str, Any],
+    levels: list[dict[str, Any]] | None = None,
+    atr: float | None = None,
+) -> dict[str, Any]:
     regime_view = _enum(payload.get("regime_view"), REGIME_VIEW_VALUES, "UNCLEAR")
     direction = _enum(payload.get("direction_if_trend"), ("UP", "DOWN", "NEUTRAL"), "NEUTRAL")
     if regime_view != "TREND_CONTINUATION":
         direction = "NEUTRAL"
     responses = payload.get("responses_to_others")
-    key_prices = payload.get("key_prices") if isinstance(payload.get("key_prices"), dict) else {}
+    counter = payload.get("counter_evidence")
     return {
         "role": role,
         "round": round_index,
@@ -124,10 +162,8 @@ def _statement_from_payload(role: str, round_index: int, payload: dict[str, Any]
         "direction_if_trend": direction,
         "statement": str(payload.get("statement", "") or "").strip(),
         "responses_to_others": [str(x) for x in responses if str(x).strip()] if isinstance(responses, list) else [],
-        "key_prices": {
-            "continuation_confirms": _price(key_prices.get("continuation_confirms")),
-            "reversal_confirms": _price(key_prices.get("reversal_confirms")),
-        },
+        "counter_evidence": [str(x) for x in counter if str(x).strip()] if isinstance(counter, list) else [],
+        "key_prices": _resolve_key_levels(payload.get("key_levels", payload.get("key_prices")), levels, atr),
         "what_would_change_view": str(payload.get("what_would_change_view", "") or ""),
         "changed_view": bool(payload.get("changed_view", False)),
         "change_reason": str(payload.get("change_reason", "") or ""),
@@ -144,7 +180,8 @@ def _absent_statement(role: str, round_index: int, error: str) -> dict[str, Any]
         "direction_if_trend": "NEUTRAL",
         "statement": "",
         "responses_to_others": [],
-        "key_prices": {"continuation_confirms": None, "reversal_confirms": None},
+        "counter_evidence": [],
+        "key_prices": {"continuation_confirms": None, "reversal_confirms": None, "continuation_level_id": None, "reversal_level_id": None},
         "what_would_change_view": "",
         "changed_view": False,
         "change_reason": "",
@@ -210,14 +247,19 @@ def _vote_fallback(transcript: list[dict[str, Any]]) -> dict[str, Any]:
         "regime": regime,
         "direction_if_trend": direction,
         "entry_style": entry_style,
-        "key_levels": {"continuation_confirms": None, "reversal_confirms": None},
+        "key_levels": {"continuation_confirms": None, "reversal_confirms": None, "continuation_level_id": None, "reversal_level_id": None},
         "consensus": consensus,
         "summary": "",
         "source": "vote_fallback",
     }
 
 
-def _judge_from_payload(payload: dict[str, Any], transcript: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _judge_from_payload(
+    payload: dict[str, Any],
+    transcript: list[dict[str, Any]],
+    levels: list[dict[str, Any]] | None = None,
+    atr: float | None = None,
+) -> dict[str, Any] | None:
     """Validated chair verdict, or None when the output cannot be executed on:
     missing/invalid regime or direction enum, TREND without a direction."""
     regime = str(payload.get("regime", "") or "").upper().strip()
@@ -232,7 +274,6 @@ def _judge_from_payload(payload: dict[str, Any], transcript: list[dict[str, Any]
     entry_style = _enum(payload.get("entry_style"), ENTRY_STYLES, {"TREND": "LIMIT_PULLBACK", "RANGE": "LIMIT_FADE"}.get(regime, "NONE"))
     if regime == "TRANSITION":
         entry_style = "NONE"
-    levels = payload.get("key_levels") if isinstance(payload.get("key_levels"), dict) else {}
     views = [s["regime_view"] for s in _latest_views(transcript).values()]
     consensus = _enum(payload.get("consensus"), CONSENSUS_VALUES, _consensus_of(views))
     agreements = payload.get("agreements")
@@ -243,10 +284,7 @@ def _judge_from_payload(payload: dict[str, Any], transcript: list[dict[str, Any]
         "regime": regime,
         "direction_if_trend": direction,
         "entry_style": entry_style,
-        "key_levels": {
-            "continuation_confirms": _price(levels.get("continuation_confirms")),
-            "reversal_confirms": _price(levels.get("reversal_confirms")),
-        },
+        "key_levels": _resolve_key_levels(payload.get("key_levels"), levels, atr),
         "consensus": consensus,
         "summary": str(payload.get("summary", "") or ""),
         "source": "judge",
@@ -266,7 +304,15 @@ def _vote_distribution(latest: dict[str, dict[str, Any]]) -> dict[str, int]:
     return {view: views.count(view) for view in REGIME_VIEW_VALUES}
 
 
-def _ask_chair(llm: Any, judge_payload: dict[str, Any], model: str, transcript: list[dict[str, Any]], usage: dict[str, int]) -> tuple[dict[str, Any] | None, str, int]:
+def _ask_chair(
+    llm: Any,
+    judge_payload: dict[str, Any],
+    model: str,
+    transcript: list[dict[str, Any]],
+    usage: dict[str, int],
+    levels: list[dict[str, Any]] | None = None,
+    atr: float | None = None,
+) -> tuple[dict[str, Any] | None, str, int]:
     """Up to JUDGE_MAX_ATTEMPTS chair calls. -> (verdict or None, last error, attempts)."""
     error = ""
     attempts = 0
@@ -290,7 +336,7 @@ def _ask_chair(llm: Any, judge_payload: dict[str, Any], model: str, transcript: 
         if not bool(getattr(result, "ok", False)):
             error = str(getattr(result, "error", "") or "chair call failed")
             continue
-        verdict = _judge_from_payload(raw, transcript)
+        verdict = _judge_from_payload(raw, transcript, levels, atr)
         if verdict is None:
             error = "invalid chair output (regime/direction missing or out of enum)"
             continue
@@ -318,6 +364,7 @@ def run_panel_debate(
         dict(technical_report.get("regime")) if isinstance(technical_report, dict) and isinstance(technical_report.get("regime"), dict) else {}
     )
     initial_views = {role: _initial_view(role, reports[role]) for role in PANEL_ROLES}
+    price_levels, atr_h1 = _levels_of(reports["technical"])
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     transcript: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -337,6 +384,7 @@ def run_panel_debate(
                 "other_reports": {k: v for k, v in reports.items() if k != role},
                 "transcript": visible,
                 "regime_hint": hint,
+                "price_levels": price_levels,
                 "question": "いまの相場はトレンド継続局面か、反転・平均回帰局面か、判断できないか。",
             }
             try:
@@ -358,7 +406,7 @@ def run_panel_debate(
                 errors.append(f"{role}#{round_index}: {error}")
                 transcript.append(_absent_statement(role, round_index, error))
                 continue
-            statement = _statement_from_payload(role, round_index, payload)
+            statement = _statement_from_payload(role, round_index, payload, price_levels, atr_h1)
             # changed_view is a fact computed against the analyst's own report,
             # not only the flag it set.
             statement["changed_view"] = bool(statement["changed_view"] or statement["regime_view"] != initial_views[role])
@@ -376,8 +424,9 @@ def run_panel_debate(
             "initial_views": initial_views,
             "absent_analysts": sorted({s["role"] for s in transcript if not s.get("ok")}),
             "regime_hint": hint,
+            "price_levels": price_levels,
         }
-        verdict, judge_error, judge_attempts = _ask_chair(llm, judge_payload, model, transcript, usage)
+        verdict, judge_error, judge_attempts = _ask_chair(llm, judge_payload, model, transcript, usage, price_levels, atr_h1)
         if verdict is not None:
             judge_status = "OK" if judge_attempts == 1 else "RECOVERED_RETRY"
     else:

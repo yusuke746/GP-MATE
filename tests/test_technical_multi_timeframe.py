@@ -266,7 +266,9 @@ def test_analyst_view_overrides_rule_based_read() -> None:
     assert result["d1_trend"] == "UP" and result["execution_trend"] == "RANGE" and result["alignment"] == "MIXED"
     assert result["regime_view"] == "MEAN_REVERSION"
     assert result["direction_if_trend"] == "NEUTRAL"  # only meaningful for TREND_CONTINUATION
-    assert result["key_levels"]["analyst"] == {"supports": [96.5, 95.0], "resistances": [101.5], "invalidation": 102.2}
+    analyst_levels = result["key_levels"]["analyst"]
+    assert analyst_levels["supports"] == [96.5, 95.0] and analyst_levels["resistances"] == [101.5] and analyst_levels["invalidation"] == 102.2
+    assert analyst_levels["support_level_ids"] == [] and analyst_levels["unresolved"] == []  # no catalogue in this payload
     assert result["key_levels"]["horizontal_levels"]["resistances"][0]["price"] == 101.5  # factual part kept
     assert result["evidence"][1].startswith("未充填")
     assert result["what_would_change_view"] == "H4終値で101.8上抜け"
@@ -290,3 +292,43 @@ def test_analyst_call_failure_falls_back_safely() -> None:
         result = analyze_technical({"d1": _bearish_frame(), "h4": _bearish_frame(), "h1": _bearish_frame()})
     assert result["source"] == "rule_based_fallback"
     assert result["trend"] == "DOWN" and result["_meta"]["ok"] is False and result["_meta"]["error"] == "timeout"
+
+
+def test_analyst_refers_to_levels_by_id_and_reports_roles_counter_evidence_and_quality() -> None:
+    from indicators.price_levels import build_price_levels
+
+    levels = build_price_levels(
+        current_price=100.0, atr=2.0,
+        horizontal_levels={"supports": [{"price": 96.5, "source": "swing", "timeframe": "D1"}], "resistances": [{"price": 101.5, "source": "cluster", "timeframe": "H4"}]},
+        structure={"h4": {"swings": {"highs": [102.2], "lows": []}, "fair_value_gaps": []}},
+    )
+    client = _analyst_client(
+        {
+            "d1_trend": "UP", "h4_trend": "UP", "h1_trend": "DOWN", "h1_role": "PULLBACK", "timeframe_relationship": "H4上昇中のH1押し目",
+            "execution_trend": "UP", "alignment": "ALIGNED", "regime_view": "TREND_CONTINUATION", "direction_if_trend": "UP",
+            "key_levels": {"support_level_ids": ["D1_SWING_SUPPORT_1", "GHOST"], "resistance_level_ids": ["H4_CLUSTER_RESISTANCE_1"], "invalidation_level_id": "H4_SWING_HIGH_1"},
+            "evidence": ["HIGHER_LOW"], "counter_evidence": ["H1 RSI 70超"], "data_quality": "partial", "abstain_reason": None,
+            "what_would_change_view": "96.5割れ", "reasoning": "押し目。",
+        }
+    )
+    payload = {"direction_context": {"d1": _bullish_frame(), "h4": _bullish_frame(), "h1": _bullish_frame(), "price_levels": levels}}
+    with patch("agents.technical.get_default_client", return_value=client):
+        result = analyze_technical(payload)
+
+    assert result["h4_trend"] == "UP" and result["h1_trend"] == "DOWN" and result["h1_role"] == "PULLBACK"
+    assert result["timeframe_relationship"] == "H4上昇中のH1押し目"
+    analyst_levels = result["key_levels"]["analyst"]
+    assert analyst_levels["supports"] == [96.5] and analyst_levels["support_level_ids"] == ["D1_SWING_SUPPORT_1"]
+    assert analyst_levels["resistances"] == [101.5] and analyst_levels["invalidation"] == 102.2 and analyst_levels["invalidation_level_id"] == "H4_SWING_HIGH_1"
+    assert analyst_levels["unresolved"] == ["GHOST"]
+    assert result["counter_evidence"] == ["H1 RSI 70超"] and result["data_quality"] == "PARTIAL" and result["abstain_reason"] is None
+    user_prompt = client.call_json.call_args.kwargs["user_prompt"]
+    assert "price_levels" in user_prompt and "D1_SWING_SUPPORT_1" in user_prompt
+
+
+def test_analyst_abstain_forces_unclear() -> None:
+    client = _analyst_client({"execution_trend": "UP", "regime_view": "TREND_CONTINUATION", "direction_if_trend": "UP", "abstain_reason": "D1が欠損", "data_quality": "POOR"})
+    with patch("agents.technical.get_default_client", return_value=client):
+        result = analyze_technical({"h4": _bullish_frame(), "h1": _bullish_frame()})
+    assert result["regime_view"] == "UNCLEAR" and result["direction_if_trend"] == "NEUTRAL" and result["abstain_reason"] == "D1が欠損"
+    assert result["data_quality"] == "POOR"
