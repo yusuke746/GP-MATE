@@ -115,3 +115,15 @@ def test_macro_analyst_exception_is_fail_safe() -> None:
     with patch("agents.macro_analyst.get_default_client", return_value=client):
         result = analyze_macro_environment(_base_fred_data())
     assert result["macro_bias"] == "NEUTRAL" and "api down" in result["_meta"]["error"]
+
+
+def test_macro_analyst_records_counter_evidence_quality_and_abstain() -> None:
+    client = _client({"macro_bias": "BULLISH", "regime_view": "SUPPORTS_CONTINUATION", "key_drivers": ["dxy -1.0"], "counter_evidence": ["us2y 5日で反発"], "data_quality": "PARTIAL", "abstain_reason": None, "invalidation": "x", "reasoning": "r"})
+    with patch("agents.macro_analyst.get_default_client", return_value=client):
+        result = analyze_macro_environment(_base_fred_data())
+    assert result["counter_evidence"] == ["us2y 5日で反発"] and result["data_quality"] == "PARTIAL" and result["abstain_reason"] is None
+
+    client = _client({"macro_bias": "BULLISH", "regime_view": "SUPPORTS_CONTINUATION", "key_drivers": [], "abstain_reason": "COT が2週間古い", "data_quality": "POOR", "invalidation": "", "reasoning": "r"})
+    with patch("agents.macro_analyst.get_default_client", return_value=client):
+        result = analyze_macro_environment(_base_fred_data())
+    assert result["macro_bias"] == "NEUTRAL" and result["regime_view"] == "UNCLEAR" and result["abstain_reason"] == "COT が2週間古い"

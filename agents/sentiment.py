@@ -31,9 +31,13 @@ SYSTEM_PROMPT = (
     "(4) 最も影響の大きい見出しはどれか。"
     "株式やドルへの影響ではなく、金価格への影響として評価すること。"
     "材料が乏しい、または互いに打ち消し合うときはNEUTRAL/UNCLEARでよく、無理に方向を出さないこと。"
+    "結論に反する見出し(counter_evidence)も探して列挙し(無ければ空)、"
+    "データ品質 data_quality を GOOD / PARTIAL(重複・古い記事・文脈不足あり) / POOR(判断に足りない) で答え、"
+    "判断を保留するなら abstain_reason にその理由を書いて gold_bias=NEUTRAL とすること。"
     "出力は次のキーだけを持つJSON: "
     "{gold_bias: 'BULLISH'|'BEARISH'|'NEUTRAL', regime_view: 'SUPPORTS_CONTINUATION'|'SUPPORTS_REVERSAL'|'UNCLEAR', "
     "new_information: string[](新しい情報の要約、無ければ空), price_echo_count: number(値動きをなぞるだけの見出しの本数), "
+    "counter_evidence: string[], data_quality: 'GOOD'|'PARTIAL'|'POOR', abstain_reason: string|null, "
     "dominant_news: string, reasoning: string(日本語)}"
 )
 
@@ -93,6 +97,16 @@ def _normalize_sentiment_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     new_info = payload.get("new_information")
     payload["new_information"] = [str(x) for x in new_info if str(x).strip()] if isinstance(new_info, list) else []
+    counter = payload.get("counter_evidence")
+    payload["counter_evidence"] = [str(x) for x in counter if str(x).strip()] if isinstance(counter, list) else []
+    quality = str(payload.get("data_quality", "") or "").upper().strip()
+    payload["data_quality"] = quality if quality in ("GOOD", "PARTIAL", "POOR") else "GOOD"
+    abstain = str(payload.get("abstain_reason") or "").strip() or None
+    payload["abstain_reason"] = abstain
+    if abstain:
+        payload["gold_bias"] = "NEUTRAL"
+        payload["score"] = 0.0
+        payload["regime_view"] = "UNCLEAR"
     try:
         payload["price_echo_count"] = int(payload.get("price_echo_count") or 0)
     except (TypeError, ValueError):
@@ -138,6 +152,9 @@ def _no_llm_report(*, evidence_status: str, reasoning: str, health: str, news_co
         "regime_view": "UNCLEAR",
         "new_information": [],
         "price_echo_count": 0,
+        "counter_evidence": [],
+        "data_quality": "POOR" if evidence_status == "INSUFFICIENT" else "GOOD",
+        "abstain_reason": reasoning if evidence_status == "INSUFFICIENT" else None,
         "dominant_news": "N/A",
         "reasoning": reasoning,
         "news_count": news_count,

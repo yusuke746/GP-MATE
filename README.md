@@ -115,6 +115,34 @@ way, and otherwise to stay flat. A few entries per day is the intended pace.
   `MIN_RISK_REWARD_RATIO`; `gross_rr`, `spread_cost`, `net_rr` and
   `rr_rejection_reason` are logged.
 
+## Levels by id, four decision layers, counter-evidence
+
+- **Price levels by id.** `indicators/price_levels.py` builds one catalogue per
+  cycle from the horizontal levels, swings, unfilled FVGs, previous-day
+  high/low, moving averages and round numbers, each tagged with a stable
+  `level_id` (e.g. `H4_SWING_LOW_1`, `D1_CLUSTER_SUPPORT_2`, `ROUND_4400`) and
+  its distance in ATR. The technical analyst, the panel members, the chair
+  and the trader refer to levels by id. A raw price is snapped to the nearest
+  candidate within 0.3 ATR; a pending order whose trigger matches no candidate
+  is dropped (`pending_status=skipped_unanchored_price:*`). TP/SL ids and the
+  pending trigger id are logged (`tp_level_id`, `sl_level_id`,
+  `pending_level_id`).
+- **Four layers in the log.** `market_state` (TREND / RANGE / TRANSITION /
+  UNKNOWN), `direction` (UP / DOWN / NEUTRAL), `setup` (PULLBACK / BREAKOUT /
+  FADE / NONE) and `executability` (EXECUTABLE / WAIT / BLOCKED) with
+  `executability_reason`, so "the market is trending" and "an order can be
+  sent now" are recorded separately. A failed chair is `UNKNOWN`, never the
+  vote.
+- **Counter-evidence and data quality.** Every analyst reports
+  `counter_evidence`, `data_quality` (GOOD / PARTIAL / POOR) and an optional
+  `abstain_reason` (which forces a neutral / UNCLEAR view); the panel members
+  do the same and the chair sees them. `analyst_data_quality` summarises this
+  per row.
+- **H1 role.** The technical analyst reports `h4_trend`, `h1_trend`, `h1_role`
+  (IMPULSE / PULLBACK / REVERSAL_ATTEMPT / NOISE) and
+  `timeframe_relationship`, so an H1 dip inside an H4 uptrend can be read as a
+  pullback instead of a divergence.
+
 ## Regime (Trend vs Range)
 
 `indicators/regime.py` classifies every cycle as TREND / RANGE / TRANSITION from
