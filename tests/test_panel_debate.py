@@ -86,22 +86,32 @@ def test_panel_majority_trend_up_gives_bull_and_full_transcript() -> None:
     summary = report["regime_summary"]
     assert summary["regime"] == "TREND" and summary["direction_if_trend"] == "UP"
     assert summary["entry_style"] == "LIMIT_PULLBACK"
-    assert summary["consensus"] == "MAJORITY" and summary["regime_confidence"] == 0.6
+    assert summary["consensus"] == "MAJORITY"
+    assert summary["regime_confidence"] is None  # not a probability: see panel_agreement
+    assert summary["panel_agreement"] == 0.6 and summary["panel_votes_available"] == 3
+    assert summary["panel_vote_distribution"] == {"TREND_CONTINUATION": 2, "MEAN_REVERSION": 1, "UNCLEAR": 0}
+    assert summary["panel_consensus_type"] == "MAJORITY"
     assert summary["key_levels"] == {"continuation_confirms": 4390.0, "reversal_confirms": 4340.5}
     assert summary["source"] == "judge" and "disagrees_with_rule" not in summary
     assert report["judge_summary"]["stronger_side"] == "bull"
     assert report["judge_summary"]["conflicts"] == ["マクロは反転寄り"]
     assert report["panel_views"]["sentiment"]["changed_view"] is True
+    assert report["panel_views"]["technical"]["initial_view"] == "UNCLEAR"  # report had no regime_view
     assert [s["role"] for s in report["panel_transcript"]] == ["technical", "macro", "sentiment"]
+    assert report["_meta"]["judge_status"] == "OK" and report["_meta"]["judge_attempts"] == 1
+    assert report["_meta"]["debate_protocol_version"] == panel_debate.DEBATE_PROTOCOL_VERSION
     assert report["bull_arguments"] == [] and report["bull_confidence"] == 0.0
 
-    # Each analyst saw its own report, the other two, the prior statements and the hint labelled as such.
+    # Round 1 is symmetric: every analyst sees the three reports and NO statements
+    # from this round, so the speaking order cannot anchor anyone.
     technical_call, macro_call, sentiment_call, judge_call = client.calls
     assert technical_call["payload"]["your_report"] == technical
     assert set(technical_call["payload"]["other_reports"]) == {"macro", "sentiment"}
     assert technical_call["payload"]["transcript"] == []
-    assert macro_call["payload"]["transcript"][0]["role"] == "technical"
-    assert len(sentiment_call["payload"]["transcript"]) == 2
+    assert macro_call["payload"]["transcript"] == []
+    assert sentiment_call["payload"]["transcript"] == []
+    assert macro_call["payload"]["your_initial_view"] == "UNCLEAR"
+    assert judge_call["payload"]["initial_views"] == {"technical": "UNCLEAR", "macro": "UNCLEAR", "sentiment": "UNCLEAR"}
     assert "マクロ分析官" in macro_call["system"] and "テクニカル分析官" in technical_call["system"]
     assert judge_call["payload"]["absent_analysts"] == []
     assert judge_call["system"] == panel_debate.PANEL_JUDGE_SYSTEM_PROMPT
@@ -130,7 +140,7 @@ def test_panel_range_verdict_is_neutral_and_flags_rule_disagreement() -> None:
     assert report["judge_summary"]["stronger_side"] == "neutral"
 
 
-def test_panel_falls_back_to_majority_vote_when_judge_fails() -> None:
+def test_panel_chair_failure_retries_once_then_is_not_ok_for_trading() -> None:
     client = _ScriptedClient(
         {
             "technical": _view("TREND_CONTINUATION", "DOWN"),
@@ -140,14 +150,38 @@ def test_panel_falls_back_to_majority_vote_when_judge_fails() -> None:
         _result({}, ok=False, error="judge timeout"),
     )
     report = panel_debate.run_panel_debate({}, {}, {}, client=client)
-    assert report["_meta"]["ok"] is True and report["_meta"]["judge_ok"] is False
+    # One retry with a note, then FAILED: the report is not ok, so main.py holds.
+    chair_calls = [c for c in client.calls if "your_role" not in c["payload"]]
+    assert len(chair_calls) == 2 and "retry_note" in chair_calls[1]["payload"]
+    assert report["_meta"]["ok"] is False and report["_meta"]["judge_ok"] is False
+    assert report["_meta"]["judge_status"] == "FAILED" and report["_meta"]["judge_attempts"] == 2
     assert report["_meta"]["judge_error"] == "judge timeout"
     summary = report["regime_summary"]
-    assert summary["source"] == "vote_fallback"
+    assert summary["source"] == "vote_fallback_log_only"
     assert summary["regime"] == "TREND" and summary["direction_if_trend"] == "DOWN" and summary["entry_style"] == "LIMIT_PULLBACK"
     assert summary["consensus"] == "MAJORITY"
     assert report["judge_summary"]["stronger_side"] == "bear"
     assert "多数決で代替" in report["judge_summary"]["conflicts"][0]
+
+
+def test_panel_chair_recovers_on_retry_and_rejects_trend_without_direction() -> None:
+    answers = {"technical": _view("TREND_CONTINUATION", "UP"), "macro": _view("TREND_CONTINUATION", "UP"), "sentiment": _view("UNCLEAR")}
+    bad_then_good = [_result({"regime": "TREND", "direction_if_trend": "NEUTRAL"}), _result(_judge("TREND", "UP", "STOP_BREAKOUT"))]
+
+    class _Client(_ScriptedClient):
+        def call_json(self, **kwargs):
+            payload = json.loads(kwargs["user_prompt"])
+            if "your_role" in payload:
+                return super().call_json(**kwargs)
+            self.calls.append({"system": kwargs["system_prompt"], "payload": payload})
+            return bad_then_good.pop(0)
+
+    client = _Client(answers, None)
+    report = panel_debate.run_panel_debate({}, {}, {}, client=client)
+    assert report["_meta"]["ok"] is True
+    assert report["_meta"]["judge_status"] == "RECOVERED_RETRY" and report["_meta"]["judge_attempts"] == 2
+    assert report["regime_summary"]["regime"] == "TREND" and report["regime_summary"]["entry_style"] == "STOP_BREAKOUT"
+    assert report["regime_summary"]["source"] == "judge"
 
 
 def test_panel_split_views_become_transition_without_forcing() -> None:
@@ -159,7 +193,9 @@ def test_panel_split_views_become_transition_without_forcing() -> None:
     assert report["regime_summary"]["regime"] == "TRANSITION"
     assert report["regime_summary"]["entry_style"] == "NONE"
     assert report["regime_summary"]["consensus"] == "SPLIT"
+    assert report["regime_summary"]["panel_agreement"] == 0.4
     assert report["judge_summary"]["stronger_side"] == "neutral"
+    assert report["_meta"]["ok"] is False  # chair exploded twice
 
 
 def test_panel_records_absent_analyst_and_holds_when_fewer_than_two_answer() -> None:
@@ -185,8 +221,16 @@ def test_two_rounds_let_analysts_reply() -> None:
     report = panel_debate.run_panel_debate({}, {}, {}, client=client, rounds=2)
     assert len(client.calls) == 7
     assert [s["round"] for s in report["panel_transcript"]] == [1, 1, 1, 2, 2, 2]
-    assert len(client.calls[3]["payload"]["transcript"]) == 3  # round-2 technical sees all of round 1
+    # Round 2 is symmetric too: everyone sees exactly the three round-1 statements.
+    for call in client.calls[3:6]:
+        assert [s["role"] for s in call["payload"]["transcript"]] == ["technical", "macro", "sentiment"]
+        assert all(s["round"] == 1 for s in call["payload"]["transcript"])
     assert report["round_count"] == 2
+    # changed_view is computed against the analyst's own report, not just the flag.
+    report2 = panel_debate.run_panel_debate({"regime_view": "MEAN_REVERSION"}, {}, {}, client=_ScriptedClient(
+        {"technical": _view("TREND_CONTINUATION", "UP"), "macro": _view("UNCLEAR"), "sentiment": _view("UNCLEAR")}, _judge("TRANSITION")))
+    assert report2["panel_views"]["technical"]["initial_view"] == "MEAN_REVERSION"
+    assert report2["panel_views"]["technical"]["changed_view"] is True
 
 
 def test_run_debate_graph_dispatches_panel_axis(monkeypatch) -> None:

@@ -45,16 +45,25 @@ PANEL_SYSTEM_PROMPT = (
     "あなたはGOLD(XAU/USD)の分析官パネルの一員として討論に参加します。"
     "あなたの専門は__ROLE__です。論点はただ一つ: いまの相場はトレンド継続局面(押し目買い/戻り売りやブレイク追随が機能する)か、"
     "反転・平均回帰局面(帯の端で逆方向に戻りやすい)か、判断できないか。"
-    "自分の専門のレポート(your_report)を出発点に、他の分析官のレポート(other_reports)とこれまでの発言(transcript)を読み、"
-    "自分の専門から見た客観的な見解を述べてください。"
-    "他の分析官に同意してもよいし、反対してもよいし、説得されて見解を変えてもよい(変えたらchanged_view=trueにして理由を書く)。"
+    "自分の専門のレポート(your_report)を出発点に、他の分析官のレポート(other_reports)を読み、"
+    "自分の専門から見た客観的な見解を述べてください。transcriptには前の巡までの発言だけが入ります"
+    "(第1巡は空で、全員が同じ情報だけを見て独立に再評価します)。"
+    "他の分析官に同意してもよいし、反対してもよいし、説得されて見解を変えてもよい"
+    "(自分のレポートの見解から変えたらchanged_view=trueにし、どの数値・水準で変えたかをchange_reasonに書く)。"
     "反論は求めません。根拠のない主張はしないこと。根拠が弱ければUNCLEARと答えること。"
     "regime_hintはコードによる機械的な暫定判定で、参考情報にすぎません。従う必要はありません。"
     "出力は次のキーだけを持つJSON: "
     "{regime_view: 'TREND_CONTINUATION'|'MEAN_REVERSION'|'UNCLEAR', direction_if_trend: 'UP'|'DOWN'|'NEUTRAL', "
     "statement: string(日本語、自分の専門からの見解と根拠), responses_to_others: string[](他の分析官の具体的な論点への応答、無ければ空), "
     "key_prices: {continuation_confirms: number|null, reversal_confirms: number|null}, "
-    "what_would_change_view: string, changed_view: boolean}"
+    "what_would_change_view: string, changed_view: boolean, change_reason: string}"
+)
+
+DEBATE_PROTOCOL_VERSION: Final[str] = "panel-v2-symmetric-round1"
+JUDGE_MAX_ATTEMPTS: Final[int] = 2
+STATEMENT_KEYS: Final[tuple[str, ...]] = (
+    "role", "round", "regime_view", "direction_if_trend", "statement", "responses_to_others",
+    "key_prices", "what_would_change_view", "changed_view", "change_reason",
 )
 
 PANEL_JUDGE_SYSTEM_PROMPT = (
@@ -121,6 +130,7 @@ def _statement_from_payload(role: str, round_index: int, payload: dict[str, Any]
         },
         "what_would_change_view": str(payload.get("what_would_change_view", "") or ""),
         "changed_view": bool(payload.get("changed_view", False)),
+        "change_reason": str(payload.get("change_reason", "") or ""),
     }
 
 
@@ -137,7 +147,19 @@ def _absent_statement(role: str, round_index: int, error: str) -> dict[str, Any]
         "key_prices": {"continuation_confirms": None, "reversal_confirms": None},
         "what_would_change_view": "",
         "changed_view": False,
+        "change_reason": "",
     }
+
+
+def _initial_view(role: str, report: dict[str, Any]) -> str:
+    """The analyst's stance in its own report, mapped onto the panel vocabulary."""
+    raw = str(report.get("regime_view", "") or "").upper()
+    return {
+        "TREND_CONTINUATION": "TREND_CONTINUATION",
+        "SUPPORTS_CONTINUATION": "TREND_CONTINUATION",
+        "MEAN_REVERSION": "MEAN_REVERSION",
+        "SUPPORTS_REVERSAL": "MEAN_REVERSION",
+    }.get(raw, "UNCLEAR")
 
 
 def _latest_views(transcript: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -195,11 +217,18 @@ def _vote_fallback(transcript: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _judge_from_payload(payload: dict[str, Any], transcript: list[dict[str, Any]]) -> dict[str, Any]:
-    regime = _enum(payload.get("regime"), REGIME_VALUES, "TRANSITION")
-    direction = _enum(payload.get("direction_if_trend"), ("UP", "DOWN", "NEUTRAL"), "NEUTRAL")
-    if regime != "TREND":
-        direction = "NEUTRAL"
+def _judge_from_payload(payload: dict[str, Any], transcript: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Validated chair verdict, or None when the output cannot be executed on:
+    missing/invalid regime or direction enum, TREND without a direction."""
+    regime = str(payload.get("regime", "") or "").upper().strip()
+    if regime not in REGIME_VALUES:
+        return None
+    direction_raw = str(payload.get("direction_if_trend", "NEUTRAL") or "NEUTRAL").upper().strip()
+    if direction_raw not in ("UP", "DOWN", "NEUTRAL"):
+        return None
+    direction = direction_raw if regime == "TREND" else "NEUTRAL"
+    if regime == "TREND" and direction == "NEUTRAL":
+        return None
     entry_style = _enum(payload.get("entry_style"), ENTRY_STYLES, {"TREND": "LIMIT_PULLBACK", "RANGE": "LIMIT_FADE"}.get(regime, "NONE"))
     if regime == "TRANSITION":
         entry_style = "NONE"
@@ -232,6 +261,43 @@ def _stronger_side(regime: str, direction: str) -> Literal["bull", "bear", "neut
     return "neutral"
 
 
+def _vote_distribution(latest: dict[str, dict[str, Any]]) -> dict[str, int]:
+    views = [s["regime_view"] for s in latest.values()]
+    return {view: views.count(view) for view in REGIME_VIEW_VALUES}
+
+
+def _ask_chair(llm: Any, judge_payload: dict[str, Any], model: str, transcript: list[dict[str, Any]], usage: dict[str, int]) -> tuple[dict[str, Any] | None, str, int]:
+    """Up to JUDGE_MAX_ATTEMPTS chair calls. -> (verdict or None, last error, attempts)."""
+    error = ""
+    attempts = 0
+    for attempt in range(1, JUDGE_MAX_ATTEMPTS + 1):
+        attempts = attempt
+        payload = dict(judge_payload)
+        if attempt > 1:
+            payload["retry_note"] = f"前回の回答は無効でした({error})。指定された JSON キーと列挙値だけで答え直してください。"
+        try:
+            result = llm.call_json(
+                system_prompt=PANEL_JUDGE_SYSTEM_PROMPT,
+                user_prompt=json.dumps(payload, ensure_ascii=False),
+                model=model,
+                fallback_payload={},
+            )
+        except Exception as exc:
+            error = str(exc)
+            continue
+        _add_usage(usage, _usage_of(result))
+        raw = result.payload if isinstance(getattr(result, "payload", None), dict) else {}
+        if not bool(getattr(result, "ok", False)):
+            error = str(getattr(result, "error", "") or "chair call failed")
+            continue
+        verdict = _judge_from_payload(raw, transcript)
+        if verdict is None:
+            error = "invalid chair output (regime/direction missing or out of enum)"
+            continue
+        return verdict, "", attempts
+    return None, error, attempts
+
+
 def run_panel_debate(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
@@ -251,23 +317,25 @@ def run_panel_debate(
     hint = dict(regime_hint) if isinstance(regime_hint, dict) else (
         dict(technical_report.get("regime")) if isinstance(technical_report, dict) and isinstance(technical_report.get("regime"), dict) else {}
     )
+    initial_views = {role: _initial_view(role, reports[role]) for role in PANEL_ROLES}
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     transcript: list[dict[str, Any]] = []
     errors: list[str] = []
     model_name = model
+    total_rounds = max(1, int(rounds))
 
-    for round_index in range(1, max(1, int(rounds)) + 1):
+    for round_index in range(1, total_rounds + 1):
+        # Symmetric rounds: everyone sees the three reports plus the statements
+        # of PREVIOUS rounds only, never this round's earlier speakers.
+        visible = [{k: s[k] for k in STATEMENT_KEYS} for s in transcript if s.get("ok") and int(s["round"]) < round_index]
         for role in PANEL_ROLES:
             user_payload = {
                 "round": round_index,
                 "your_role": role,
                 "your_report": reports[role],
+                "your_initial_view": initial_views[role],
                 "other_reports": {k: v for k, v in reports.items() if k != role},
-                "transcript": [
-                    {k: s[k] for k in ("role", "round", "regime_view", "direction_if_trend", "statement", "responses_to_others", "key_prices", "what_would_change_view", "changed_view")}
-                    for s in transcript
-                    if s.get("ok")
-                ],
+                "transcript": visible,
                 "regime_hint": hint,
                 "question": "いまの相場はトレンド継続局面か、反転・平均回帰局面か、判断できないか。",
             }
@@ -290,49 +358,51 @@ def run_panel_debate(
                 errors.append(f"{role}#{round_index}: {error}")
                 transcript.append(_absent_statement(role, round_index, error))
                 continue
-            transcript.append(_statement_from_payload(role, round_index, payload))
+            statement = _statement_from_payload(role, round_index, payload)
+            # changed_view is a fact computed against the analyst's own report,
+            # not only the flag it set.
+            statement["changed_view"] = bool(statement["changed_view"] or statement["regime_view"] != initial_views[role])
+            transcript.append(statement)
 
     latest = _latest_views(transcript)
-    judge_ok = False
+    enough_analysts = len(latest) >= 2
+    judge_status = "FAILED"
     judge_error = ""
-    if len(latest) >= 2:
+    judge_attempts = 0
+    verdict: dict[str, Any] | None = None
+    if enough_analysts:
         judge_payload = {
-            "transcript": [
-                {k: s[k] for k in ("role", "round", "regime_view", "direction_if_trend", "statement", "responses_to_others", "key_prices", "what_would_change_view", "changed_view")}
-                for s in transcript
-                if s.get("ok")
-            ],
-            "absent_analysts": [s["role"] for s in transcript if not s.get("ok")],
+            "transcript": [{k: s[k] for k in STATEMENT_KEYS} for s in transcript if s.get("ok")],
+            "initial_views": initial_views,
+            "absent_analysts": sorted({s["role"] for s in transcript if not s.get("ok")}),
             "regime_hint": hint,
         }
-        try:
-            result = llm.call_json(
-                system_prompt=PANEL_JUDGE_SYSTEM_PROMPT,
-                user_prompt=json.dumps(judge_payload, ensure_ascii=False),
-                model=model,
-                fallback_payload={},
-            )
-            _add_usage(usage, _usage_of(result))
-            payload = result.payload if isinstance(getattr(result, "payload", None), dict) else {}
-            if bool(getattr(result, "ok", False)) and "regime" in payload:
-                verdict = _judge_from_payload(payload, transcript)
-                judge_ok = True
-            else:
-                judge_error = str(getattr(result, "error", "") or "no regime in judge output")
-                verdict = _vote_fallback(transcript)
-        except Exception as exc:
-            judge_error = str(exc)
-            verdict = _vote_fallback(transcript)
+        verdict, judge_error, judge_attempts = _ask_chair(llm, judge_payload, model, transcript, usage)
+        if verdict is not None:
+            judge_status = "OK" if judge_attempts == 1 else "RECOVERED_RETRY"
     else:
         judge_error = "fewer than two analysts answered"
-        verdict = _vote_fallback(transcript)
-        verdict["conflicts"] = ["分析官の回答が2名未満のため判定不能"]
-        verdict["regime"], verdict["direction_if_trend"], verdict["entry_style"] = "TRANSITION", "NEUTRAL", "NONE"
 
+    # Vote fallback is for the record only: with the chair failed the report is
+    # NOT ok, so the trading loop holds; the logger still gets a regime to score.
+    if verdict is None:
+        verdict = _vote_fallback(transcript)
+        verdict["source"] = "vote_fallback_log_only"
+        if not enough_analysts:
+            verdict["conflicts"] = ["分析官の回答が2名未満のため判定不能"]
+            verdict["regime"], verdict["direction_if_trend"], verdict["entry_style"] = "TRANSITION", "NEUTRAL", "NONE"
+
+    distribution = _vote_distribution(latest)
     hint_regime = str(hint.get("regime", "") or "")
     regime_summary = {
         "regime": verdict["regime"],
-        "regime_confidence": CONSENSUS_CONFIDENCE.get(verdict["consensus"], 0.4),
+        # Not a probability: how many of the analysts who answered agree. Never
+        # used as an order threshold; kept for the log and later calibration.
+        "regime_confidence": None,
+        "panel_agreement": CONSENSUS_CONFIDENCE.get(verdict["consensus"], 0.4),
+        "panel_votes_available": len(latest),
+        "panel_vote_distribution": distribution,
+        "panel_consensus_type": verdict["consensus"],
         "direction_if_trend": verdict["direction_if_trend"],
         "entry_style": verdict["entry_style"],
         "key_levels": verdict["key_levels"],
@@ -344,17 +414,27 @@ def run_panel_debate(
         regime_summary["disagrees_with_rule"] = True
 
     stronger = _stronger_side(verdict["regime"], verdict["direction_if_trend"])
-    ok = len(latest) >= 2
+    ok = enough_analysts and judge_status != "FAILED"
+    absent = sorted({s["role"] for s in transcript if not s.get("ok")})
     return {
         "axis": AXIS_PANEL,
         "regime_summary": regime_summary,
         "panel_transcript": transcript,
-        "panel_views": {role: {"regime_view": s["regime_view"], "direction_if_trend": s["direction_if_trend"], "changed_view": s["changed_view"]} for role, s in latest.items()},
+        "panel_views": {
+            role: {
+                "initial_view": initial_views[role],
+                "regime_view": s["regime_view"],
+                "direction_if_trend": s["direction_if_trend"],
+                "changed_view": s["changed_view"],
+                "change_reason": s["change_reason"],
+            }
+            for role, s in latest.items()
+        },
         "bull_arguments": [],
         "bear_arguments": [],
         "bull_conceded_points": [],
         "bear_conceded_points": [],
-        "round_count": max(1, int(rounds)),
+        "round_count": total_rounds,
         "bull_confidence": 0.0,
         "bear_confidence": 0.0,
         "prev_bull_confidence": 0.0,
@@ -362,7 +442,7 @@ def run_panel_debate(
         "bear_confidence_history": [],
         "judge_summary": {
             "agreements": verdict["agreements"],
-            "conflicts": verdict["conflicts"] + ([f"欠席: {', '.join(sorted({s['role'] for s in transcript if not s.get('ok')}))}"] if any(not s.get("ok") for s in transcript) else []),
+            "conflicts": verdict["conflicts"] + ([f"欠席: {', '.join(absent)}"] if absent else []),
             "confidence_shift": {"bull": [], "bear": []},
             "stronger_side": stronger,
             "regime_summary": regime_summary,
@@ -373,10 +453,13 @@ def run_panel_debate(
             "ok": ok,
             "engine": "panel",
             "model": model_name,
-            "judge_ok": judge_ok,
+            "judge_ok": judge_status != "FAILED",
+            "judge_status": judge_status,
+            "judge_attempts": judge_attempts,
             "judge_error": judge_error,
             "analysts_ok": sorted(latest.keys()),
             "errors": errors,
             "usage": usage,
+            "debate_protocol_version": DEBATE_PROTOCOL_VERSION,
         },
     }
