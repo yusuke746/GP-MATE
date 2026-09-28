@@ -4,18 +4,17 @@ import json
 from typing import Any
 
 from agents.base import decision_model, get_default_client
-from config import CONFIDENCE_THRESHOLD, SYMBOL, MACRO_BIAS_CARRY_THRESHOLD
+from config import CONFIDENCE_THRESHOLD, SYMBOL
 
 SYSTEM_PROMPT = (
     "あなたは最終決定権を持つトレーダーです。"
     "必ず place_trade_order 関数を呼び出して最終判断を返してください。"
     "confidenceは判断の確からしさ(0-1)を正直に申告すること。"
     "エントリー可否の閾値判定はシステム側で行うため、閾値を意識して数値を調整しないこと。"
-    "HOLDの場合でも、macro/technical/sentimentが方向性を示すなら "
-    "directional_bias(BULLISH/BEARISH)とbias_strength、trigger_conditions"
-    "(key_levelsに基づく発動価格条件)を必ず設定すること。"
-    "特にmacroのmacro_biasとconfidenceは、テクニカルがレンジでも"
-    "directional_biasに反映すること。"
+    "HOLDで見送る場合、分析官と討論(judge_summary)の見解が同じ方向を指しているときだけ "
+    "directional_bias(BULLISH/BEARISH)とbias_strength、trigger_conditions(key_levelsに基づく発動価格条件)を設定する。"
+    "見解が割れている、または根拠が薄いときはdirectional_bias=NEUTRAL、bias_strength=0、pending_orders=[]とし、"
+    "無理に方向を作らないこと。エントリーは1日に数回で十分である。"
     "action(BUY/SELL/HOLD)の方向判断はtechnical/macro/sentiment/debateに基づき、"
     "technical_report内のtp_reference_onlyを方向判断に使ってはならない。"
     "tp_reference_onlyはsuggested_tpの算出にのみ使用する。"
@@ -347,13 +346,8 @@ def decide_trade(
     directional_bias = str(payload.get("directional_bias", "NEUTRAL") or "NEUTRAL").upper()
     if directional_bias not in {"BULLISH", "BEARISH", "NEUTRAL"}:
         directional_bias = "NEUTRAL"
-    if directional_bias == "NEUTRAL" and isinstance(macro_report, dict):
-        _macro_meta = macro_report.get("_meta", {})
-        _macro_ok = bool(_macro_meta.get("ok", False)) if isinstance(_macro_meta, dict) else False
-        m_bias = str(macro_report.get("macro_bias", "NEUTRAL") or "NEUTRAL").upper()
-        m_conf = float(macro_report.get("confidence", 0.0) or 0.0)
-        if _macro_ok and m_bias in {"BULLISH", "BEARISH"} and m_conf >= MACRO_BIAS_CARRY_THRESHOLD:
-            directional_bias = m_bias
+    # The trader's own bias stands; code no longer injects the macro bias when
+    # the trader said NEUTRAL.
     payload["directional_bias"] = directional_bias
     payload["bias_strength"] = max(0.0, min(1.0, float(payload.get("bias_strength", 0.0) or 0.0)))
     tc = payload.get("trigger_conditions", [])
