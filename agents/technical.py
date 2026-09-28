@@ -4,29 +4,41 @@ import json
 from typing import Any, Final, Literal, TypedDict, cast
 
 from agents.base import analysis_model, get_default_client
+from indicators.price_levels import accepted, resolve_level
 
 SYSTEM_PROMPT = (
     "あなたはGOLD(XAU/USD)のテクニカル分析官です。"
     "与えられた多時間軸(D1/H4/H1)の指標スナップショット、水平帯(supports/resistances)、"
     "価格構造(直近スイングの高値安値の並び、未充填のFVG)だけを材料に、自分の判断で相場を読んでください。"
     "採点表や『この条件ならこう答える』という固定の規則はありません。あなたの読みがそのまま採用されます。"
-    "答える問い: (1) D1の方向と執行足(H4/H1)の方向、その整合性。"
+    "答える問い: (1) D1(構造的バイアス)・H4(セットアップ形成)・H1(タイミング)それぞれの方向と、"
+    "H1の役割(IMPULSE=推進 / PULLBACK=上位足トレンド内の押し目・戻り / REVERSAL_ATTEMPT=反転の試み / NOISE)。"
+    "H4が上でH1が下なら、それは押し目かもしれないし反転の始まりかもしれない。どちらと読むかを述べ、"
+    "execution_trendにはH4/H1を合わせた執行足の方向、alignmentにはD1と執行足の整合を書く。"
     "(2) いまはトレンド継続局面(押し目買い/戻り売りやブレイク追随が機能する)か、"
     "反転・平均回帰局面(帯の端で反対方向に戻りやすい)か、判断できないか。"
-    "(3) その読みを支える具体的な価格(支持・抵抗)と、読みが崩れる価格(invalidation)。"
+    "(3) その読みを支える水準と、読みが崩れる水準(invalidation)。価格は自分で作らず、"
+    "price_levels に与えた候補の level_id で答えること(候補に無い水準は書かない)。"
+    "(4) 結論に反する材料(counter_evidence)。都合のよい材料だけを拾わないよう、反対側も探して列挙する(無ければ空)。"
+    "(5) データ品質 data_quality: GOOD / PARTIAL(欠損や古い値がある) / POOR(判断に足りない)。"
+    "判断を保留するなら abstain_reason にその理由を書き、regime_view は UNCLEAR にする。"
     "根拠が弱いときはRANGEやUNCLEARと答えてよく、無理に方向を出す必要はありません。"
     "複数の独立した根拠(例: 上位足のスイング構造とFVGと水平帯が同じ価格帯を指す)が重なるときだけ、"
     "evidenceにそれを列挙して強い読みとしてください。"
     "出力は次のキーだけを持つJSON: "
-    "{d1_trend: 'UP'|'DOWN'|'RANGE', execution_trend: 'UP'|'DOWN'|'RANGE', "
-    "alignment: 'ALIGNED'|'DIVERGENT'|'MIXED', "
+    "{d1_trend: 'UP'|'DOWN'|'RANGE', h4_trend: 'UP'|'DOWN'|'RANGE', h1_trend: 'UP'|'DOWN'|'RANGE', "
+    "h1_role: 'IMPULSE'|'PULLBACK'|'REVERSAL_ATTEMPT'|'NOISE', timeframe_relationship: string, "
+    "execution_trend: 'UP'|'DOWN'|'RANGE', alignment: 'ALIGNED'|'DIVERGENT'|'MIXED', "
     "regime_view: 'TREND_CONTINUATION'|'MEAN_REVERSION'|'UNCLEAR', "
     "direction_if_trend: 'UP'|'DOWN'|'NEUTRAL', "
-    "key_prices: {supports: number[], resistances: number[], invalidation: number|null}, "
-    "evidence: string[], what_would_change_view: string, reasoning: string(日本語)}"
+    "key_levels: {support_level_ids: string[], resistance_level_ids: string[], invalidation_level_id: string|null}, "
+    "evidence: string[], counter_evidence: string[], data_quality: 'GOOD'|'PARTIAL'|'POOR', abstain_reason: string|null, "
+    "what_would_change_view: string, reasoning: string(日本語)}"
 )
 
 REGIME_VIEW_VALUES: Final[tuple[str, ...]] = ("TREND_CONTINUATION", "MEAN_REVERSION", "UNCLEAR")
+H1_ROLE_VALUES: Final[tuple[str, ...]] = ("IMPULSE", "PULLBACK", "REVERSAL_ATTEMPT", "NOISE")
+DATA_QUALITY_VALUES: Final[tuple[str, ...]] = ("GOOD", "PARTIAL", "POOR")
 
 TIMEFRAME_TREND_VALUES: Final[tuple[Literal["UP", "DOWN", "RANGE"], ...]] = (
     "UP",
@@ -378,25 +390,38 @@ def _enum(value: Any, allowed: tuple[str, ...] | set[str]) -> str | None:
     return text if text in allowed else None
 
 
-def _price_list(value: Any) -> list[float]:
-    if not isinstance(value, list):
-        return []
-    out: list[float] = []
-    for item in value:
-        try:
-            out.append(round(float(item), 5))
-        except (TypeError, ValueError):
-            continue
-    return out[:6]
+def _resolve_ids(levels: list[dict[str, Any]] | None, values: Any, atr: float | None) -> tuple[list[float], list[str], list[str]]:
+    """-> (prices, level_ids, unresolved references) for a list of ids (or legacy raw prices)."""
+    prices: list[float] = []
+    ids: list[str] = []
+    unresolved: list[str] = []
+    if not isinstance(values, list):
+        return prices, ids, unresolved
+    for item in values[:6]:
+        resolved = resolve_level(levels, item, atr=atr)
+        if accepted(resolved):
+            prices.append(round(float(resolved["price"]), 5))
+            if resolved["level_id"]:
+                ids.append(str(resolved["level_id"]))
+        else:
+            unresolved.append(str(item))
+    return prices, ids, unresolved
 
 
-def _analyst_view(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _analyst_view(payload: dict[str, Any], levels: list[dict[str, Any]] | None = None, atr: float | None = None) -> dict[str, Any] | None:
     """The LLM's own read, validated. None when it did not answer the question
     (then the rule-based baseline is used as a fail-safe, and says so)."""
     execution_trend = _enum(payload.get("execution_trend"), TIMEFRAME_TREND_VALUES)
     if execution_trend is None:
         return None
     d1_trend = _enum(payload.get("d1_trend"), TIMEFRAME_TREND_VALUES) or "RANGE"
+    h4_trend = _enum(payload.get("h4_trend"), TIMEFRAME_TREND_VALUES) or execution_trend
+    h1_trend = _enum(payload.get("h1_trend"), TIMEFRAME_TREND_VALUES) or execution_trend
+    h1_role = _enum(payload.get("h1_role"), H1_ROLE_VALUES) or "NOISE"
+    data_quality = _enum(payload.get("data_quality"), DATA_QUALITY_VALUES) or "GOOD"
+    abstain_reason = str(payload.get("abstain_reason") or "").strip() or None
+    counter_raw = payload.get("counter_evidence")
+    counter_evidence = [str(x) for x in counter_raw if str(x).strip()] if isinstance(counter_raw, list) else []
     alignment = _enum(payload.get("alignment"), ALIGNMENT_VALUES) or _alignment_from_trends(
         cast(Literal["UP", "DOWN", "RANGE"], d1_trend), cast(Literal["UP", "DOWN", "RANGE"], execution_trend)
     )
@@ -404,27 +429,45 @@ def _analyst_view(payload: dict[str, Any]) -> dict[str, Any] | None:
     direction = _enum(payload.get("direction_if_trend"), ("UP", "DOWN", "NEUTRAL")) or "NEUTRAL"
     if regime_view != "TREND_CONTINUATION":
         direction = "NEUTRAL"
-    key_prices_raw = payload.get("key_prices") if isinstance(payload.get("key_prices"), dict) else {}
-    invalidation = None
-    try:
-        if key_prices_raw.get("invalidation") is not None:
-            invalidation = round(float(key_prices_raw.get("invalidation")), 5)
-    except (TypeError, ValueError):
-        invalidation = None
+    # Levels: ids from the catalogue (legacy raw numbers are snapped to the
+    # nearest candidate within tolerance, otherwise reported as unresolved).
+    key_raw = payload.get("key_levels") if isinstance(payload.get("key_levels"), dict) else (
+        payload.get("key_prices") if isinstance(payload.get("key_prices"), dict) else {}
+    )
+    supports, support_ids, unresolved_s = _resolve_ids(levels, key_raw.get("support_level_ids", key_raw.get("supports")), atr)
+    resistances, resistance_ids, unresolved_r = _resolve_ids(levels, key_raw.get("resistance_level_ids", key_raw.get("resistances")), atr)
+    inv_ref = key_raw.get("invalidation_level_id", key_raw.get("invalidation"))
+    inv = resolve_level(levels, inv_ref, atr=atr)
+    invalidation = round(float(inv["price"]), 5) if accepted(inv) else None
+    unresolved = unresolved_s + unresolved_r + ([str(inv_ref)] if inv_ref not in (None, "") and not accepted(inv) else [])
+    if abstain_reason and regime_view != "UNCLEAR":
+        regime_view = "UNCLEAR"
+        direction = "NEUTRAL"
     evidence_raw = payload.get("evidence")
     evidence = [str(x) for x in evidence_raw if str(x).strip()] if isinstance(evidence_raw, list) else []
     return {
         "d1_trend": d1_trend,
+        "h4_trend": h4_trend,
+        "h1_trend": h1_trend,
+        "h1_role": h1_role,
+        "timeframe_relationship": str(payload.get("timeframe_relationship", "") or ""),
         "execution_trend": execution_trend,
         "alignment": alignment,
         "regime_view": regime_view,
         "direction_if_trend": direction,
         "key_prices": {
-            "supports": _price_list(key_prices_raw.get("supports")),
-            "resistances": _price_list(key_prices_raw.get("resistances")),
+            "supports": supports,
+            "resistances": resistances,
             "invalidation": invalidation,
+            "support_level_ids": support_ids,
+            "resistance_level_ids": resistance_ids,
+            "invalidation_level_id": inv["level_id"] if inv["anchored"] else None,
+            "unresolved": unresolved,
         },
         "evidence": evidence,
+        "counter_evidence": counter_evidence,
+        "data_quality": data_quality,
+        "abstain_reason": abstain_reason,
         "what_would_change_view": str(payload.get("what_would_change_view", "") or ""),
         "reasoning": str(payload.get("reasoning") or payload.get("summary") or "").strip(),
     }
@@ -453,12 +496,17 @@ def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
         "technical_notes": direction_payload.get("technical", {}),
         "structure": direction_payload.get("structure", {}),
         "horizontal_levels": horizontal_levels,
+        "price_levels": direction_payload.get("price_levels", []),
     }
+    price_levels = direction_payload.get("price_levels") if isinstance(direction_payload.get("price_levels"), list) else []
+    h1_snapshot = direction_payload.get("h1") if isinstance(direction_payload.get("h1"), dict) else {}
+    atr_h1 = _as_float(h1_snapshot.get("atr_14", 0.0), 0.0)
     user_prompt = (
         "以下の材料から、D1と執行足(H4/H1)の方向、いまがトレンド継続か反転(平均回帰)か判断不能か、"
         "鍵となる価格と読みが崩れる価格を、あなた自身の判断で答えてください。\n"
         "horizontal_levelsは複数時間軸のスイングとキリ番から機械的に集めた水平帯、"
-        "structureは直近スイングの並びと未充填FVGの事実です。意味づけはあなたが行ってください。\n"
+        "structureは直近スイングの並びと未充填FVGの事実、price_levelsはそれらをlevel_id付きで一覧にした候補水準です。"
+        "水準はprice_levelsのlevel_idで参照してください。意味づけはあなたが行ってください。\n"
         f"{json.dumps(analyst_input, ensure_ascii=False)}"
     )
 
@@ -470,7 +518,7 @@ def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     payload = dict(result.payload) if isinstance(result.payload, dict) else {}
-    view = _analyst_view(payload) if bool(result.ok) else None
+    view = _analyst_view(payload, price_levels, atr_h1) if bool(result.ok) else None
 
     merged: TechnicalAnalysisResult = dict(baseline)
     if view is not None:
@@ -489,9 +537,20 @@ def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
     # key_levels keeps the factual part (snapshots, horizontal levels) and adds
     # the analyst's own price picks under "analyst".
     key_levels = dict(baseline["key_levels"])
-    key_levels["analyst"] = view["key_prices"] if view is not None else {"supports": [], "resistances": [], "invalidation": None}
+    key_levels["analyst"] = view["key_prices"] if view is not None else {
+        "supports": [], "resistances": [], "invalidation": None,
+        "support_level_ids": [], "resistance_level_ids": [], "invalidation_level_id": None, "unresolved": [],
+    }
     merged["key_levels"] = key_levels
     merged["rsi_14"] = baseline["rsi_14"]
+    exec_block = baseline["key_levels"].get("execution", {}) if isinstance(baseline["key_levels"], dict) else {}
+    merged["h4_trend"] = view["h4_trend"] if view is not None else str(exec_block.get("h4_trend", "RANGE"))  # type: ignore[typeddict-unknown-key]
+    merged["h1_trend"] = view["h1_trend"] if view is not None else str(exec_block.get("h1_trend", "RANGE"))  # type: ignore[typeddict-unknown-key]
+    merged["h1_role"] = view["h1_role"] if view is not None else "NOISE"  # type: ignore[typeddict-unknown-key]
+    merged["timeframe_relationship"] = view["timeframe_relationship"] if view is not None else ""  # type: ignore[typeddict-unknown-key]
+    merged["counter_evidence"] = view["counter_evidence"] if view is not None else []  # type: ignore[typeddict-unknown-key]
+    merged["data_quality"] = view["data_quality"] if view is not None else "POOR"  # type: ignore[typeddict-unknown-key]
+    merged["abstain_reason"] = view["abstain_reason"] if view is not None else "analyst did not answer"  # type: ignore[typeddict-unknown-key]
     merged["regime_view"] = view["regime_view"] if view is not None else "UNCLEAR"  # type: ignore[typeddict-unknown-key]
     merged["direction_if_trend"] = view["direction_if_trend"] if view is not None else "NEUTRAL"  # type: ignore[typeddict-unknown-key]
     merged["evidence"] = view["evidence"] if view is not None else []  # type: ignore[typeddict-unknown-key]

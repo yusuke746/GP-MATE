@@ -442,7 +442,7 @@ def test_pending_validation_distinguishes_dropped_from_absent() -> None:
     )
     assert weak["pending_orders"] == []
     assert weak["pending_validation"] == "skipped_weak_bias:0.58"
-    assert weak["pending_proposal"] == {"type": "SELL_STOP", "price": 4405.89}
+    assert weak["pending_proposal"] == {"type": "SELL_STOP", "price": 4405.89, "entry_level_id": None}
 
     absent = _decide_with_payload(
         {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID",
@@ -500,3 +500,66 @@ def test_trader_sees_rule_regime_and_judge_regime_summary() -> None:
     assert "【レジーム】" in SYSTEM_PROMPT
     for token in ("TREND", "RANGE", "TRANSITION", "LIMIT_PULLBACK", "STOP_BREAKOUT", "LIMIT_FADE"):
         assert token in SYSTEM_PROMPT
+
+
+def _levels_technical() -> dict:
+    from indicators.price_levels import build_price_levels
+
+    levels = build_price_levels(
+        current_price=4400.0,
+        atr=20.0,
+        horizontal_levels={"supports": [{"price": 4350.0, "source": "cluster", "timeframe": "H4", "touch_count": 3}], "resistances": [{"price": 4450.0, "source": "swing", "timeframe": "D1", "touch_count": 2}]},
+        structure={"h4": {"swings": {"highs": [4460.0], "lows": [4330.0]}, "fair_value_gaps": []}},
+    )
+    return {"signal": "SELL", "direction_context": {"h1": {"close": 4400.0, "atr_14": 20.0}, "price_levels": levels}}
+
+
+def test_pending_orders_use_level_ids_and_reject_unanchored_prices() -> None:
+    by_id = _run_with_payload(
+        {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID", "directional_bias": "BEARISH", "bias_strength": 0.8,
+         "pending_orders": [{"type": "SELL_LIMIT", "entry_level_id": "D1_SWING_RESISTANCE_1", "sl_level_id": "H4_SWING_HIGH_1", "tp_level_id": "H4_CLUSTER_SUPPORT_1", "basis": "戻り売り"}]},
+        technical_report=_levels_technical(),
+    )
+    order = by_id["pending_orders"][0]
+    assert order["price"] == 4450.0 and order["entry_level_id"] == "D1_SWING_RESISTANCE_1"
+    assert order["sl"] == 4460.0 and order["sl_level_id"] == "H4_SWING_HIGH_1"
+    assert order["tp"] == 4350.0 and order["tp_level_id"] == "H4_CLUSTER_SUPPORT_1"
+    assert by_id["pending_validation"] == "" and by_id["pending_proposal"]["entry_level_id"] == "D1_SWING_RESISTANCE_1"
+
+    snapped = _run_with_payload(
+        {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID", "directional_bias": "BEARISH", "bias_strength": 0.8,
+         "pending_orders": [{"type": "SELL_LIMIT", "price": 4452.0}]},  # 2.0 from the 4450 level: within 0.3 ATR
+        technical_report=_levels_technical(),
+    )
+    assert snapped["pending_orders"][0]["price"] == 4450.0 and snapped["pending_orders"][0]["entry_level_id"] == "D1_SWING_RESISTANCE_1"
+
+    invented = _run_with_payload(
+        {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID", "directional_bias": "BEARISH", "bias_strength": 0.8,
+         "pending_orders": [{"type": "SELL_LIMIT", "price": 4425.0}]},  # no candidate near 4425
+        technical_report=_levels_technical(),
+    )
+    assert invented["pending_orders"] == []
+    assert invented["pending_validation"] == "skipped_unanchored_price:unanchored"
+
+    unknown = _run_with_payload(
+        {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID", "directional_bias": "BEARISH", "bias_strength": 0.8,
+         "pending_orders": [{"type": "SELL_LIMIT", "entry_level_id": "MADE_UP_ID"}]},
+        technical_report=_levels_technical(),
+    )
+    assert unknown["pending_orders"] == [] and unknown["pending_validation"] == "skipped_unanchored_price:unknown_id"
+
+
+def test_suggested_tp_sl_level_ids_resolve_and_anchoring_is_recorded() -> None:
+    result = _run_with_payload(
+        {"action": "SELL", "confidence": 0.8, "reasoning": "x", "risk_level": "MID",
+         "suggested_tp_level_id": "H4_CLUSTER_SUPPORT_1", "suggested_sl": 4447.0},  # sl raw but 3.0 from 4450: snapped
+        technical_report=_levels_technical(),
+    )
+    assert result["suggested_tp"] == 4350.0 and result["suggested_tp_level_id"] == "H4_CLUSTER_SUPPORT_1" and result["tp_anchor_reason"] == "id"
+    assert result["suggested_sl"] == 4450.0 and result["suggested_sl_level_id"] == "D1_SWING_RESISTANCE_1" and result["sl_anchor_reason"] == "nearest"
+
+    free = _run_with_payload(
+        {"action": "SELL", "confidence": 0.8, "reasoning": "x", "risk_level": "MID", "suggested_tp": 4362.0},  # 12 from 4350: unanchored but kept
+        technical_report=_levels_technical(),
+    )
+    assert free["suggested_tp"] == 4362.0 and free["suggested_tp_level_id"] is None and free["tp_anchor_reason"] == "unanchored"

@@ -47,6 +47,7 @@ from data.confirmed_bars import get_confirmed_rates
 from data.mt5_client import get_rates
 from data.news_client import fetch_news_with_meta
 from indicators.horizontal_levels import build_horizontal_levels
+from indicators.price_levels import build_price_levels
 from indicators.regime import classify_regime
 from indicators.structure import build_structure_context
 from indicators.ta_calc import add_indicators
@@ -113,6 +114,13 @@ def build_reports(frames: dict[str, pd.DataFrame], use_debate: bool = FORECAST_U
         d1_frame=d1,
         h4_frame=h4,
         current_price=float(h1_latest.get("close", 0.0) or 0.0),
+    )
+    direction_context["price_levels"] = build_price_levels(
+        current_price=float(h1_latest.get("close", 0.0) or 0.0),
+        atr=float(h1_latest.get("atr_14", 0.0) or 0.0),
+        horizontal_levels=horizontal_levels,
+        structure=direction_context.get("structure"),
+        tp_reference=tp_reference_only,
     )
 
     news_items, feed_meta = fetch_news_with_meta(hours=24)

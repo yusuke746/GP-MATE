@@ -91,7 +91,8 @@ def test_panel_majority_trend_up_gives_bull_and_full_transcript() -> None:
     assert summary["panel_agreement"] == 0.6 and summary["panel_votes_available"] == 3
     assert summary["panel_vote_distribution"] == {"TREND_CONTINUATION": 2, "MEAN_REVERSION": 1, "UNCLEAR": 0}
     assert summary["panel_consensus_type"] == "MAJORITY"
-    assert summary["key_levels"] == {"continuation_confirms": 4390.0, "reversal_confirms": 4340.5}
+    assert summary["key_levels"]["continuation_confirms"] == 4390.0 and summary["key_levels"]["reversal_confirms"] == 4340.5
+    assert summary["key_levels"]["continuation_level_id"] is None  # no catalogue in this test: raw prices accepted
     assert summary["source"] == "judge" and "disagrees_with_rule" not in summary
     assert report["judge_summary"]["stronger_side"] == "bull"
     assert report["judge_summary"]["conflicts"] == ["マクロは反転寄り"]
@@ -273,3 +274,27 @@ def test_sentiment_direction_prefers_stated_bias_over_score() -> None:
     assert debate_graph._sentiment_direction({"gold_bias": "BEARISH", "score": 0.4}) == "BEARISH"
     assert debate_graph._sentiment_direction({"score": 0.4}) == "BULLISH"
     assert debate_graph._sentiment_direction({"gold_bias": "weird", "score": 0.0}) == "NEUTRAL"
+
+
+def test_panel_resolves_level_ids_from_the_technical_catalogue() -> None:
+    from indicators.price_levels import build_price_levels
+
+    levels = build_price_levels(
+        current_price=4400.0, atr=20.0,
+        horizontal_levels={"supports": [{"price": 4350.0, "source": "cluster", "timeframe": "H4"}], "resistances": [{"price": 4450.0, "source": "swing", "timeframe": "D1"}]},
+    )
+    technical = {"regime_view": "TREND_CONTINUATION", "direction_context": {"h1": {"close": 4400.0, "atr_14": 20.0}, "price_levels": levels}}
+    statement = {**_view("TREND_CONTINUATION", "UP"), "key_levels": {"continuation_level_id": "D1_SWING_RESISTANCE_1", "reversal_level_id": "NOPE"}, "counter_evidence": ["マクロは逆風"]}
+    chair = {**_judge("TREND", "UP", "STOP_BREAKOUT"), "key_levels": {"continuation_level_id": "D1_SWING_RESISTANCE_1", "reversal_level_id": 4352.0}}
+    client = _ScriptedClient({"technical": statement, "macro": statement, "sentiment": statement}, chair)
+    report = panel_debate.run_panel_debate(technical, {}, {}, client=client)
+
+    first = report["panel_transcript"][0]
+    assert first["key_prices"]["continuation_confirms"] == 4450.0 and first["key_prices"]["continuation_level_id"] == "D1_SWING_RESISTANCE_1"
+    assert first["key_prices"]["reversal_confirms"] is None and first["key_prices"]["reversal_unresolved"] == "NOPE"
+    assert first["counter_evidence"] == ["マクロは逆風"]
+    key = report["regime_summary"]["key_levels"]
+    assert key["continuation_level_id"] == "D1_SWING_RESISTANCE_1" and key["reversal_confirms"] == 4350.0 and key["reversal_level_id"] == "H4_CLUSTER_SUPPORT_1"
+    assert client.calls[0]["payload"]["price_levels"] == levels and client.calls[-1]["payload"]["price_levels"] == levels
+    assert "counter_evidence" in panel_debate.PANEL_SYSTEM_PROMPT and "level_id" in panel_debate.PANEL_JUDGE_SYSTEM_PROMPT
+    assert report["panel_views"]["technical"]["initial_view"] == "TREND_CONTINUATION"

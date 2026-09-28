@@ -113,3 +113,11 @@ def test_feed_health_and_feed_state_reports() -> None:
     assert quiet["evidence_status"] == "NO_NEWS" and quiet["gold_bias"] == "NEUTRAL" and quiet["feed_health"] == "DEGRADED"
     assert sentiment_for_feed_state([{"title": "x"}], {"feeds_total": 4, "feeds_live": 4}) is None  # run the analyst
     assert sentiment_for_feed_state([], None) is None  # unknown state: legacy INSUFFICIENT path in analyze_sentiment
+
+
+def test_sentiment_abstain_and_counter_evidence() -> None:
+    normalized = _normalize_sentiment_payload({"gold_bias": "BEARISH", "counter_evidence": ["ETF流入"], "data_quality": "poor", "abstain_reason": "重複記事のみ"})
+    assert normalized["gold_bias"] == "NEUTRAL" and normalized["score"] == 0.0 and normalized["regime_view"] == "UNCLEAR"
+    assert normalized["counter_evidence"] == ["ETF流入"] and normalized["data_quality"] == "POOR"
+    plain = _normalize_sentiment_payload({"gold_bias": "BULLISH"})
+    assert plain["counter_evidence"] == [] and plain["data_quality"] == "GOOD" and plain["abstain_reason"] is None

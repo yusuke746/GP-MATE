@@ -26,6 +26,7 @@ MACRO_BIAS_VALUES: Final[tuple[Literal["BULLISH", "BEARISH", "NEUTRAL"], ...]] =
     "NEUTRAL",
 )
 REGIME_VIEW_VALUES: Final[tuple[str, ...]] = ("SUPPORTS_CONTINUATION", "SUPPORTS_REVERSAL", "UNCLEAR")
+DATA_QUALITY_VALUES: Final[tuple[str, ...]] = ("GOOD", "PARTIAL", "POOR")
 
 SYSTEM_PROMPT = (
     "あなたはGOLD(XAU/USD)のマクロ環境を評価する分析官です。"
@@ -39,9 +40,13 @@ SYSTEM_PROMPT = (
     "その読みが崩れる条件(invalidation: 例『次回CPIが予想を上回る』『ドル指数が◯◯を上抜く』)を1つ書いてください。"
     "材料が乏しい、または互いに打ち消し合うときはNEUTRAL/UNCLEARでよく、無理に方向を出さないこと。"
     "確信度の数値は求めません。強い読みなら、その根拠となる系列名と数値をkey_driversに具体的に列挙してください。"
+    "結論に反する材料(counter_evidence)も探して列挙し(無ければ空)、"
+    "データ品質 data_quality を GOOD / PARTIAL(欠損・古い値あり) / POOR(判断に足りない) で答え、"
+    "判断を保留するなら abstain_reason にその理由を書いて macro_bias=NEUTRAL とすること。"
     "出力は次のキーだけを持つJSON: "
     "{macro_bias: 'BULLISH'|'BEARISH'|'NEUTRAL', regime_view: 'SUPPORTS_CONTINUATION'|'SUPPORTS_REVERSAL'|'UNCLEAR', "
-    "key_drivers: string[], invalidation: string, reasoning: string(日本語)}"
+    "key_drivers: string[], counter_evidence: string[], data_quality: 'GOOD'|'PARTIAL'|'POOR', "
+    "abstain_reason: string|null, invalidation: string, reasoning: string(日本語)}"
 )
 
 # Provenance only: what each field is and how fresh it is. No "this means gold up".
@@ -72,6 +77,9 @@ class MacroAnalysisResult(TypedDict, total=False):
     macro_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"]
     regime_view: str
     key_drivers: list[str]
+    counter_evidence: list[str]
+    data_quality: str
+    abstain_reason: str | None
     invalidation: str
     reasoning: str
     source: str
@@ -99,6 +107,9 @@ def _build_neutral_result(error: str, model: str = "none", ok: bool = False, sou
         "macro_bias": "NEUTRAL",
         "regime_view": "UNCLEAR",
         "key_drivers": ["マクロ分析が得られなかったため安全側で中立"],
+        "counter_evidence": [],
+        "data_quality": "POOR",
+        "abstain_reason": error,
         "invalidation": "",
         "reasoning": FALLBACK_REASONING,
         "source": source,
@@ -173,10 +184,20 @@ def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
 
     key_drivers_raw = payload.get("key_drivers", [])
     key_drivers = [str(item) for item in key_drivers_raw if str(item).strip()] if isinstance(key_drivers_raw, list) else []
+    counter_raw = payload.get("counter_evidence", [])
+    counter_evidence = [str(item) for item in counter_raw if str(item).strip()] if isinstance(counter_raw, list) else []
+    data_quality = str(payload.get("data_quality", "") or "").upper().strip()
+    abstain_reason = str(payload.get("abstain_reason") or "").strip() or None
+    regime_view = _normalize_regime_view(payload.get("regime_view"))
+    if abstain_reason:
+        bias, regime_view = "NEUTRAL", "UNCLEAR"
     return {
         "macro_bias": bias,
-        "regime_view": _normalize_regime_view(payload.get("regime_view")),
+        "regime_view": regime_view,
         "key_drivers": key_drivers,
+        "counter_evidence": counter_evidence,
+        "data_quality": data_quality if data_quality in DATA_QUALITY_VALUES else "GOOD",
+        "abstain_reason": abstain_reason,
         "invalidation": str(payload.get("invalidation", "") or ""),
         "reasoning": str(payload.get("reasoning", "") or "").strip() or "(reasoning なし)",
         "source": "analyst",
