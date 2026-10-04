@@ -67,7 +67,7 @@ def test_run_ablation_calls_per_condition_and_resumes(tmp_path) -> None:
 
     counts = fa.run_ablation(("no_sentiment", "no_macro"), forecasts=forecasts, inputs_directory=inputs,
                              output_path=out, model="m", forecaster=fake_forecaster)
-    assert counts == {"targets": 3, "calls": 6, "skipped_done": 0, "missing_inputs": 0, "failed": 0}
+    assert counts == {"targets": 3, "calls": 6, "skipped_done": 0, "skipped_not_applicable": 0, "missing_inputs": 0, "failed": 0}
     assert all(m == "m" for m, _ in seen)
     assert {"task", "technical", "macro"} in [k for _, k in seen] and {"task", "technical", "sentiment"} in [k for _, k in seen]
     rows = fa.read_ablation(out)
@@ -131,3 +131,35 @@ def test_compare_conditions_handles_empty() -> None:
     report = fa.compare_conditions([_forecast_row(0, "UP")], [])
     assert report["n"] == 0
     assert "nothing to compare" in fa.format_comparison(report) or "no ablation" in fa.format_comparison(report)
+
+
+def test_no_debate_condition_runs_only_where_a_debate_was_in_the_input(tmp_path) -> None:
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    with_debate = {**_payload(), "debate": {"axis": "panel", "regime_summary": {"regime": "TREND"}}}
+    (inputs / "id000.json").write_text(json.dumps({"payload": with_debate}), encoding="utf-8")
+    (inputs / "id001.json").write_text(json.dumps({"payload": _payload()}), encoding="utf-8")
+    assert fa.condition_applies(with_debate, "no_debate") is True
+    assert fa.condition_applies(_payload(), "no_debate") is False
+    assert fa.condition_applies(_payload(), "full_rerun") is True
+    assert set(fa.apply_condition(with_debate, "no_debate")) == {"task", "technical", "sentiment", "macro"}
+    assert "no_debate" in fa.DEFAULT_CONDITIONS
+
+    seen: list[dict] = []
+
+    def fake_forecaster(payload, *, model, samples, client):
+        seen.append(payload)
+        return {"ok": True, "probs_valid": True, "p_up": 0.4, "p_down": 0.4, "p_timeout": 0.2, "key_reason": "", "model": model,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+    counts = fa.run_ablation(
+        ("no_debate",),
+        forecasts=[_forecast_row(0, "UP"), _forecast_row(1, "DOWN")],
+        inputs_directory=inputs,
+        output_path=tmp_path / "abl.jsonl",
+        forecaster=fake_forecaster,
+    )
+    assert counts["calls"] == 1 and counts["skipped_not_applicable"] == 1
+    assert "debate" not in seen[0]
+    rows = fa.read_ablation(tmp_path / "abl.jsonl")
+    assert [r["forecast_id"] for r in rows] == ["id000"] and rows[0]["condition"] == "no_debate"

@@ -198,6 +198,61 @@ def block_bootstrap_ci(
     return (float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5)))
 
 
+def anchor_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Scorable rows that carried a reference_base_rates anchor."""
+    out = []
+    for row in rows:
+        ref = row.get("reference_base_rates")
+        if isinstance(ref, dict) and all(isinstance(ref.get(k), (int, float)) for k in ("p_up", "p_down", "p_timeout")):
+            out.append(row)
+    return out
+
+
+def anchor_probs(rows: list[dict[str, Any]]) -> np.ndarray:
+    return np.array([[float(r["reference_base_rates"]["p_up"]), float(r["reference_base_rates"]["p_down"]), float(r["reference_base_rates"]["p_timeout"])] for r in rows])
+
+
+def anchor_deviation(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """How the LLM moved away from the base-rate anchor it was handed, and whether
+    that move pointed the right way.
+
+    Once the forecaster is anchored, "p_up > p_down" mostly echoes the anchor,
+    so directional accuracy of the raw probabilities says little. The
+    informative quantity is the sign of (p_up - anchor_up) - (p_down -
+    anchor_down) against the realised direction, plus how far it moved.
+    """
+    anchored = anchor_rows(rows)
+    if not anchored:
+        return None
+    llm = llm_probs(anchored)
+    ref = anchor_probs(anchored)
+    outs = outcomes_of(anchored)
+    dev = llm - ref
+    tilt = dev[:, 0] - dev[:, 1]  # >0: moved toward UP relative to the anchor
+    directional = [(t, o) for t, o in zip(tilt, outs) if o in ("UP", "DOWN") and abs(t) > 1e-9]
+    hits = sum(1 for t, o in directional if (t > 0) == (o == "UP"))
+    moved_up = int(sum(1 for t in tilt if t > 1e-9))
+    moved_down = int(sum(1 for t in tilt if t < -1e-9))
+    llm_b = brier_per_row(llm, outs)
+    ref_b = brier_per_row(ref, outs)
+    lo, hi = block_bootstrap_ci(llm_b - ref_b)
+    return {
+        "n": len(anchored),
+        "brier_llm": round(float(llm_b.mean()), 4),
+        "brier_anchor": round(float(ref_b.mean()), 4),
+        "llm_minus_anchor_ci95": (round(lo, 4), round(hi, 4)),
+        "beats_anchor": hi < 0.0,
+        "deviation_direction_n": len(directional),
+        "deviation_direction_accuracy": round(hits / len(directional), 3) if directional else None,
+        "moved_toward_up": moved_up,
+        "moved_toward_down": moved_down,
+        "flat": len(anchored) - moved_up - moved_down,
+        "abs_tilt_median": round(float(np.median(np.abs(tilt))), 4),
+        "abs_tilt_p90": round(float(np.percentile(np.abs(tilt), 90)), 4),
+        "mean_deviation": {c: round(float(v), 4) for c, v in zip(CLASSES, dev.mean(axis=0))},
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Report
 # --------------------------------------------------------------------------- #
@@ -233,7 +288,10 @@ def evaluate(rows_all: list[dict[str, Any]]) -> dict[str, Any]:
     report["by_weekday"] = group_brier(rows, weekday_bucket)
     report["by_model"] = group_brier(rows, lambda r: str(r.get("model", "")))
     report["by_debate"] = group_brier(rows, lambda r: bool(r.get("used_debate")))
+    report["by_debate_axis"] = group_brier(rows, lambda r: str(r.get("debate_axis") or "none") if r.get("used_debate") else "none")
+    report["by_regime"] = group_brier(rows, lambda r: str(r.get("regime") or "n/a"))
     report["by_horizon"] = group_brier(rows, lambda r: int(r.get("horizon_bars", 0)))
+    report["anchor"] = anchor_deviation(rows)
     return report
 
 
@@ -257,10 +315,23 @@ def format_report(report: dict[str, Any]) -> str:
         for row in report[key]:
             if row["n"]:
                 lines.append(f"  {row['bin']:<9} {row['n']:>4}   {row['mean_pred']:.3f}     {row['actual_rate']:.3f}")
-    for title, key in (("NY 2h bucket", "by_ny_2h"), ("weekday", "by_weekday"), ("model", "by_model"), ("used_debate", "by_debate"), ("horizon", "by_horizon")):
+    for title, key in (("NY 2h bucket", "by_ny_2h"), ("weekday", "by_weekday"), ("model", "by_model"), ("used_debate", "by_debate"), ("debate_axis", "by_debate_axis"), ("regime", "by_regime"), ("horizon", "by_horizon")):
         lines.append(f"\n[Brier by {title}]")
-        for row in report[key]:
+        for row in report.get(key, []):
             lines.append(f"  {str(row['group']):<14} n={row['n']:<5} brier={row['brier']}")
+    anchor = report.get("anchor")
+    lines.append("\n[Anchor deviation] (rows that carried reference_base_rates)")
+    if not anchor:
+        lines.append("  none yet")
+    else:
+        flag = "  <- beats the anchor" if anchor["beats_anchor"] else ""
+        lines.append(f"  n={anchor['n']}  Brier LLM={anchor['brier_llm']}  anchor={anchor['brier_anchor']}  LLM-anchor CI95={anchor['llm_minus_anchor_ci95']}{flag}")
+        lines.append(
+            f"  deviation direction accuracy={anchor['deviation_direction_accuracy']} (n={anchor['deviation_direction_n']})  "
+            f"moved toward UP={anchor['moved_toward_up']} DOWN={anchor['moved_toward_down']} flat={anchor['flat']}"
+        )
+        lines.append(f"  |tilt| median={anchor['abs_tilt_median']} p90={anchor['abs_tilt_p90']}  mean deviation={anchor['mean_deviation']}")
+        lines.append("  Anchored forecasts echo the anchor's side; read the deviation direction, not raw p_up vs p_down.")
     lines.append("\n" + report["caveat"])
     return "\n".join(lines)
 
@@ -273,9 +344,14 @@ def write_csv(report: dict[str, Any], path: Path) -> None:
         for key in ("reliability_p_up", "reliability_p_down"):
             for row in report.get(key, []):
                 writer.writerow([key, row["bin"], row["n"], row["mean_pred"], row["actual_rate"], ""])
-        for key in ("by_ny_2h", "by_weekday", "by_model", "by_debate", "by_horizon"):
+        for key in ("by_ny_2h", "by_weekday", "by_model", "by_debate", "by_debate_axis", "by_regime", "by_horizon"):
             for row in report.get(key, []):
                 writer.writerow([key, row["group"], row["n"], "", "", row["brier"]])
+        anchor = report.get("anchor")
+        if anchor:
+            writer.writerow(["anchor", "llm", anchor["n"], "", "", anchor["brier_llm"]])
+            writer.writerow(["anchor", "anchor", anchor["n"], "", "", anchor["brier_anchor"]])
+            writer.writerow(["anchor", "deviation_direction_accuracy", anchor["deviation_direction_n"], "", anchor["deviation_direction_accuracy"], ""])
 
 
 def evaluate_file(path: Path | None = None) -> dict[str, Any]:

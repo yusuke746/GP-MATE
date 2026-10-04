@@ -35,9 +35,20 @@ CONDITIONS: dict[str, tuple[str, ...]] = {
     "no_sentiment": ("sentiment",),
     "no_macro": ("macro",),
     "no_technical": ("technical",),
+    "no_debate": ("debate",),
     "technical_only": ("sentiment", "macro", "debate"),
 }
-DEFAULT_CONDITIONS = ("no_sentiment", "no_macro", "technical_only")
+DEFAULT_CONDITIONS = ("no_sentiment", "no_macro", "technical_only", "no_debate")
+
+
+def condition_applies(payload: dict[str, Any], condition: str) -> bool:
+    """False when the condition would remove nothing from this payload (e.g.
+    no_debate on a forecast made without a debate): re-forecasting the
+    identical input would only spend an API call on noise."""
+    keys = CONDITIONS.get(condition, ())
+    if not keys:
+        return True
+    return any(key in payload for key in keys)
 
 
 def ablation_path() -> Path:
@@ -108,7 +119,7 @@ def run_ablation(
         targets = targets[: max(0, int(limit))]
     out_path = output_path or ablation_path()
     done = {(r.get("forecast_id"), r.get("condition")) for r in read_ablation(out_path)}
-    counts = {"targets": len(targets), "calls": 0, "skipped_done": 0, "missing_inputs": 0, "failed": 0}
+    counts = {"targets": len(targets), "calls": 0, "skipped_done": 0, "skipped_not_applicable": 0, "missing_inputs": 0, "failed": 0}
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with out_path.open("a", encoding="utf-8") as fp:
@@ -121,6 +132,9 @@ def run_ablation(
             for condition in conditions:
                 if (forecast_id, condition) in done:
                     counts["skipped_done"] += 1
+                    continue
+                if not condition_applies(payload, condition):
+                    counts["skipped_not_applicable"] += 1
                     continue
                 try:
                     result = forecaster(apply_condition(payload, condition), model=model, samples=1, client=client)
