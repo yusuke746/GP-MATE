@@ -112,3 +112,43 @@ def test_write_csv(tmp_path) -> None:
     fe.write_csv(report, out)
     text = out.read_text(encoding="utf-8")
     assert "reliability_p_up" in text and "by_ny_2h" in text
+
+
+def _anchored(i: int, p_up: float, p_down: float, outcome: str, ref=(0.40, 0.45, 0.15)) -> dict:
+    row = _row(f"2026-10-{1 + i // 24:02d}T{i % 24:02d}:00:00+00:00", p_up, p_down, outcome)
+    row["reference_base_rates"] = {"p_up": ref[0], "p_down": ref[1], "p_timeout": ref[2], "n": 120}
+    row["debate_axis"] = "panel"
+    row["used_debate"] = True
+    row["regime"] = "RANGE" if i % 2 else "TREND"
+    return row
+
+
+def test_anchor_deviation_reads_direction_of_the_move_not_the_raw_side() -> None:
+    # Anchor leans DOWN. The LLM nudges toward UP by 0.02 on UP outcomes and toward DOWN on DOWN outcomes:
+    # raw p_up < p_down on every row (echoing the anchor), yet every deviation points the right way.
+    rows = []
+    for i in range(30):
+        outcome = "UP" if i % 3 else "DOWN"
+        if outcome == "UP":
+            rows.append(_anchored(i, 0.42, 0.43, outcome))
+        else:
+            rows.append(_anchored(i, 0.38, 0.47, outcome))
+    rows.append(_anchored(30, 0.40, 0.45, "TIMEOUT"))  # flat: no move
+    anchor = fe.anchor_deviation(rows)
+    assert anchor["n"] == 31
+    assert anchor["deviation_direction_accuracy"] == 1.0 and anchor["deviation_direction_n"] == 30
+    assert anchor["moved_toward_up"] == 20 and anchor["moved_toward_down"] == 10 and anchor["flat"] == 1
+    assert anchor["abs_tilt_median"] == 0.04
+    assert anchor["brier_llm"] < anchor["brier_anchor"]
+    # Raw directional accuracy would call all of these DOWN (33% right); the anchor view sees the signal.
+    raw_hits = sum(1 for r in rows if r["outcome"] in ("UP", "DOWN") and ((r["p_up"] > r["p_down"]) == (r["outcome"] == "UP")))
+    assert raw_hits == 10
+
+    report = fe.evaluate(rows)
+    assert report["anchor"]["deviation_direction_accuracy"] == 1.0
+    assert {g["group"] for g in report["by_debate_axis"]} == {"panel"}
+    assert {g["group"] for g in report["by_regime"]} == {"TREND", "RANGE"}
+    text = fe.format_report(report)
+    assert "[Anchor deviation]" in text and "deviation direction accuracy=1.0" in text
+    assert fe.anchor_deviation([_row("2026-10-01T00:00:00+00:00", 0.5, 0.3, "UP")]) is None
+    assert "none yet" in fe.format_report(fe.evaluate([_row("2026-10-01T00:00:00+00:00", 0.5, 0.3, "UP")] * 1))

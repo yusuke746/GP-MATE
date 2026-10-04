@@ -61,7 +61,8 @@ the trade log.
 - Settings: `FORECAST_*` and `MODEL_FORECAST` in `.env` (defaults: K=1.0 ATR both sides, 6 bars, 24h, no debate, 1 sample)
 - The forecaster is anchored on the realised UP/DOWN/TIMEOUT frequencies of recent resolved forecasts (`task.reference_base_rates`, from 30 rows) and receives the rule-based regime read (`task.regime`)
 - `python scripts/calibrate_forecasts.py` — fits shrink / shrink+tilt transforms on the first half of the record and tests them on the second half; a fitted weight near 0 means the probabilities carry no usable signal
-- `python scripts/ablate_forecasts.py` — re-forecasts archived inputs with reports removed to attribute the error
+- `python scripts/ablate_forecasts.py` — re-forecasts archived inputs with reports removed to attribute the error; `no_debate` (default) runs only on forecasts whose input had a debate
+- The evaluation also reports the deviation from the base-rate anchor (direction accuracy of the move, its size, Brier vs the anchor); once anchored, raw `p_up` vs `p_down` mostly echoes the anchor, so read the deviation
 
 ## Analysts and the panel debate
 
