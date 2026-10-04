@@ -2,7 +2,8 @@
 
     python scripts/ablate_forecasts.py                 # run default conditions, then compare
     python scripts/ablate_forecasts.py --limit 20      # smoke test on the first 20 rows
-    python scripts/ablate_forecasts.py --conditions no_sentiment,no_macro,technical_only,full_rerun
+    python scripts/ablate_forecasts.py --conditions no_sentiment,no_macro,technical_only,no_debate,full_rerun
+    (no_debate runs only on forecasts that had a debate in their input)
     python scripts/ablate_forecasts.py --compare-only  # no LLM calls, just the table
 
 Resumable: already-done (forecast_id, condition) pairs are skipped.
