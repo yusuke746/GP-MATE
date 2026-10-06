@@ -1699,3 +1699,34 @@ def test_run_once_logs_layers_level_ids_and_analyst_quality(tmp_path: Path, monk
     quality = json.loads(row["analyst_data_quality"])
     assert quality["technical"] == {"data_quality": "GOOD", "abstain": False, "counter_evidence": 1}
     assert quality["sentiment"]["data_quality"] == "GOOD"  # NO_NEWS report
+
+
+def test_pending_windows_follow_the_configured_slots(monkeypatch) -> None:
+    tz = main.MARKET_TZ
+    # Default slots: window runs from 16:45 through the night to 08:00.
+    monkeypatch.setattr(main, "NY_RUN_TIMES", ((8, 0), (9, 30), (10, 30)))
+    assert main._is_pending_flat_window(reference=datetime(2026, 10, 7, 20, 0, tzinfo=tz))
+    assert main._is_pending_flat_window(reference=datetime(2026, 10, 8, 3, 0, tzinfo=tz))
+    assert not main._is_pending_flat_window(reference=datetime(2026, 10, 8, 8, 5, tzinfo=tz))
+    # With Asia / London slots the window ends at the first slot after the cutoff (20:00)
+    # and pendings placed there survive the night until the next slot re-plans.
+    monkeypatch.setattr(main, "NY_RUN_TIMES", ((3, 0), (8, 0), (9, 30), (10, 30), (20, 0), (22, 0)))
+    assert main._is_pending_flat_window(reference=datetime(2026, 10, 7, 16, 45, tzinfo=tz))
+    assert main._is_pending_flat_window(reference=datetime(2026, 10, 7, 19, 59, tzinfo=tz))
+    assert not main._is_pending_flat_window(reference=datetime(2026, 10, 7, 20, 5, tzinfo=tz))
+    assert not main._is_pending_flat_window(reference=datetime(2026, 10, 8, 1, 0, tzinfo=tz))
+    assert not main._is_pending_flat_window(reference=datetime(2026, 10, 8, 3, 5, tzinfo=tz))
+    assert not main._is_pending_flat_window(reference=datetime(2026, 10, 8, 12, 0, tzinfo=tz))
+    # The late-NY placement cutoff is a window, not "from 11:00 onwards": evening slots may place.
+    assert not main._is_past_pending_placement_cutoff(reference=datetime(2026, 10, 7, 10, 30, tzinfo=tz))
+    assert main._is_past_pending_placement_cutoff(reference=datetime(2026, 10, 7, 11, 0, tzinfo=tz))
+    assert main._is_past_pending_placement_cutoff(reference=datetime(2026, 10, 7, 16, 44, tzinfo=tz))
+    assert not main._is_past_pending_placement_cutoff(reference=datetime(2026, 10, 7, 20, 0, tzinfo=tz))
+    assert not main._is_past_pending_placement_cutoff(reference=datetime(2026, 10, 8, 3, 0, tzinfo=tz))
+
+
+def test_decision_layers_take_direction_from_a_range_fade_order() -> None:
+    range_panel = {"regime_summary": {"regime": "RANGE", "direction_if_trend": "NEUTRAL", "entry_style": "LIMIT_FADE", "source": "judge"}, "_meta": {"ok": True}}
+    trader = {"directional_bias": "NEUTRAL", "pending_orders": [{"type": "SELL_LIMIT", "price": 4164.88}]}
+    layers = main._decision_layers({}, range_panel, trader, final_action="HOLD", order_sent=False, market_filter_ok=True, market_filter_reason="OK", pending_status="placed")
+    assert layers == {"market_state": "RANGE", "direction": "DOWN", "setup": "FADE", "executability": "WAIT", "executability_reason": "pending order placed, waiting for the trigger"}

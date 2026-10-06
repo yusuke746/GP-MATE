@@ -40,3 +40,11 @@ def test_explicit_env_values_still_win(monkeypatch) -> None:
     finally:
         monkeypatch.undo()
         importlib.reload(config)
+
+
+def test_judgment_times_parse_sort_dedupe_and_fall_back() -> None:
+    import config
+
+    assert config._parse_judgment_times("") == config.DEFAULT_JUDGMENT_TIMES_NY
+    assert config._parse_judgment_times("20:00, 03:00,08:00,20:00,junk,25:00") == ((3, 0), (8, 0), (20, 0))
+    assert config._parse_judgment_times("nonsense") == config.DEFAULT_JUDGMENT_TIMES_NY

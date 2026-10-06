@@ -42,11 +42,30 @@ JST_TIMEZONE_NAME: Final[str] = "Asia/Tokyo"
 # while the three NY slots combined ran 36 settled, 58% win rate, PF 1.81.
 # Positions opened in London were repeatedly stopped out during the NY open
 # (08:00-09:30) before the next judgment could re-evaluate them.
-NY_RUN_TIMES: Final[tuple[tuple[int, int], ...]] = (
-    (8, 0),
-    (9, 30),
-    (10, 30),
-)
+# Override with JUDGMENT_TIMES_NY=HH:MM,HH:MM,... (America/New_York) to add
+# Asia / London slots. Pending orders placed at a slot live until the next
+# slot re-plans (or the daily cutoff), so every slot must be one at which the
+# system is allowed to re-evaluate.
+DEFAULT_JUDGMENT_TIMES_NY: Final[tuple[tuple[int, int], ...]] = ((8, 0), (9, 30), (10, 30))
+
+
+def _parse_judgment_times(value: str) -> tuple[tuple[int, int], ...]:
+    times: list[tuple[int, int]] = []
+    for item in value.split(","):
+        text = item.strip()
+        if not text:
+            continue
+        try:
+            hour_text, minute_text = text.split(":")
+            hour, minute = int(hour_text), int(minute_text)
+        except Exception:
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59 and (hour, minute) not in times:
+            times.append((hour, minute))
+    return tuple(sorted(times)) if times else DEFAULT_JUDGMENT_TIMES_NY
+
+
+NY_RUN_TIMES: Final[tuple[tuple[int, int], ...]] = _parse_judgment_times(os.getenv("JUDGMENT_TIMES_NY", "") or "")
 MARKET_TZ: Final[ZoneInfo] = ZoneInfo(MARKET_TIMEZONE_NAME)
 JST_TZ: Final[ZoneInfo] = ZoneInfo(JST_TIMEZONE_NAME)
 
