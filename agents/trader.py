@@ -5,13 +5,13 @@ from typing import Any
 
 from agents.base import decision_model, get_default_client
 from indicators.price_levels import resolve_level
-from config import CONFIDENCE_THRESHOLD, SYMBOL
+from config import SYMBOL
 
 SYSTEM_PROMPT = (
     "あなたは最終決定権を持つトレーダーです。"
     "必ず place_trade_order 関数を呼び出して最終判断を返してください。"
-    "confidenceは判断の確からしさ(0-1)を正直に申告すること。"
-    "エントリー可否の閾値判定はシステム側で行うため、閾値を意識して数値を調整しないこと。"
+    "確信度の数値は求めない。あなたの決定がそのまま採用される。迷いがあればHOLDを選ぶこと。"
+    "HOLDが『確信がない』の表現である。"
     "HOLDで見送る場合、分析官と討論(judge_summary)の見解が同じ方向を指しているときだけ "
     "directional_bias(BULLISH/BEARISH)とbias_strength、trigger_conditions(key_levelsに基づく発動価格条件)を設定する。"
     "見解が割れている、または根拠が薄いときはdirectional_bias=NEUTRAL、bias_strength=0とし、無理に方向を作らないこと。"
@@ -83,7 +83,6 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
         "properties": {
             "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
             "symbol": {"type": "string"},
-            "confidence": {"type": "number", "description": "0-1の確信度"},
             "reasoning": {"type": "string", "description": "判断根拠（日本語）"},
             "risk_level": {"type": "string", "enum": ["LOW", "MID", "HIGH"]},
             "directional_bias": {"type": "string", "enum": ["BULLISH", "BEARISH", "NEUTRAL"]},
@@ -132,14 +131,13 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
                 },
             },
         },
-        "required": ["action", "symbol", "confidence", "reasoning"],
+        "required": ["action", "symbol", "reasoning"],
     },
 }
 
 FALLBACK_RESPONSE: dict[str, Any] = {
     "action": "HOLD",
     "symbol": SYMBOL,
-    "confidence": 0.0,
     "reasoning": "最終判断に失敗したためHOLD。",
     "risk_level": "HIGH",
 }
@@ -397,9 +395,18 @@ def decide_trade(
     sentiment_report: dict[str, Any],
     debate_report: dict[str, Any],
     macro_report: dict[str, Any] | None = None,
-    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    confidence_threshold: float | None = None,  # deprecated: no longer gates anything; kept for callers
     recent_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Final decision. The trader's action stands; there is no confidence gate.
+
+    A self-reported confidence number predicted nothing (executed trades all
+    sat at 0.62-0.84, HOLDs at 0.78 median: the model learned the cutoff),
+    so it is neither requested nor used. HOLD is how the trader says "not
+    sure". Code-side guards (spread, daily loss, losing streak, RR, pending
+    distance, time windows) still apply after this function.
+    """
+    _ = confidence_threshold
     raw_judge_summary = debate_report.get("judge_summary", {})
     judge_summary: dict[str, Any]
     if isinstance(raw_judge_summary, dict):
@@ -417,9 +424,6 @@ def decide_trade(
         "debate": _strip_debater_confidence(debate_report),
         "judge_summary": _strip_debater_confidence(judge_summary),
         "recent_context": recent_context or {"decisions": [], "recent_closed": []},
-        # The confidence threshold is intentionally NOT exposed to the model:
-        # it is enforced in code below, and telling the model the cutoff lets
-        # it anchor its self-reported confidence around it.
         "constraints": {
             "symbol": SYMBOL,
         },
@@ -436,8 +440,6 @@ def decide_trade(
 
     payload = dict(result.payload)
     action = str(payload.get("action", "HOLD")).upper()
-    confidence = float(payload.get("confidence", 0.0) or 0.0)
-    confidence = max(0.0, min(1.0, confidence))
     evidence_status = str(sentiment_report.get("evidence_status", "")).upper()
     risk_level = str(payload.get("risk_level") or "HIGH").upper()
     if risk_level not in {"LOW", "MID", "HIGH"}:
@@ -448,8 +450,6 @@ def decide_trade(
     if evidence_status == "INSUFFICIENT":
         action = "HOLD"
         payload["reasoning"] = "ニュース判断材料が不足しているためHOLD。"
-    if confidence < confidence_threshold:
-        action = "HOLD"
 
     directional_bias = str(payload.get("directional_bias", "NEUTRAL") or "NEUTRAL").upper()
     if directional_bias not in {"BULLISH", "BEARISH", "NEUTRAL"}:
@@ -463,7 +463,8 @@ def decide_trade(
 
     payload["action"] = action
     payload["symbol"] = str(payload.get("symbol") or SYMBOL)
-    payload["confidence"] = confidence
+    # Not requested; if the model volunteers one it is logged, never used.
+    payload["confidence"] = _safe_float_or_none(payload.get("confidence"))
     payload["risk_level"] = risk_level
 
     current_price = _extract_current_price_for_tp_sanity(technical_report)

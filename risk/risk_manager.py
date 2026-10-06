@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from config import (
     ATR_MULTIPLIER_SL,
-    CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
     JPY_USD_RATE_FALLBACK,
     MAX_DAILY_LOSS_PCT,
@@ -99,24 +98,23 @@ def calc_sl_tp(
 
 
 def check_filters(
-    confidence: float,
-    spread: float,
-    baseline_spread: float,
-    is_news_soon: bool,
-    consecutive_losses: int,
-    daily_loss_pct: float,
-    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    confidence: float | None = None,  # deprecated: ignored (the trader's action stands)
+    spread: float = -1.0,
+    baseline_spread: float = 0.0,
+    is_news_soon: bool = False,
+    consecutive_losses: int = 0,
+    daily_loss_pct: float = 0.0,
     consecutive_loss_limit: int = CONSECUTIVE_LOSS_LIMIT,
     max_daily_loss_pct: float = MAX_DAILY_LOSS_PCT,
     spread_multiplier_limit: float = SPREAD_MULTIPLIER_LIMIT,
 ) -> FilterCheckResult:
-    """Evaluate risk/safety filters.
+    """Evaluate risk/safety filters (spread, news window, losing streak, daily loss).
 
-    Any failing condition blocks trading.
+    Any failing condition blocks trading. There is no confidence gate: the
+    self-reported number never predicted anything, so the decision maker's
+    action is taken at face value and only market/risk facts can block it.
     """
-    if confidence < confidence_threshold:
-        return FilterCheckResult(False, "Low confidence")
-
+    _ = confidence
     if spread < 0:
         return FilterCheckResult(False, "Spread unavailable")
 

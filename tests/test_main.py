@@ -476,7 +476,7 @@ def test_run_once_uses_evaluate_position_when_position_exists(tmp_path: Path, mo
     called = {"evaluate": 0, "close": 0, "decide": 0, "modify": 0}
     def _fake_evaluate(**kwargs):
         called["evaluate"] += 1
-        assert kwargs["confidence_threshold"] == main.CLOSE_CONFIDENCE_THRESHOLD
+        assert "confidence_threshold" not in kwargs  # no gate any more
         return {
             "action": "HOLD",
             "confidence": 0.7,

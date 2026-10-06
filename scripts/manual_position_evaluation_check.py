@@ -15,7 +15,7 @@ from agents.evaluate_position import evaluate_position
 from agents.macro_analyst import analyze_macro_environment
 from agents.sentiment import analyze_sentiment
 from agents.technical import analyze_technical
-from config import CLOSE_CONFIDENCE_THRESHOLD, SYMBOL
+from config import SYMBOL
 from data import mt5_client
 from data.mt5_client import close_position, get_account_info, get_position_details, get_rates, send_order
 from data.news_client import fetch_news
@@ -336,13 +336,11 @@ def main() -> int:
         technical_report=technical_report,
         sentiment_report=sentiment_report,
         debate_report=debate_report,
-        confidence_threshold=CLOSE_CONFIDENCE_THRESHOLD,
     )
 
     technical_signal = str(technical_report.get("signal", "NEUTRAL") or "NEUTRAL")
     debate_direction = _direction_from_debate(debate_report)
     action = str(evaluation_report.get("action", "HOLD") or "HOLD")
-    confidence = float(evaluation_report.get("confidence", 0.0) or 0.0)
     reasoning = str(evaluation_report.get("reasoning", "") or "")
 
     print("\n--- 評価結果（目視確認用）---")
@@ -352,8 +350,6 @@ def main() -> int:
     print(f"議論実行            : {gate['should_debate']}")
     print(f"議論ゲート理由      : {gate['reason']}")
     print(f"evaluate action      : {action}")
-    print(f"evaluate confidence  : {confidence:.2f}")
-    print(f"close threshold      : {CLOSE_CONFIDENCE_THRESHOLD:.2f}")
     print("reasoning (全文):")
     print(reasoning)
 

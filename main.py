@@ -28,7 +28,6 @@ from agents.technical import analyze_technical
 from agents.trader import decide_trade
 from config import (
     BREAKEVEN_BUFFER,
-    CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
     DAILY_PENDING_CUTOFF_NY,
     FRIDAY_FLAT_TIME_NY,
@@ -1204,6 +1203,20 @@ def _is_past_pending_placement_cutoff(reference: datetime | None = None) -> bool
     return PENDING_ORDER_LAST_PLACEMENT_NY <= now_hm < DAILY_PENDING_CUTOFF_NY
 
 
+def _confidence_for_log(report: Any) -> Any:
+    """The decision maker's volunteered confidence for the log ('' when none).
+
+    Not requested from the model and never used as a gate; kept as a column
+    so old rows stay comparable."""
+    value = report.get("confidence") if isinstance(report, dict) else None
+    if value is None or value == "":
+        return ""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return ""
+
+
 def _pending_intent_fields(pendings: Any) -> dict[str, Any]:
     """pending_type / pending_price of the first proposed order ('' when none).
 
@@ -1352,7 +1365,7 @@ def _handle_pending_orders(
     consecutive_losses: int,
     daily_loss_pct: float,
     balance: float,
-    trader_confidence: float,
+    trader_confidence: Any,
     now_iso: str,
     spread_usd: float = 0.0,
 ) -> dict[str, Any]:
@@ -1377,7 +1390,6 @@ def _handle_pending_orders(
             return {"status": "skipped_late_placement", "log_row": None, "fields": intent}
 
         gate = check_filters(
-            confidence=1.0,
             spread=spread,
             baseline_spread=baseline_spread,
             is_news_soon=False,
@@ -1797,7 +1809,6 @@ def run_once(
                 sentiment_report=sentiment_report,
                 debate_report=debate_report,
                 macro_report=macro_report,
-                confidence_threshold=CLOSE_CONFIDENCE_THRESHOLD,
             )
 
             close_result: dict[str, Any] = {
@@ -1822,7 +1833,7 @@ def run_once(
                 "breakeven_reason": "",
             }
             evaluation_action = str(evaluation_report.get("action", "HOLD"))
-            evaluation_confidence = float(evaluation_report.get("confidence", 0.0) or 0.0)
+            evaluation_confidence = _confidence_for_log(evaluation_report)
             evaluation_reasoning = str(evaluation_report.get("reasoning", "") or "")
             position_direction = str(position_context.get("type", "") or "")
             technical_signal = str(technical_report.get("signal", "") or "")
@@ -1896,7 +1907,6 @@ def run_once(
         spread = get_spread(SYMBOL)
         spread_usd = get_spread_price(SYMBOL) or 0.0
         filter_result = check_filters(
-            confidence=float(trader_report.get("confidence", 0.0) or 0.0),
             spread=spread,
             baseline_spread=calibrated_baseline,
             is_news_soon=False,
@@ -1939,7 +1949,9 @@ def run_once(
             "retcode": None,
         }
 
-        final_action = str(risk_plan.get("action", "HOLD"))
+        # A HOLD from the trader (or from a fail-safe report) is final: the risk
+        # plan can only confirm a BUY/SELL, never turn a HOLD into an order.
+        final_action = str(risk_plan.get("action", "HOLD")) if action in {"BUY", "SELL"} else "HOLD"
         market_filter_ok = bool(filter_result.ok)
         market_filter_reason = str(filter_result.reason)
         if action in {"BUY", "SELL"} and market_filter_ok and str(risk_plan.get("reason", "")) == "low_rr":
@@ -1980,7 +1992,7 @@ def run_once(
             "exit_price": "",
             "holding_seconds": "",
             "pnl": "",
-            "confidence": float(trader_report.get("confidence", 0.0) or 0.0),
+            "confidence": _confidence_for_log(trader_report),
             "reasoning": str(trader_report.get("reasoning", "")),
             "risk_level": str(trader_report.get("risk_level", "MID")),
             "allowed": market_filter_ok,
@@ -2019,7 +2031,7 @@ def run_once(
                     consecutive_losses=effective_consecutive_losses,
                     daily_loss_pct=effective_daily_loss_pct,
                     balance=balance,
-                    trader_confidence=float(trader_report.get("confidence", 0.0) or 0.0),
+                    trader_confidence=_confidence_for_log(trader_report),
                     now_iso=now_iso,
                     spread_usd=spread_usd,
                 )

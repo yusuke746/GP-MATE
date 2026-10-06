@@ -37,7 +37,7 @@ def test_evaluate_position_closes_on_high_confidence_reverse_signal() -> None:
     assert result["action"] == "CLOSE"
 
 
-def test_evaluate_position_holds_on_low_confidence_reverse_signal() -> None:
+def test_evaluate_position_close_verdict_stands_regardless_of_confidence() -> None:
     fake_client = Mock()
     fake_client.call_function.return_value = _fake_result("CLOSE", 0.45)
 
@@ -50,7 +50,8 @@ def test_evaluate_position_holds_on_low_confidence_reverse_signal() -> None:
             confidence_threshold=0.7,
         )
 
-    assert result["action"] == "HOLD"
+    assert result["action"] == "CLOSE"  # no confidence gate: the verdict is the verdict
+    assert result["confidence"] == 0.45  # logged only
 
 
 def test_evaluate_position_holds_on_same_direction() -> None:
@@ -130,49 +131,17 @@ def test_evaluate_position_falls_back_to_hold_on_client_failure() -> None:
     assert result["action"] == "HOLD"
 
 
-def test_evaluate_position_closes_at_close_threshold_boundary() -> None:
+def test_evaluate_position_schema_and_prompt_do_not_ask_for_confidence() -> None:
     fake_client = Mock()
-    fake_client.call_function.return_value = _fake_result("CLOSE", 0.7)
-
+    fake_client.call_function.return_value = _fake_result("HOLD", None)
     with patch("agents.evaluate_position.get_default_client", return_value=fake_client):
         result = evaluate_position(
-            position_context={"symbol": "GOLD#", "type": "BUY", "price_open": 2300.0, "profit": -20.0},
-            technical_report={"signal": "SELL", "trend": "DOWN"},
-            sentiment_report={"score": -0.2},
-            debate_report={"judge_summary": {"stronger_side": "bear"}},
-            confidence_threshold=0.7,
+            position_context={"symbol": "GOLD#", "type": "BUY", "price_open": 2300.0, "profit": 0.0},
+            technical_report={"signal": "NEUTRAL"},
+            sentiment_report={"score": 0.0},
+            debate_report={"judge_summary": {"stronger_side": "neutral"}},
         )
-
-    assert result["action"] == "CLOSE"
-
-
-def test_evaluate_position_holds_just_below_close_threshold() -> None:
-    fake_client = Mock()
-    fake_client.call_function.return_value = _fake_result("CLOSE", 0.69)
-
-    with patch("agents.evaluate_position.get_default_client", return_value=fake_client):
-        result = evaluate_position(
-            position_context={"symbol": "GOLD#", "type": "BUY", "price_open": 2300.0, "profit": -15.0},
-            technical_report={"signal": "SELL", "trend": "DOWN"},
-            sentiment_report={"score": -0.1},
-            debate_report={"judge_summary": {"stronger_side": "bear"}},
-            confidence_threshold=0.7,
-        )
-
-    assert result["action"] == "HOLD"
-
-
-def test_evaluate_position_holds_at_even_confidence_level() -> None:
-    fake_client = Mock()
-    fake_client.call_function.return_value = _fake_result("CLOSE", 0.6)
-
-    with patch("agents.evaluate_position.get_default_client", return_value=fake_client):
-        result = evaluate_position(
-            position_context={"symbol": "GOLD#", "type": "BUY", "price_open": 2300.0, "profit": -5.0},
-            technical_report={"signal": "SELL", "trend": "DOWN"},
-            sentiment_report={"score": -0.05},
-            debate_report={"judge_summary": {"stronger_side": "bear"}},
-            confidence_threshold=0.7,
-        )
-
-    assert result["action"] == "HOLD"
+    assert result["action"] == "HOLD" and result["confidence"] is None
+    schema = fake_client.call_function.call_args.kwargs["function_schema"]
+    assert "confidence" not in schema["parameters"]["properties"]
+    assert "確信度の数値は求めない" in fake_client.call_function.call_args.kwargs["system_prompt"]

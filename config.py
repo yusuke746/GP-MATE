@@ -78,8 +78,6 @@ class Settings:
 
     risk_percent: float
     max_positions: int
-    confidence_threshold: float
-    close_confidence_threshold: float
     max_daily_loss_pct: float
     consecutive_loss_limit: int
 
@@ -275,8 +273,6 @@ def load_settings() -> Settings:
         timeframe_entry=_get_env_str("TIMEFRAME_ENTRY", "H1"),
         risk_percent=_get_env_float("RISK_PERCENT", 0.01),
         max_positions=_get_env_int("MAX_POSITIONS", 1),
-        confidence_threshold=_get_env_float("CONFIDENCE_THRESHOLD", 0.6),
-        close_confidence_threshold=_get_env_float("CLOSE_CONFIDENCE_THRESHOLD", 0.7),
         max_daily_loss_pct=_get_env_float("MAX_DAILY_LOSS_PCT", 0.03),
         consecutive_loss_limit=_get_env_int("CONSECUTIVE_LOSS_LIMIT", 3),
         atr_multiplier_sl=_get_env_float("ATR_MULTIPLIER_SL", 1.5),
@@ -321,8 +317,6 @@ TIMEFRAME_ENTRY: Final[str] = settings.timeframe_entry
 
 RISK_PERCENT: Final[float] = settings.risk_percent
 MAX_POSITIONS: Final[int] = settings.max_positions
-CONFIDENCE_THRESHOLD: Final[float] = settings.confidence_threshold
-CLOSE_CONFIDENCE_THRESHOLD: Final[float] = settings.close_confidence_threshold
 MAX_DAILY_LOSS_PCT: Final[float] = settings.max_daily_loss_pct
 CONSECUTIVE_LOSS_LIMIT: Final[int] = settings.consecutive_loss_limit
 

@@ -8,7 +8,7 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 - Symbol: XAU/USD (XM symbol auto-detected, currently GOLD#)
 - Timeframes: H4 for trend, H1 for entries
 - Architecture: three analysts (technical, macro, sentiment) give their own reads, discuss trend vs reversal as a panel, then a trader decides
-- Risk-first policy: fail-safe HOLD on uncertainty or failures
+- Risk-first policy: fail-safe HOLD on uncertainty or failures. The trader is not asked for a confidence number and no confidence threshold exists; HOLD is how it expresses doubt, and only market/risk facts (spread, news window, losing streak, daily loss, RR, pending distance, time windows) can block its decision
 
 ## Project Structure
 

@@ -54,16 +54,18 @@ def test_calc_sl_tp_invalid_action_raises() -> None:
         calc_sl_tp(entry_price=2300.0, atr=10.0, action="HOLD")
 
 
-def test_check_filters_confidence_block() -> None:
+def test_check_filters_ignores_confidence() -> None:
+    # The self-reported number is no longer a gate; only market/risk facts block.
     result = check_filters(
-        confidence=0.5,
+        confidence=0.05,
         spread=20,
         baseline_spread=15,
         is_news_soon=False,
         consecutive_losses=0,
         daily_loss_pct=0.0,
     )
-    assert not result.ok
+    assert result.ok
+    assert check_filters(spread=20, baseline_spread=15).ok
 
 
 def test_check_filters_spread_block() -> None:
