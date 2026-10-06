@@ -42,11 +42,30 @@ JST_TIMEZONE_NAME: Final[str] = "Asia/Tokyo"
 # while the three NY slots combined ran 36 settled, 58% win rate, PF 1.81.
 # Positions opened in London were repeatedly stopped out during the NY open
 # (08:00-09:30) before the next judgment could re-evaluate them.
-NY_RUN_TIMES: Final[tuple[tuple[int, int], ...]] = (
-    (8, 0),
-    (9, 30),
-    (10, 30),
-)
+# Override with JUDGMENT_TIMES_NY=HH:MM,HH:MM,... (America/New_York) to add
+# Asia / London slots. Pending orders placed at a slot live until the next
+# slot re-plans (or the daily cutoff), so every slot must be one at which the
+# system is allowed to re-evaluate.
+DEFAULT_JUDGMENT_TIMES_NY: Final[tuple[tuple[int, int], ...]] = ((8, 0), (9, 30), (10, 30))
+
+
+def _parse_judgment_times(value: str) -> tuple[tuple[int, int], ...]:
+    times: list[tuple[int, int]] = []
+    for item in value.split(","):
+        text = item.strip()
+        if not text:
+            continue
+        try:
+            hour_text, minute_text = text.split(":")
+            hour, minute = int(hour_text), int(minute_text)
+        except Exception:
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59 and (hour, minute) not in times:
+            times.append((hour, minute))
+    return tuple(sorted(times)) if times else DEFAULT_JUDGMENT_TIMES_NY
+
+
+NY_RUN_TIMES: Final[tuple[tuple[int, int], ...]] = _parse_judgment_times(os.getenv("JUDGMENT_TIMES_NY", "") or "")
 MARKET_TZ: Final[ZoneInfo] = ZoneInfo(MARKET_TIMEZONE_NAME)
 JST_TZ: Final[ZoneInfo] = ZoneInfo(JST_TIMEZONE_NAME)
 
@@ -59,8 +78,6 @@ class Settings:
 
     risk_percent: float
     max_positions: int
-    confidence_threshold: float
-    close_confidence_threshold: float
     max_daily_loss_pct: float
     consecutive_loss_limit: int
 
@@ -256,8 +273,6 @@ def load_settings() -> Settings:
         timeframe_entry=_get_env_str("TIMEFRAME_ENTRY", "H1"),
         risk_percent=_get_env_float("RISK_PERCENT", 0.01),
         max_positions=_get_env_int("MAX_POSITIONS", 1),
-        confidence_threshold=_get_env_float("CONFIDENCE_THRESHOLD", 0.6),
-        close_confidence_threshold=_get_env_float("CLOSE_CONFIDENCE_THRESHOLD", 0.7),
         max_daily_loss_pct=_get_env_float("MAX_DAILY_LOSS_PCT", 0.03),
         consecutive_loss_limit=_get_env_int("CONSECUTIVE_LOSS_LIMIT", 3),
         atr_multiplier_sl=_get_env_float("ATR_MULTIPLIER_SL", 1.5),
@@ -302,8 +317,6 @@ TIMEFRAME_ENTRY: Final[str] = settings.timeframe_entry
 
 RISK_PERCENT: Final[float] = settings.risk_percent
 MAX_POSITIONS: Final[int] = settings.max_positions
-CONFIDENCE_THRESHOLD: Final[float] = settings.confidence_threshold
-CLOSE_CONFIDENCE_THRESHOLD: Final[float] = settings.close_confidence_threshold
 MAX_DAILY_LOSS_PCT: Final[float] = settings.max_daily_loss_pct
 CONSECUTIVE_LOSS_LIMIT: Final[int] = settings.consecutive_loss_limit
 

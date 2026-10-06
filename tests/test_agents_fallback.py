@@ -28,16 +28,22 @@ def test_debate_fallback_shape() -> None:
     assert "_meta" in result
 
 
-def test_trader_enforces_hold_when_low_confidence() -> None:
-    result = decide_trade(
-        technical_report={"signal": "BUY"},
-        sentiment_report={"score": 0.2},
-        debate_report={"round1": {}, "round2": {}},
-        confidence_threshold=0.6,
-    )
-    assert result["action"] in {"BUY", "SELL", "HOLD"}
-    if result["confidence"] < 0.6:
-        assert result["action"] == "HOLD"
+def test_trader_action_stands_without_a_confidence_gate() -> None:
+    fake_result = Mock()
+    fake_result.ok = True
+    fake_result.payload = {"action": "BUY", "symbol": "GOLD#", "reasoning": "test", "risk_level": "MID"}
+    fake_result.model = "m"
+    fake_result.error = ""
+    fake_result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    fake_client = Mock()
+    fake_client.call_function.return_value = fake_result
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        result = decide_trade(technical_report={"signal": "BUY"}, sentiment_report={"score": 0.2}, debate_report={"judge_summary": {}})
+    assert result["action"] == "BUY"
+    assert result["confidence"] is None  # not requested, not used
+    schema = fake_client.call_function.call_args.kwargs["function_schema"]
+    assert "confidence" not in schema["parameters"]["properties"] and "confidence" not in schema["parameters"]["required"]
+    assert "確信度の数値は求めない" in fake_client.call_function.call_args.kwargs["system_prompt"]
 
 
 def test_trader_forces_hold_when_sentiment_evidence_insufficient() -> None:
@@ -47,63 +53,6 @@ def test_trader_forces_hold_when_sentiment_evidence_insufficient() -> None:
         debate_report={"round1": {}, "round2": {}},
         confidence_threshold=0.1,
     )
-    assert result["action"] == "HOLD"
-
-
-def test_trader_clamps_confidence_to_upper_bound() -> None:
-    fake_result = Mock()
-    fake_result.ok = True
-    fake_result.payload = {
-        "action": "BUY",
-        "symbol": "GOLD#",
-        "confidence": 1.5,
-        "reasoning": "test",
-        "risk_level": "MID",
-    }
-    fake_result.model = "gpt-5.5"
-    fake_result.error = ""
-    fake_result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
-
-    fake_client = Mock()
-    fake_client.call_function.return_value = fake_result
-
-    with patch("agents.trader.get_default_client", return_value=fake_client):
-        result = decide_trade(
-            technical_report={"signal": "BUY"},
-            sentiment_report={"score": 0.2},
-            debate_report={"round1": {}, "round2": {}},
-            confidence_threshold=0.1,
-        )
-
-    assert result["confidence"] == 1.0
-
-
-def test_trader_clamps_confidence_to_lower_bound() -> None:
-    fake_result = Mock()
-    fake_result.ok = True
-    fake_result.payload = {
-        "action": "SELL",
-        "symbol": "GOLD#",
-        "confidence": -0.3,
-        "reasoning": "test",
-        "risk_level": "LOW",
-    }
-    fake_result.model = "gpt-5.5"
-    fake_result.error = ""
-    fake_result.usage = Mock(prompt_tokens=1, completion_tokens=1, total_tokens=2)
-
-    fake_client = Mock()
-    fake_client.call_function.return_value = fake_result
-
-    with patch("agents.trader.get_default_client", return_value=fake_client):
-        result = decide_trade(
-            technical_report={"signal": "SELL"},
-            sentiment_report={"score": -0.2},
-            debate_report={"round1": {}, "round2": {}},
-            confidence_threshold=0.1,
-        )
-
-    assert result["confidence"] == 0.0
     assert result["action"] == "HOLD"
 
 

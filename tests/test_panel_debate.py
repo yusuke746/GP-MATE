@@ -298,3 +298,22 @@ def test_panel_resolves_level_ids_from_the_technical_catalogue() -> None:
     assert client.calls[0]["payload"]["price_levels"] == levels and client.calls[-1]["payload"]["price_levels"] == levels
     assert "counter_evidence" in panel_debate.PANEL_SYSTEM_PROMPT and "level_id" in panel_debate.PANEL_JUDGE_SYSTEM_PROMPT
     assert report["panel_views"]["technical"]["initial_view"] == "TREND_CONTINUATION"
+
+
+def test_chair_overriding_a_two_vote_majority_is_recorded() -> None:
+    answers = {"technical": _view("MEAN_REVERSION"), "macro": _view("MEAN_REVERSION"), "sentiment": _view("UNCLEAR")}
+    cautious = _ScriptedClient(answers, _judge("TRANSITION", consensus="MAJORITY"))
+    report = panel_debate.run_panel_debate({}, {}, {}, client=cautious)
+    summary = report["regime_summary"]
+    assert summary["regime"] == "TRANSITION"  # the chair's verdict still stands
+    assert summary["majority_view"] == "MEAN_REVERSION" and summary["chair_overrode_majority"] is True
+    assert any("多数意見" in c for c in report["judge_summary"]["conflicts"])
+
+    following = _ScriptedClient(answers, _judge("RANGE", consensus="MAJORITY"))
+    report = panel_debate.run_panel_debate({}, {}, {}, client=following)
+    assert report["regime_summary"]["chair_overrode_majority"] is False and report["regime_summary"]["majority_view"] == "MEAN_REVERSION"
+
+    split = _ScriptedClient({"technical": _view("TREND_CONTINUATION", "UP"), "macro": _view("MEAN_REVERSION"), "sentiment": _view("UNCLEAR")}, _judge("TRANSITION", consensus="SPLIT"))
+    report = panel_debate.run_panel_debate({}, {}, {}, client=split)
+    assert report["regime_summary"]["majority_view"] is None and report["regime_summary"]["chair_overrode_majority"] is False
+    assert "2名以上がMEAN_REVERSIONならRANGE" in panel_debate.PANEL_JUDGE_SYSTEM_PROMPT

@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from agents.base import decision_model, get_default_client
-from config import CLOSE_CONFIDENCE_THRESHOLD, SYMBOL
+from config import SYMBOL
 
 SYSTEM_PROMPT = (
     "あなたは保有ポジションを評価するトレーダーです。"
@@ -15,8 +15,8 @@ SYSTEM_PROMPT = (
     "macro_context.macro_vs_position が AGAINST の場合は保有方向にマクロの逆風があることを意味する。"
     "macro.key_drivers の根拠が具体的で複数あるならCLOSE寄りの検討材料とし、"
     "単一材料のみならHOLDを維持してください。"
-    "confidenceは判断の確からしさ(0-1)を正直に申告すること。"
-    "決済可否の閾値判定はシステム側で行うため、閾値を意識して数値を調整しないこと。"
+    "確信度の数値は求めない。あなたの判断がそのまま採用される。迷いがあればHOLDを選び、"
+    "保有根拠が明確に崩れたと判断したときだけCLOSEを選ぶこと。"
     "必ず evaluate_position_action 関数を呼び出して返答してください。"
 )
 
@@ -27,18 +27,16 @@ EVALUATE_POSITION_SCHEMA: dict[str, Any] = {
         "properties": {
             "action": {"type": "string", "enum": ["HOLD", "CLOSE"]},
             "symbol": {"type": "string"},
-            "confidence": {"type": "number", "description": "0-1の確信度"},
             "reasoning": {"type": "string", "description": "判断根拠（日本語）"},
             "risk_level": {"type": "string", "enum": ["LOW", "MID", "HIGH"]},
         },
-        "required": ["action", "symbol", "confidence", "reasoning"],
+        "required": ["action", "symbol", "reasoning"],
     },
 }
 
 FALLBACK_RESPONSE: dict[str, Any] = {
     "action": "HOLD",
     "symbol": SYMBOL,
-    "confidence": 0.0,
     "reasoning": "保有評価に失敗したためHOLD。",
     "risk_level": "HIGH",
 }
@@ -50,8 +48,10 @@ def evaluate_position(
     sentiment_report: dict[str, Any],
     debate_report: dict[str, Any],
     macro_report: dict[str, Any] | None = None,
-    confidence_threshold: float = CLOSE_CONFIDENCE_THRESHOLD,
+    confidence_threshold: float | None = None,  # deprecated: no longer gates anything; kept for callers
 ) -> dict[str, Any]:
+    """HOLD or CLOSE for an open position. The verdict stands; no confidence gate."""
+    _ = confidence_threshold
     raw_judge_summary = debate_report.get("judge_summary", {})
     judge_summary: dict[str, Any]
     if isinstance(raw_judge_summary, dict):
@@ -86,9 +86,6 @@ def evaluate_position(
         "macro_context": macro_context,
         "debate": debate_report,
         "judge_summary": judge_summary,
-        # The confidence threshold is intentionally NOT exposed to the model:
-        # it is enforced in code below, and telling the model the cutoff lets
-        # it anchor its self-reported confidence around it.
         "constraints": {
             "symbol": str(position_context.get("symbol") or SYMBOL),
         },
@@ -105,8 +102,6 @@ def evaluate_position(
 
     payload = dict(result.payload)
     action = str(payload.get("action", "HOLD")).upper()
-    confidence = float(payload.get("confidence", 0.0) or 0.0)
-    confidence = max(0.0, min(1.0, confidence))
     evidence_status = str(sentiment_report.get("evidence_status", "") or "").upper()
     risk_level = str(payload.get("risk_level") or "HIGH").upper()
     if risk_level not in {"LOW", "MID", "HIGH"}:
@@ -117,12 +112,13 @@ def evaluate_position(
     if evidence_status == "INSUFFICIENT":
         action = "HOLD"
         payload["reasoning"] = "ニュース判断材料が不足しているためHOLD。"
-    if confidence < confidence_threshold:
-        action = "HOLD"
 
     payload["action"] = action
     payload["symbol"] = str(payload.get("symbol") or position_context.get("symbol") or SYMBOL)
-    payload["confidence"] = confidence
+    try:
+        payload["confidence"] = float(payload["confidence"]) if payload.get("confidence") is not None else None  # logged only
+    except (TypeError, ValueError):
+        payload["confidence"] = None
     payload["risk_level"] = risk_level
 
     payload["_meta"] = {

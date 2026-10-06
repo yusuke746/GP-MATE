@@ -8,7 +8,7 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 - Symbol: XAU/USD (XM symbol auto-detected, currently GOLD#)
 - Timeframes: H4 for trend, H1 for entries
 - Architecture: three analysts (technical, macro, sentiment) give their own reads, discuss trend vs reversal as a panel, then a trader decides
-- Risk-first policy: fail-safe HOLD on uncertainty or failures
+- Risk-first policy: fail-safe HOLD on uncertainty or failures. The trader is not asked for a confidence number and no confidence threshold exists; HOLD is how it expresses doubt, and only market/risk facts (spread, news window, losing streak, daily loss, RR, pending distance, time windows) can block its decision
 
 ## Project Structure
 
@@ -33,7 +33,7 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 4. Fill required values in `.env`:
    - MT5 credentials (`MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_PATH`)
    - API keys (`OPENAI_API_KEY`, optional `NEWS_API_KEY`, `FRED_API_KEY`)
-   - Judgment schedule is fixed in code as `America/New_York` 08:00 / 09:30 / 10:30 (NY session only) and follows DST automatically.
+   - Judgment schedule defaults to `America/New_York` 08:00 / 09:30 / 10:30 and follows DST automatically; set `JUDGMENT_TIMES_NY=20:00,22:00,03:00,08:00,09:30,10:30` to add Asia / London slots. Pending orders live until the next slot re-plans.
 
 ## Run Flow (Safe 3-Step)
 
@@ -90,6 +90,12 @@ consensus (UNANIMOUS / MAJORITY / SPLIT); if the chair fails, a plain majority
 of the stated views is used and marked `vote_fallback`. The trader is told to
 set a directional bias and pending orders only when the panel points the same
 way, and otherwise to stay flat. A few entries per day is the intended pace.
+Pending orders follow the panel regime rather than a self-reported bias
+number: in TREND only orders on the trend side are accepted, in RANGE limit
+fades at the band edges are accepted on either side with no directional bias,
+in TRANSITION none. The chair follows the majority (two analysts for
+continuation is TREND, two for mean reversion is RANGE); a chair that still
+says TRANSITION is recorded with `chair_overrode_majority`.
 
 ## Data integrity and fail-safes
 

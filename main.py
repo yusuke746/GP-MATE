@@ -28,7 +28,6 @@ from agents.technical import analyze_technical
 from agents.trader import decide_trade
 from config import (
     BREAKEVEN_BUFFER,
-    CLOSE_CONFIDENCE_THRESHOLD,
     CONSECUTIVE_LOSS_LIMIT,
     DAILY_PENDING_CUTOFF_NY,
     FRIDAY_FLAT_TIME_NY,
@@ -616,11 +615,16 @@ def _is_pending_flat_window(reference: datetime | None = None) -> bool:
     16:55 daily close) until the first judgment of the next day re-plans.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
-    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (8, 0)
-
-    if (now_market.hour, now_market.minute) >= DAILY_PENDING_CUTOFF_NY:
-        return True
-    return (now_market.hour, now_market.minute) < first_judgment
+    now_hm = (now_market.hour, now_market.minute)
+    slots = sorted(NY_RUN_TIMES) if NY_RUN_TIMES else [(8, 0)]
+    # The window runs from the daily cutoff to the next judgment slot after it
+    # (wrapping past midnight when no slot follows the cutoff that day). Slots
+    # after the cutoff -- e.g. an Asia slot at 20:00 NY -- end the window early
+    # because they re-plan.
+    later = [slot for slot in slots if slot > DAILY_PENDING_CUTOFF_NY]
+    if later:
+        return DAILY_PENDING_CUTOFF_NY <= now_hm < later[0]
+    return now_hm >= DAILY_PENDING_CUTOFF_NY or now_hm < slots[0]
 
 
 def _is_market_closed_for_weekend(reference: datetime | None = None) -> bool:
@@ -1186,15 +1190,31 @@ PENDING_MAX_DISTANCE_ATR = 3.0
 
 
 def _is_past_pending_placement_cutoff(reference: datetime | None = None) -> bool:
-    """True from PENDING_ORDER_LAST_PLACEMENT_NY (NY time) onwards.
+    """True between PENDING_ORDER_LAST_PLACEMENT_NY and the daily cutoff (NY time).
 
-    Pending orders placed after this time can fill late in the session and
-    then be held overnight until the next judgment with no re-evaluation, so
-    late judgments keep their plan in the log but do not send it to the broker.
+    Pending orders placed late in the NY session can fill into the close and
+    then sit through the rollover with no re-evaluation, so late NY judgments
+    keep their plan in the log but do not send it to the broker. Evening /
+    Asia slots (after the daily cutoff) are outside this window: their orders
+    are re-planned by the next slot.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
-    cutoff_hour, cutoff_minute = PENDING_ORDER_LAST_PLACEMENT_NY
-    return (now_market.hour, now_market.minute) >= (cutoff_hour, cutoff_minute)
+    now_hm = (now_market.hour, now_market.minute)
+    return PENDING_ORDER_LAST_PLACEMENT_NY <= now_hm < DAILY_PENDING_CUTOFF_NY
+
+
+def _confidence_for_log(report: Any) -> Any:
+    """The decision maker's volunteered confidence for the log ('' when none).
+
+    Not requested from the model and never used as a gate; kept as a column
+    so old rows stay comparable."""
+    value = report.get("confidence") if isinstance(report, dict) else None
+    if value is None or value == "":
+        return ""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return ""
 
 
 def _pending_intent_fields(pendings: Any) -> dict[str, Any]:
@@ -1260,15 +1280,19 @@ def _decision_layers(
         entry_style = str(rule.get("entry_style", "NONE") or "NONE")
     else:
         market_state, direction, entry_style = "UNKNOWN", "NEUTRAL", "NONE"
+    setup = SETUP_BY_ENTRY_STYLE.get(entry_style, "NONE")
+    pendings = trader_report.get("pending_orders") if isinstance(trader_report, dict) else None
+    first = pendings[0] if isinstance(pendings, list) and pendings and isinstance(pendings[0], dict) else None
     if market_state != "TREND":
         direction = "NEUTRAL"
         if isinstance(trader_report, dict):
             bias = str(trader_report.get("directional_bias", "") or "").upper()
             direction = {"BULLISH": "UP", "BEARISH": "DOWN"}.get(bias, "NEUTRAL")
-
-    setup = SETUP_BY_ENTRY_STYLE.get(entry_style, "NONE")
-    pendings = trader_report.get("pending_orders") if isinstance(trader_report, dict) else None
-    first = pendings[0] if isinstance(pendings, list) and pendings and isinstance(pendings[0], dict) else None
+        if direction == "NEUTRAL" and first is not None:
+            # A range fade has a side even when the bias is neutral.
+            direction = "UP" if str(first.get("type", "") or "").upper().startswith("BUY") else "DOWN"
+        if direction == "NEUTRAL" and final_action in {"BUY", "SELL"}:
+            direction = "UP" if final_action == "BUY" else "DOWN"
     if first is not None:
         order_type = str(first.get("type", "") or "").upper()
         setup = "BREAKOUT" if order_type.endswith("STOP") else ("FADE" if market_state == "RANGE" else "PULLBACK")
@@ -1341,7 +1365,7 @@ def _handle_pending_orders(
     consecutive_losses: int,
     daily_loss_pct: float,
     balance: float,
-    trader_confidence: float,
+    trader_confidence: Any,
     now_iso: str,
     spread_usd: float = 0.0,
 ) -> dict[str, Any]:
@@ -1366,7 +1390,6 @@ def _handle_pending_orders(
             return {"status": "skipped_late_placement", "log_row": None, "fields": intent}
 
         gate = check_filters(
-            confidence=1.0,
             spread=spread,
             baseline_spread=baseline_spread,
             is_news_soon=False,
@@ -1786,7 +1809,6 @@ def run_once(
                 sentiment_report=sentiment_report,
                 debate_report=debate_report,
                 macro_report=macro_report,
-                confidence_threshold=CLOSE_CONFIDENCE_THRESHOLD,
             )
 
             close_result: dict[str, Any] = {
@@ -1811,7 +1833,7 @@ def run_once(
                 "breakeven_reason": "",
             }
             evaluation_action = str(evaluation_report.get("action", "HOLD"))
-            evaluation_confidence = float(evaluation_report.get("confidence", 0.0) or 0.0)
+            evaluation_confidence = _confidence_for_log(evaluation_report)
             evaluation_reasoning = str(evaluation_report.get("reasoning", "") or "")
             position_direction = str(position_context.get("type", "") or "")
             technical_signal = str(technical_report.get("signal", "") or "")
@@ -1885,7 +1907,6 @@ def run_once(
         spread = get_spread(SYMBOL)
         spread_usd = get_spread_price(SYMBOL) or 0.0
         filter_result = check_filters(
-            confidence=float(trader_report.get("confidence", 0.0) or 0.0),
             spread=spread,
             baseline_spread=calibrated_baseline,
             is_news_soon=False,
@@ -1928,7 +1949,9 @@ def run_once(
             "retcode": None,
         }
 
-        final_action = str(risk_plan.get("action", "HOLD"))
+        # A HOLD from the trader (or from a fail-safe report) is final: the risk
+        # plan can only confirm a BUY/SELL, never turn a HOLD into an order.
+        final_action = str(risk_plan.get("action", "HOLD")) if action in {"BUY", "SELL"} else "HOLD"
         market_filter_ok = bool(filter_result.ok)
         market_filter_reason = str(filter_result.reason)
         if action in {"BUY", "SELL"} and market_filter_ok and str(risk_plan.get("reason", "")) == "low_rr":
@@ -1969,7 +1992,7 @@ def run_once(
             "exit_price": "",
             "holding_seconds": "",
             "pnl": "",
-            "confidence": float(trader_report.get("confidence", 0.0) or 0.0),
+            "confidence": _confidence_for_log(trader_report),
             "reasoning": str(trader_report.get("reasoning", "")),
             "risk_level": str(trader_report.get("risk_level", "MID")),
             "allowed": market_filter_ok,
@@ -2008,7 +2031,7 @@ def run_once(
                     consecutive_losses=effective_consecutive_losses,
                     daily_loss_pct=effective_daily_loss_pct,
                     balance=balance,
-                    trader_confidence=float(trader_report.get("confidence", 0.0) or 0.0),
+                    trader_confidence=_confidence_for_log(trader_report),
                     now_iso=now_iso,
                     spread_usd=spread_usd,
                 )

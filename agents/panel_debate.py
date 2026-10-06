@@ -106,7 +106,8 @@ PANEL_JUDGE_SYSTEM_PROMPT = (
     "発言者が参照した level_id の中から、継続が確認される水準(continuation_level_id)と反転が確認される水準(reversal_level_id)を選ぶこと"
     "(発言に無い水準を作らない。無ければnull)。各発言の counter_evidence も対立点の整理に使うこと。"
     "consensusは3人の見解が一致ならUNANIMOUS、2対1ならMAJORITY、それ以外はSPLIT。"
-    "UNCLEARが多い、または見解が割れる場合は無理にTREND/RANGEにせずTRANSITIONとすること。"
+    "2名以上がTREND_CONTINUATIONならTREND、2名以上がMEAN_REVERSIONならRANGEをパネルの結論とし、少数意見はconflictsに残すこと。"
+    "TRANSITIONは、UNCLEARが2名以上か、3者が三様に割れた場合に限る。自分の慎重さで多数意見を覆さないこと。"
     "出力は次のキーだけを持つJSON: "
     "{agreements: string[], conflicts: string[], regime: 'TREND'|'RANGE'|'TRANSITION', "
     "direction_if_trend: 'UP'|'DOWN'|'NEUTRAL', entry_style: 'STOP_BREAKOUT'|'LIMIT_PULLBACK'|'LIMIT_FADE'|'NONE', "
@@ -442,6 +443,13 @@ def run_panel_debate(
             verdict["regime"], verdict["direction_if_trend"], verdict["entry_style"] = "TRANSITION", "NEUTRAL", "NONE"
 
     distribution = _vote_distribution(latest)
+    # A 2+ majority for a definite view is a fact; if the chair still said
+    # TRANSITION, record it (the chair's verdict stands, the log shows it).
+    majority_view = next((view for view in ("TREND_CONTINUATION", "MEAN_REVERSION") if distribution.get(view, 0) >= 2), None)
+    majority_regime = {"TREND_CONTINUATION": "TREND", "MEAN_REVERSION": "RANGE"}.get(majority_view or "", None)
+    chair_overrode_majority = bool(majority_regime and verdict["source"] == "judge" and verdict["regime"] != majority_regime)
+    if chair_overrode_majority:
+        verdict["conflicts"] = list(verdict["conflicts"]) + [f"議長は多数意見({majority_view} {distribution[majority_view]}名)と異なる{verdict['regime']}を選んだ"]
     hint_regime = str(hint.get("regime", "") or "")
     regime_summary = {
         "regime": verdict["regime"],
@@ -458,6 +466,8 @@ def run_panel_debate(
         "consensus": verdict["consensus"],
         "stronger_advocate": "neutral",
         "source": verdict["source"],
+        "majority_view": majority_view,
+        "chair_overrode_majority": chair_overrode_majority,
     }
     if hint_regime and hint_regime != verdict["regime"]:
         regime_summary["disagrees_with_rule"] = True
