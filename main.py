@@ -616,11 +616,16 @@ def _is_pending_flat_window(reference: datetime | None = None) -> bool:
     16:55 daily close) until the first judgment of the next day re-plans.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
-    first_judgment = min(NY_RUN_TIMES) if NY_RUN_TIMES else (8, 0)
-
-    if (now_market.hour, now_market.minute) >= DAILY_PENDING_CUTOFF_NY:
-        return True
-    return (now_market.hour, now_market.minute) < first_judgment
+    now_hm = (now_market.hour, now_market.minute)
+    slots = sorted(NY_RUN_TIMES) if NY_RUN_TIMES else [(8, 0)]
+    # The window runs from the daily cutoff to the next judgment slot after it
+    # (wrapping past midnight when no slot follows the cutoff that day). Slots
+    # after the cutoff -- e.g. an Asia slot at 20:00 NY -- end the window early
+    # because they re-plan.
+    later = [slot for slot in slots if slot > DAILY_PENDING_CUTOFF_NY]
+    if later:
+        return DAILY_PENDING_CUTOFF_NY <= now_hm < later[0]
+    return now_hm >= DAILY_PENDING_CUTOFF_NY or now_hm < slots[0]
 
 
 def _is_market_closed_for_weekend(reference: datetime | None = None) -> bool:
@@ -1186,15 +1191,17 @@ PENDING_MAX_DISTANCE_ATR = 3.0
 
 
 def _is_past_pending_placement_cutoff(reference: datetime | None = None) -> bool:
-    """True from PENDING_ORDER_LAST_PLACEMENT_NY (NY time) onwards.
+    """True between PENDING_ORDER_LAST_PLACEMENT_NY and the daily cutoff (NY time).
 
-    Pending orders placed after this time can fill late in the session and
-    then be held overnight until the next judgment with no re-evaluation, so
-    late judgments keep their plan in the log but do not send it to the broker.
+    Pending orders placed late in the NY session can fill into the close and
+    then sit through the rollover with no re-evaluation, so late NY judgments
+    keep their plan in the log but do not send it to the broker. Evening /
+    Asia slots (after the daily cutoff) are outside this window: their orders
+    are re-planned by the next slot.
     """
     now_market = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
-    cutoff_hour, cutoff_minute = PENDING_ORDER_LAST_PLACEMENT_NY
-    return (now_market.hour, now_market.minute) >= (cutoff_hour, cutoff_minute)
+    now_hm = (now_market.hour, now_market.minute)
+    return PENDING_ORDER_LAST_PLACEMENT_NY <= now_hm < DAILY_PENDING_CUTOFF_NY
 
 
 def _pending_intent_fields(pendings: Any) -> dict[str, Any]:
@@ -1260,15 +1267,19 @@ def _decision_layers(
         entry_style = str(rule.get("entry_style", "NONE") or "NONE")
     else:
         market_state, direction, entry_style = "UNKNOWN", "NEUTRAL", "NONE"
+    setup = SETUP_BY_ENTRY_STYLE.get(entry_style, "NONE")
+    pendings = trader_report.get("pending_orders") if isinstance(trader_report, dict) else None
+    first = pendings[0] if isinstance(pendings, list) and pendings and isinstance(pendings[0], dict) else None
     if market_state != "TREND":
         direction = "NEUTRAL"
         if isinstance(trader_report, dict):
             bias = str(trader_report.get("directional_bias", "") or "").upper()
             direction = {"BULLISH": "UP", "BEARISH": "DOWN"}.get(bias, "NEUTRAL")
-
-    setup = SETUP_BY_ENTRY_STYLE.get(entry_style, "NONE")
-    pendings = trader_report.get("pending_orders") if isinstance(trader_report, dict) else None
-    first = pendings[0] if isinstance(pendings, list) and pendings and isinstance(pendings[0], dict) else None
+        if direction == "NEUTRAL" and first is not None:
+            # A range fade has a side even when the bias is neutral.
+            direction = "UP" if str(first.get("type", "") or "").upper().startswith("BUY") else "DOWN"
+        if direction == "NEUTRAL" and final_action in {"BUY", "SELL"}:
+            direction = "UP" if final_action == "BUY" else "DOWN"
     if first is not None:
         order_type = str(first.get("type", "") or "").upper()
         setup = "BREAKOUT" if order_type.endswith("STOP") else ("FADE" if market_state == "RANGE" else "PULLBACK")

@@ -456,7 +456,7 @@ def test_pending_validation_distinguishes_dropped_from_absent() -> None:
          "pending_orders": [{"type": "BUY_LIMIT", "price": 4380.0}]}
     )
     assert wrong_side["pending_orders"] == []
-    assert wrong_side["pending_validation"] == "skipped_invalid_proposal"
+    assert wrong_side["pending_validation"] == "skipped_against_bias"  # legacy rule (no regime known): a BUY against a BEARISH bias
 
     kept = _decide_with_payload(
         {"action": "HOLD", "confidence": 0.7, "reasoning": "x", "risk_level": "MID",
@@ -563,3 +563,65 @@ def test_suggested_tp_sl_level_ids_resolve_and_anchoring_is_recorded() -> None:
         technical_report=_levels_technical(),
     )
     assert free["suggested_tp"] == 4362.0 and free["suggested_tp_level_id"] is None and free["tp_anchor_reason"] == "unanchored"
+
+
+def _range_debate(consensus: str = "MAJORITY", regime: str = "RANGE", direction: str = "NEUTRAL", source: str = "judge") -> dict:
+    return {
+        "axis": "panel",
+        "regime_summary": {"regime": regime, "direction_if_trend": direction, "entry_style": "LIMIT_FADE" if regime == "RANGE" else "LIMIT_PULLBACK", "panel_consensus_type": consensus, "consensus": consensus, "source": source},
+        "judge_summary": {"stronger_side": "neutral", "regime_summary": {"regime": regime}},
+        "_meta": {"ok": True},
+    }
+
+
+def _run_with_debate(llm_payload: dict, debate: dict, technical: dict | None = None) -> dict:
+    fake_client = Mock()
+    fake_client.call_function.return_value = _fake_result(llm_payload)
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        return decide_trade(
+            technical_report=technical or {"signal": "NEUTRAL", "direction_context": {"h1": {"close": 4140.0}}},
+            sentiment_report={"score": 0.0},
+            debate_report=debate,
+            confidence_threshold=0.1,
+        )
+
+
+def test_range_fade_limit_orders_need_no_directional_bias() -> None:
+    hold = {"action": "HOLD", "confidence": 0.8, "reasoning": "x", "risk_level": "LOW", "directional_bias": "NEUTRAL", "bias_strength": 0.0,
+            "pending_orders": [{"type": "SELL_LIMIT", "price": 4164.88, "basis": "帯上端で売り"}]}
+    result = _run_with_debate(hold, _range_debate("MAJORITY"))
+    assert len(result["pending_orders"]) == 1 and result["pending_orders"][0]["type"] == "SELL_LIMIT"
+    assert result["pending_validation"] == "" and result["pending_regime"]["regime"] == "RANGE"
+
+    buy_side = {**hold, "pending_orders": [{"type": "BUY_LIMIT", "price": 4124.79}]}
+    assert len(_run_with_debate(buy_side, _range_debate("UNANIMOUS"))["pending_orders"]) == 1
+
+    stop = {**hold, "pending_orders": [{"type": "SELL_STOP", "price": 4120.0}]}
+    blocked = _run_with_debate(stop, _range_debate())
+    assert blocked["pending_orders"] == [] and blocked["pending_validation"] == "skipped_stop_in_range"
+
+    split = _run_with_debate(hold, _range_debate("SPLIT"))
+    assert split["pending_orders"] == [] and split["pending_validation"] == "skipped_transition"
+    assert split["pending_regime"]["source"] == "judge_split"
+
+
+def test_trend_pending_orders_follow_the_panel_direction_not_the_bias_number() -> None:
+    hold = {"action": "HOLD", "confidence": 0.8, "reasoning": "x", "risk_level": "LOW", "directional_bias": "BEARISH", "bias_strength": 0.3,  # weak self-reported number
+            "pending_orders": [{"type": "SELL_LIMIT", "price": 4166.0}]}
+    trend_down = _range_debate("UNANIMOUS", regime="TREND", direction="DOWN")
+    result = _run_with_debate(hold, trend_down)
+    assert len(result["pending_orders"]) == 1  # the panel's direction is the evidence, not bias_strength
+
+    against = {**hold, "pending_orders": [{"type": "BUY_LIMIT", "price": 4124.0}]}
+    blocked = _run_with_debate(against, trend_down)
+    assert blocked["pending_orders"] == [] and blocked["pending_validation"] == "skipped_against_trend"
+
+    transition = _run_with_debate(hold, _range_debate("MAJORITY", regime="TRANSITION"))
+    assert transition["pending_orders"] == [] and transition["pending_validation"] == "skipped_transition"
+
+    # Rule-based regime is used when no chair verdict exists.
+    no_debate = {"judge_summary": {"stronger_side": "neutral"}, "_meta": {"ok": True, "debate_executed": False}}
+    technical = {"signal": "NEUTRAL", "regime": {"regime": "RANGE", "direction": "NEUTRAL", "entry_style": "LIMIT_FADE"}, "direction_context": {"h1": {"close": 4140.0}}}
+    fade = {**hold, "directional_bias": "NEUTRAL", "bias_strength": 0.0}
+    result = _run_with_debate(fade, no_debate, technical)
+    assert len(result["pending_orders"]) == 1 and result["pending_regime"]["source"] == "rule_based"

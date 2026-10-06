@@ -14,8 +14,8 @@ SYSTEM_PROMPT = (
     "エントリー可否の閾値判定はシステム側で行うため、閾値を意識して数値を調整しないこと。"
     "HOLDで見送る場合、分析官と討論(judge_summary)の見解が同じ方向を指しているときだけ "
     "directional_bias(BULLISH/BEARISH)とbias_strength、trigger_conditions(key_levelsに基づく発動価格条件)を設定する。"
-    "見解が割れている、または根拠が薄いときはdirectional_bias=NEUTRAL、bias_strength=0、pending_orders=[]とし、"
-    "無理に方向を作らないこと。エントリーは1日に数回で十分である。"
+    "見解が割れている、または根拠が薄いときはdirectional_bias=NEUTRAL、bias_strength=0とし、無理に方向を作らないこと。"
+    "ただしRANGEの逆張り指値は方向バイアスを必要としない(【レジーム】参照)。エントリーは1日に数回で十分である。"
     "action(BUY/SELL/HOLD)の方向判断はtechnical/macro/sentiment/debateに基づき、"
     "technical_report内のtp_reference_onlyを方向判断に使ってはならない。"
     "tp_reference_onlyはsuggested_tpの算出にのみ使用する。"
@@ -65,6 +65,8 @@ SYSTEM_PROMPT = (
     "TREND: direction_if_trendの方向のみ。entry_styleがLIMIT_PULLBACKなら押し目/戻りのLIMIT、"
     "STOP_BREAKOUTならkey_levels.continuation_confirmsの外側にSTOP。逆張りのpending_ordersは置かない。"
     "RANGE(entry_style=LIMIT_FADE): 帯の端でのLIMIT(支持で買い/抵抗で売り)のみ。TPは帯の反対側の手前。ブレイク追随のSTOPは置かない。"
+    "レンジではdirectional_biasはNEUTRALのままでよく、現値が帯の中ほどでも、帯の端の候補水準(level_id)にLIMITをpending_ordersとして置くこと。"
+    "片側だけ置く場合は、上位足の方向と整合する側(日足が下向きなら抵抗での売り)を優先する。"
     "TRANSITION(または判定が食い違う場合): 新規エントリーとpending_ordersは見送り、"
     "trigger_conditionsに『どちらに決着したら何をするか』を書くこと。"
     "judge_summary.regime_summaryとtechnical.regimeが食い違う場合は、根拠が具体的な方を採用し、reasoningに理由を書くこと。"
@@ -202,6 +204,52 @@ def _anchor(levels: list[dict[str, Any]], level_id: Any, price: Any, atr: float 
     return resolved
 
 
+def _panel_regime(debate_report: Any, technical_report: Any) -> dict[str, Any]:
+    """The regime the pending-order rules follow: the chair's verdict when the
+    panel ran and agreed (MAJORITY/UNANIMOUS), else the rule-based read, else
+    unknown. -> {regime, direction, source}"""
+    summary = debate_report.get("regime_summary") if isinstance(debate_report, dict) else None
+    if isinstance(summary, dict) and summary.get("regime") and str(summary.get("source", "")) == "judge":
+        consensus = str(summary.get("panel_consensus_type") or summary.get("consensus") or "").upper()
+        if consensus in {"UNANIMOUS", "MAJORITY"}:
+            return {"regime": str(summary["regime"]), "direction": str(summary.get("direction_if_trend", "NEUTRAL") or "NEUTRAL"), "source": "judge"}
+        return {"regime": "TRANSITION", "direction": "NEUTRAL", "source": "judge_split"}
+    rule = technical_report.get("regime") if isinstance(technical_report, dict) else None
+    if isinstance(rule, dict) and rule.get("regime"):
+        return {"regime": str(rule["regime"]), "direction": str(rule.get("direction", "NEUTRAL") or "NEUTRAL"), "source": "rule_based"}
+    return {"regime": "", "direction": "NEUTRAL", "source": "none"}
+
+
+def _order_allowed_for_regime(order_type: str, regime: dict[str, Any], directional_bias: str, bias_strength: float) -> str:
+    """'' when the order type fits the regime, else the trade-log reason it does not.
+
+    TREND: only orders on the trend side (no directional-bias number needed;
+    the panel's direction is the evidence). RANGE: LIMIT fades only, either
+    side, no bias needed. TRANSITION: nothing. No regime known: legacy rule
+    (bias side + bias_strength >= PENDING_MIN_BIAS_STRENGTH).
+    """
+    kind = str(regime.get("regime", "") or "")
+    side = "BUY" if order_type.startswith("BUY") else "SELL"
+    if kind == "TRANSITION":
+        return "skipped_transition"
+    if kind == "TREND":
+        direction = str(regime.get("direction", "NEUTRAL") or "NEUTRAL")
+        if direction == "NEUTRAL":
+            return "skipped_trend_without_direction"
+        if (direction == "UP") != (side == "BUY"):
+            return "skipped_against_trend"
+        return ""
+    if kind == "RANGE":
+        return "" if order_type.endswith("LIMIT") else "skipped_stop_in_range"
+    if directional_bias not in {"BULLISH", "BEARISH"}:
+        return "skipped_no_bias"
+    if bias_strength < PENDING_MIN_BIAS_STRENGTH:
+        return f"skipped_weak_bias:{bias_strength:.2f}"
+    if (directional_bias == "BULLISH") != (side == "BUY"):
+        return "skipped_against_bias"
+    return ""
+
+
 def _validate_pending_orders(
     raw: Any,
     action: str,
@@ -210,22 +258,20 @@ def _validate_pending_orders(
     current_price: float | None,
     levels: list[dict[str, Any]] | None = None,
     atr: float | None = None,
+    regime: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate model-proposed pending orders.
 
-    Only meaningful for HOLD with a clear directional bias; each order must be
-    on the bias side and on the correct side of the current price for its
-    type, and its trigger must be a catalogue level (by id, or a price within
-    tolerance of one) when a catalogue is available.
+    Only meaningful for HOLD. Which orders are acceptable follows the regime
+    (see _order_allowed_for_regime); each must also be on the correct side of
+    the current price for its type, and its trigger must be a catalogue level
+    (by id, or a price within tolerance of one) when a catalogue is available.
     """
     if action != "HOLD":
         return []
-    if directional_bias not in {"BULLISH", "BEARISH"}:
-        return []
-    if bias_strength < PENDING_MIN_BIAS_STRENGTH:
-        return []
     if not isinstance(raw, list):
         return []
+    regime = regime or {}
 
     valid: list[dict[str, Any]] = []
     for item in raw:
@@ -234,15 +280,13 @@ def _validate_pending_orders(
         order_type = str(item.get("type", "") or "").upper().strip()
         if order_type not in PENDING_ORDER_TYPES:
             continue
+        if _order_allowed_for_regime(order_type, regime, directional_bias, bias_strength):
+            continue
         anchor = _anchor(levels or [], item.get("entry_level_id", item.get("level_id")), item.get("price"), atr)
         if not anchor["anchored"]:
             continue
         price = _safe_float_or_none(anchor["price"])
         if price is None or price <= 0:
-            continue
-        if directional_bias == "BULLISH" and not order_type.startswith("BUY"):
-            continue
-        if directional_bias == "BEARISH" and not order_type.startswith("SELL"):
             continue
         if current_price is not None:
             if order_type == "BUY_STOP" and price <= current_price:
@@ -312,6 +356,7 @@ def _describe_pending_proposal(
     validated: list[dict[str, Any]],
     levels: list[dict[str, Any]] | None = None,
     atr: float | None = None,
+    regime: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Explain why a proposed pending order survived or was dropped.
 
@@ -334,11 +379,13 @@ def _describe_pending_proposal(
         return "", proposal
     if not items:
         return "none_proposed", None
-    if directional_bias not in {"BULLISH", "BEARISH"}:
-        return "skipped_no_bias", proposal
-    if bias_strength < PENDING_MIN_BIAS_STRENGTH:
-        return f"skipped_weak_bias:{bias_strength:.2f}", proposal
     first = items[0]
+    first_type = str(first.get("type", "") or "").upper().strip()
+    if first_type not in PENDING_ORDER_TYPES:
+        return "skipped_invalid_proposal", proposal
+    regime_reason = _order_allowed_for_regime(first_type, regime or {}, directional_bias, bias_strength)
+    if regime_reason:
+        return regime_reason, proposal
     anchor = _anchor(levels or [], first.get("entry_level_id", first.get("level_id")), first.get("price"), atr)
     if not anchor["anchored"]:
         return f"skipped_unanchored_price:{anchor['reason']}", proposal
@@ -458,6 +505,8 @@ def decide_trade(
     payload["suggested_sl_basis"] = str(payload.get("suggested_sl_basis", "") or "")
 
     raw_pending_orders = payload.get("pending_orders")
+    regime = _panel_regime(debate_report, technical_report)
+    payload["pending_regime"] = regime
     payload["pending_orders"] = _validate_pending_orders(
         raw=raw_pending_orders,
         action=action,
@@ -466,6 +515,7 @@ def decide_trade(
         current_price=current_price,
         levels=price_levels,
         atr=atr_h1,
+        regime=regime,
     )
     payload["pending_validation"], payload["pending_proposal"] = _describe_pending_proposal(
         raw=raw_pending_orders,
@@ -475,6 +525,7 @@ def decide_trade(
         validated=payload["pending_orders"],
         levels=price_levels,
         atr=atr_h1,
+        regime=regime,
     )
 
     payload["_meta"] = {
