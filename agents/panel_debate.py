@@ -54,7 +54,6 @@ PANEL_SYSTEM_PROMPT = (
     "反論は求めません。根拠のない主張はしないこと。根拠が弱ければUNCLEARと答えること。"
     "自分の結論に反する材料(counter_evidence)も探して列挙すること(無ければ空)。"
     "水準は自分で作らず、price_levels(technical レポート内の候補一覧)の level_id で答えること。"
-    "regime_hintはコードによる機械的な暫定判定で、参考情報にすぎません。従う必要はありません。"
     "出力は次のキーだけを持つJSON: "
     "{regime_view: 'TREND_CONTINUATION'|'MEAN_REVERSION'|'UNCLEAR', direction_if_trend: 'UP'|'DOWN'|'NEUTRAL', "
     "statement: string(日本語、自分の専門からの見解と根拠), responses_to_others: string[](他の分析官の具体的な論点への応答、無ければ空), "
@@ -384,7 +383,6 @@ def run_panel_debate(
                 "your_initial_view": initial_views[role],
                 "other_reports": {k: v for k, v in reports.items() if k != role},
                 "transcript": visible,
-                "regime_hint": hint,
                 "price_levels": price_levels,
                 "question": "いまの相場はトレンド継続局面か、反転・平均回帰局面か、判断できないか。",
             }
@@ -424,7 +422,6 @@ def run_panel_debate(
             "transcript": [{k: s[k] for k in STATEMENT_KEYS} for s in transcript if s.get("ok")],
             "initial_views": initial_views,
             "absent_analysts": sorted({s["role"] for s in transcript if not s.get("ok")}),
-            "regime_hint": hint,
             "price_levels": price_levels,
         }
         verdict, judge_error, judge_attempts = _ask_chair(llm, judge_payload, model, transcript, usage, price_levels, atr_h1)

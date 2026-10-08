@@ -8,68 +8,31 @@ from indicators.price_levels import resolve_level
 from config import SYMBOL
 
 SYSTEM_PROMPT = (
-    "あなたは最終決定権を持つトレーダーです。"
-    "必ず place_trade_order 関数を呼び出して最終判断を返してください。"
+    "あなたは最終決定権を持つトレーダーです。必ず place_trade_order 関数を呼び出して最終判断を返してください。"
     "確信度の数値は求めない。あなたの決定がそのまま採用される。迷いがあればHOLDを選ぶこと。"
-    "HOLDが『確信がない』の表現である。"
-    "HOLDで見送る場合、分析官と討論(judge_summary)の見解が同じ方向を指しているときだけ "
-    "directional_bias(BULLISH/BEARISH)とbias_strength、trigger_conditions(key_levelsに基づく発動価格条件)を設定する。"
-    "見解が割れている、または根拠が薄いときはdirectional_bias=NEUTRAL、bias_strength=0とし、無理に方向を作らないこと。"
-    "ただしRANGEの逆張り指値は方向バイアスを必要としない(【レジーム】参照)。エントリーは1日に数回で十分である。"
-    "action(BUY/SELL/HOLD)の方向判断はtechnical/macro/sentiment/debateに基づき、"
-    "technical_report内のtp_reference_onlyを方向判断に使ってはならない。"
-    "tp_reference_onlyはsuggested_tpの算出にのみ使用する。"
-    "【水準の指定】価格は自分で作らない。technical.direction_context.price_levels に level_id 付きの候補水準があるので、"
-    "suggested_tp_level_id / suggested_sl_level_id / pending_orders[].entry_level_id (と任意の tp_level_id, sl_level_id) は"
-    "その level_id で指定すること。候補に無い水準の指値はシステムが受け付けない。"
-    "actionがBUY/SELLの場合、反発が予想される強レベルの手前の候補を suggested_tp_level_id に指定すること。"
-    "複数根拠が重なるほど強いのでconfluence_noteを重視すること。"
-    "direction_context.technical.extensionがD1の伸び切り(BBミドルから2ATR超の乖離)を"
-    "示す場合、直近の急騰・急落に追随するエントリーは平均回帰による反転リスクが高い。"
-    "その局面では押し目/戻りを待つHOLDを優先的に検討し、"
-    "それでもエントリーする場合はreasoningで伸び切りリスクを上回る根拠を明示すること。"
-    "recent_contextには直近24時間の自分の判断履歴(decisions)と決済結果(recent_closed)が含まれる。"
-    "過去判断への盲従は不要だが、数時間前の自分のHOLD判断を覆してエントリーする場合は、"
-    "前回から何が新しく変わったのかをreasoningに明示すること。"
-    "recent_closedに直近2時間以内のLOSSがあり、同方向へ再エントリーする場合は、"
-    "明確な状況変化がない限り見送る(HOLD)こと。"
-    "direction_context.technical.adxが強いトレンドを示す場合は、"
-    "手前のサポレジで反発しにくいためsuggested_tpを遠めに設定してよい。"
-    "ただし最終TPはリスクリワード2Rが上限であり、2Rを超えるsuggested_tpは2Rに丸められる。"
-    "したがってsuggested_tpは原則2R以内で、最も反発が強そうなレベルの手前に置くこと。"
-    "HOLDの場合や算出根拠が不十分な場合、suggested_tpはnullにすること。"
-    "suggested_tp_basisには、その価格にした根拠を簡潔な日本語で記すこと。"
-    "actionがBUY/SELLの場合、suggested_slも設定すること。"
-    "SLは単なる損切り幅ではなく『シナリオ否定点』である。"
-    "suggested_slにはエントリー根拠が崩れる構造的な水準そのもの"
-    "(BUYなら直下の強サポート帯の価格、SELLなら直上の強レジスタンス帯の価格)を設定すること。"
-    "ヒゲ抜け対策のバッファはシステム側が自動付与するため、自分でマージンを足さないこと。"
-    "基準SLはATR×1.5であり、バッファ付与後の距離が基準より内側(浅い)場合のみ採用される。"
-    "基準より深い水準はATR×1.5にフォールバックされるため、"
-    "基準SLより手前に明確な構造があるときだけ提案する意味がある。"
-    "算出根拠が不十分ならsuggested_slはnullにすること(ATR×1.5が自動適用される)。"
-    "suggested_sl_basisにはその水準にした根拠を簡潔な日本語で記すこと。"
-    "HOLDで見送る場合でも、directional_biasが明確でtrigger_conditionsに"
-    "具体的な発動価格条件があるなら、その中で最も優位な1件をpending_ordersに"
-    "構造化して返すこと。ブレイク待ちはBUY_STOP/SELL_STOP、"
-    "押し目・戻り待ちはBUY_LIMIT/SELL_LIMITを使い、entry_level_idに発動水準のlevel_idを設定する。"
-    "伸び切り警戒中の順方向エントリーは、ブレイク追随ではなく押し目/戻りのLIMIT型を優先すること。"
-    "pending_ordersのtpは任意で、設定時は2R上限が適用される。"
-    "予約に値する明確な条件がなければpending_ordersは空配列にすること。"
-    "システム側の構造SLはH1 ATR×1.0が最小距離であり、それより近い水準はATR×1.5に置き換えられる。"
-    "suggested_tpと最終SLの比がMIN_RISK_REWARD_RATIO(既定1.5)を下回る注文はシステムが発注しない。"
-    "抵抗が近く損切り幅が取れない局面では、TPを遠ざけるのではなく、"
-    "より有利な価格の押し目/戻りをpending_ordersに置くか、pending_ordersを空にすること。"
-    "【レジーム】technical.regime(ルールベース)と、存在すればjudge_summary.regime_summary(討論の裁定)が"
-    "現在の相場をTREND/RANGE/TRANSITIONで示す。方向(上か下か)より先に、この局面の種類に注文タイプを合わせること。"
-    "TREND: direction_if_trendの方向のみ。entry_styleがLIMIT_PULLBACKなら押し目/戻りのLIMIT、"
-    "STOP_BREAKOUTならkey_levels.continuation_confirmsの外側にSTOP。逆張りのpending_ordersは置かない。"
-    "RANGE(entry_style=LIMIT_FADE): 帯の端でのLIMIT(支持で買い/抵抗で売り)のみ。TPは帯の反対側の手前。ブレイク追随のSTOPは置かない。"
-    "レンジではdirectional_biasはNEUTRALのままでよく、現値が帯の中ほどでも、帯の端の候補水準(level_id)にLIMITをpending_ordersとして置くこと。"
-    "片側だけ置く場合は、上位足の方向と整合する側(日足が下向きなら抵抗での売り)を優先する。"
-    "TRANSITION(または判定が食い違う場合): 新規エントリーとpending_ordersは見送り、"
-    "trigger_conditionsに『どちらに決着したら何をするか』を書くこと。"
-    "judge_summary.regime_summaryとtechnical.regimeが食い違う場合は、根拠が具体的な方を採用し、reasoningに理由を書くこと。"
+    "HOLDが『確信がない』の表現であり、見送りは正当な判断である。エントリーは1日に数回で十分である。"
+    "【材料】technical / macro / sentiment の各分析官レポートと、debate(分析官パネルの討論全文)、judge_summary(議長のまとめ)。"
+    "どう読むかはあなたの判断である。"
+    "【レジーム】judge_summary.regime_summary が、パネルの結論として現在の相場を TREND / RANGE / TRANSITION、"
+    "注文タイプ entry_style(STOP_BREAKOUT / LIMIT_PULLBACK / LIMIT_FADE / NONE)、"
+    "継続確認・反転確認の水準(level_id)で示す。パネルが走らなかった場合は technical.regime(コードの暫定判定)が代わりに入る。"
+    "technical.tp_reference_only は利確目標の選定専用のデータであり、方向判断の材料ではない。"
+    "recent_context は直近24時間の自分の判断履歴(decisions)と決済結果(recent_closed)。盲従は不要だが、"
+    "数時間前の自分の HOLD を覆して入る場合や、直近の負けと同方向に再び入る場合は、前回から何が変わったかを reasoning に書くこと。"
+    "【システムが受け付けるもの(事実)】"
+    "水準は technical.direction_context.price_levels の level_id で指定する。候補に無い水準の指値はシステムが受け付けない。"
+    "pending_orders は最大1件が採用され、レジームに応じて受理される: TREND では direction_if_trend 側の注文のみ、"
+    "RANGE では帯の端の LIMIT のみ(方向バイアスは不要、STOP は受理されない)、TRANSITION では受理されない。"
+    "指値のトリガーは現値から 0.1〜3.0 ATR の範囲にあるものだけが発注され、NY 11:00〜16:45 の判断では指値は発注されない。"
+    "SL: 基準は ATR×1.5。suggested_sl は『シナリオ否定点』の構造水準そのもの(ヒゲ抜け用のバッファはシステムが付与する)で、"
+    "バッファ後の距離が 1.0〜1.5 ATR に収まるときだけ採用され、それ以外は ATR×1.5 になる。null なら ATR×1.5。"
+    "TP: suggested_tp は 2R が上限で、超える分は 2R に丸められる。null なら 2R。"
+    "スプレッド控除後のリスクリワードが 1.5 未満の注文は発注されない。その場合、TP を遠ざけるより、より有利な水準の指値に替えるか見送る方が通る。"
+    "【書き方】action が BUY/SELL なら suggested_tp_level_id と suggested_sl_level_id を指定し、根拠を suggested_tp_basis / suggested_sl_basis に書く。"
+    "HOLD で条件付きの計画があるなら pending_orders に1件(type, entry_level_id, 任意の tp_level_id / sl_level_id, basis)。"
+    "ブレイク待ちは BUY_STOP / SELL_STOP、押し目・戻り・帯の端待ちは BUY_LIMIT / SELL_LIMIT。"
+    "directional_bias / bias_strength / trigger_conditions は方向の見方があれば書き、無ければ NEUTRAL / 0 / []。"
+    "条件が無ければ pending_orders は空配列にする。reasoning は日本語で、何を見て決めたかが分かるように書くこと。"
 )
 
 PENDING_ORDER_TYPES = ("BUY_STOP", "BUY_LIMIT", "SELL_STOP", "SELL_LIMIT")
@@ -172,6 +135,23 @@ def _extract_current_price_for_tp_sanity(technical_report: dict[str, Any]) -> fl
     except Exception:
         return None
     return None
+
+
+def _technical_for_trader(technical_report: dict[str, Any], debate_report: Any) -> dict[str, Any]:
+    """The technical report as the trader sees it.
+
+    When the panel chair returned a regime verdict, the rule-based regime
+    (technical.regime) is withheld: showing both made the trader explain the
+    rule-vs-panel disagreement every cycle instead of reading the market. The
+    field stays in the report itself (logs, fallback when no debate ran).
+    """
+    if not isinstance(technical_report, dict):
+        return technical_report
+    summary = debate_report.get("regime_summary") if isinstance(debate_report, dict) else None
+    chair_decided = isinstance(summary, dict) and bool(summary.get("regime")) and str(summary.get("source", "")) == "judge"
+    if not chair_decided or "regime" not in technical_report:
+        return technical_report
+    return {key: value for key, value in technical_report.items() if key != "regime"}
 
 
 def _levels_and_atr(technical_report: dict[str, Any]) -> tuple[list[dict[str, Any]], float | None]:
@@ -418,7 +398,7 @@ def decide_trade(
             "stronger_side": "neutral",
         }
     user_payload = {
-        "technical": technical_report,
+        "technical": _technical_for_trader(technical_report, debate_report),
         "sentiment": sentiment_report,
         "macro": macro_report or {},
         "debate": _strip_debater_confidence(debate_report),

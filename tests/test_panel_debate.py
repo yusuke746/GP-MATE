@@ -124,7 +124,7 @@ def test_panel_prompts_assign_no_side_and_allow_unclear() -> None:
             assert forbidden not in prompt
     assert "UNCLEAR" in panel_debate.PANEL_SYSTEM_PROMPT
     assert "見解を変えてもよい" in panel_debate.PANEL_SYSTEM_PROMPT
-    assert "従う必要はありません" in panel_debate.PANEL_SYSTEM_PROMPT
+    assert "regime_hint" not in panel_debate.PANEL_SYSTEM_PROMPT  # the rule-based hint is no longer shown to the panel
     assert "あなた自身の相場観を加えず" in panel_debate.PANEL_JUDGE_SYSTEM_PROMPT
 
 
