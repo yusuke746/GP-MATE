@@ -466,7 +466,7 @@ def test_pending_validation_distinguishes_dropped_from_absent() -> None:
     assert len(kept["pending_orders"]) == 1 and kept["pending_validation"] == ""
 
 
-def test_trader_sees_rule_regime_and_judge_regime_summary() -> None:
+def test_trader_sees_judge_regime_but_not_the_rule_based_one_when_chair_decided() -> None:
     import json
 
     from agents.trader import SYSTEM_PROMPT
@@ -491,15 +491,32 @@ def test_trader_sees_rule_regime_and_judge_regime_summary() -> None:
         decide_trade(technical_report=technical, sentiment_report={"score": 0.1}, debate_report=debate_report, confidence_threshold=0.1)
 
     sent = json.loads(fake_client.call_function.call_args.kwargs["user_prompt"])
-    assert sent["technical"]["regime"]["regime"] == "RANGE"
+    assert "regime" not in sent["technical"]  # chair decided: the rule-based read is withheld from the trader
+    assert technical["regime"]["regime"] == "RANGE"  # ...but stays in the report for the log / fallback
     assert sent["judge_summary"]["regime_summary"]["entry_style"] == "LIMIT_FADE"
     assert sent["judge_summary"]["regime_summary"]["key_levels"]["reversal_confirms"] == 2280.0
     assert sent["debate"]["regime_summary"]["regime"] == "RANGE"
     assert "confidence_shift" not in sent["judge_summary"] and "bull_confidence" not in sent["debate"]
-    # The prompt tells the trader to fit the order type to the regime before arguing direction.
     assert "【レジーム】" in SYSTEM_PROMPT
     for token in ("TREND", "RANGE", "TRANSITION", "LIMIT_PULLBACK", "STOP_BREAKOUT", "LIMIT_FADE"):
         assert token in SYSTEM_PROMPT
+    # Directives that steered the judgement are gone; what remains is facts about the system and reporting requirements.
+    for directive in ("優先的に検討", "見送る(HOLD)こと", "整合する側", "重視すること", "遠めに設定してよい", "同じ方向を指しているときだけ"):
+        assert directive not in SYSTEM_PROMPT
+    assert "どう読むかはあなたの判断である" in SYSTEM_PROMPT
+
+
+def test_trader_keeps_rule_regime_when_no_chair_verdict() -> None:
+    import json
+
+    fake_client = Mock()
+    fake_client.call_function.return_value = _fake_result({"action": "HOLD", "reasoning": "x"})
+    technical = {"signal": "BUY", "regime": {"regime": "TREND", "direction": "UP", "entry_style": "STOP_BREAKOUT", "source": "rule_based"}}
+    skipped = {"judge_summary": {"stronger_side": "neutral"}, "_meta": {"ok": True, "debate_executed": False}}
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        decide_trade(technical_report=technical, sentiment_report={"score": 0.1}, debate_report=skipped)
+    sent = json.loads(fake_client.call_function.call_args.kwargs["user_prompt"])
+    assert sent["technical"]["regime"]["regime"] == "TREND"  # no panel: the rule-based read is the only regime available
 
 
 def _levels_technical() -> dict:
