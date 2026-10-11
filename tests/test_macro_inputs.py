@@ -29,6 +29,7 @@ def test_live_dollar_index_replaces_fred_and_keeps_original() -> None:
         positioning_fetcher=lambda: {"cot": {"crowding": "NORMAL", "_meta": {"ok": True}}, "gld": {"_meta": {"ok": False, "error": "x"}},
                                      "_meta": {"ok": True, "error": ""}},
         calendar_fetcher=lambda: events,
+        yields_fetcher=lambda: {"_meta": {"ok": False, "error": "off"}},
     )
     assert enriched["dxy"]["direction"] == "DOWN"
     assert enriched["dxy"]["source"] == "mt5:USDX"
@@ -37,7 +38,7 @@ def test_live_dollar_index_replaces_fred_and_keeps_original() -> None:
     assert enriched["positioning"]["cot"]["crowding"] == "NORMAL"
     assert enriched["recent_releases"][0]["surprise"] == 67.0
     assert enriched["upcoming_events"][0]["title"] == "ISM Services PMI"
-    assert enriched["_meta"]["warnings"] == []
+    assert [w for w in enriched["_meta"]["warnings"] if "treasury yields" not in w] == []
     # us2y untouched
     assert enriched["us2y"]["direction"] == "DOWN"
 
@@ -48,6 +49,7 @@ def test_missing_layers_degrade_to_warnings() -> None:
         dollar_index_fetcher=lambda: {"_meta": {"ok": False, "error": "connect failed"}},
         positioning_fetcher=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
         calendar_fetcher=lambda: None,
+        yields_fetcher=lambda: {"_meta": {"ok": False, "error": "off"}},
     )
     assert enriched["dxy"]["source"] == "fred:DTWEXBGS"
     assert "dxy_fred" not in enriched
@@ -64,6 +66,7 @@ def test_empty_macro_data_does_not_raise() -> None:
         dollar_index_fetcher=lambda: {"_meta": {"ok": False, "error": "x"}},
         positioning_fetcher=lambda: {"_meta": {"ok": False, "error": "y"}},
         calendar_fetcher=lambda: [],
+        yields_fetcher=lambda: {"_meta": {"ok": False, "error": "off"}},
     )
     assert enriched["recent_releases"] == []
     assert enriched["upcoming_events"] == []

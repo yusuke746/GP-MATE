@@ -6,6 +6,9 @@ Layers, each optional and fail-safe:
    and the week-lagged broad dollar index as a fallback.
 2. Live dollar index from MT5 (get_dollar_index_snapshot) replacing the FRED
    dollar read when available; the FRED one is kept under ``dxy_fred``.
+2b. Same-day Treasury yields from Yahoo (get_treasury_yields_snapshot)
+   replacing the next-day FRED closes for us2y / us10y (kept under
+   ``*_fred``) and adding us5y / us30y with change_1d.
 3. Gold positioning (CFTC managed money, SPDR GLD holdings).
 4. Economic calendar: high-impact USD releases of the last 48h with actual
    prints and surprises, and the events scheduled in the next 24h.
@@ -20,6 +23,7 @@ from typing import Any, Callable
 from agents.data.fred_client import MacroData
 from agents.data.positioning import get_positioning
 from agents.data.releases import build_recent_releases, build_upcoming_events
+from agents.data.yahoo_rates import get_treasury_yields_snapshot
 from config import EVENTS_LOOKAHEAD_HOURS, RELEASES_LOOKBACK_HOURS
 from data.mt5_client import get_dollar_index_snapshot
 from data.news_client import fetch_calendar_events
@@ -41,10 +45,11 @@ def build_macro_inputs(
     dollar_index_fetcher: Callable[[], dict[str, Any]] = get_dollar_index_snapshot,
     positioning_fetcher: Callable[[], dict[str, Any]] = get_positioning,
     calendar_fetcher: Callable[[], list[dict[str, Any]] | None] = fetch_calendar_events,
+    yields_fetcher: Callable[[], dict[str, Any]] = get_treasury_yields_snapshot,
 ) -> dict[str, Any]:
-    """Return a copy of ``macro_data`` with live dollar index, positioning and
-    calendar context attached. Never raises; missing layers are simply absent
-    and noted in ``_meta.warnings``."""
+    """Return a copy of ``macro_data`` with live dollar index, same-day yields,
+    positioning and calendar context attached. Never raises; missing layers
+    are simply absent and noted in ``_meta.warnings``."""
     now = now or datetime.now(UTC)
     enriched: dict[str, Any] = dict(macro_data or {})
     meta = dict(enriched.get("_meta") or {})
@@ -60,6 +65,21 @@ def build_macro_inputs(
     else:
         err = live_dxy.get("_meta", {}).get("error", "") if isinstance(live_dxy, dict) else "unknown"
         warnings.append(f"live dollar index unavailable ({err}); using FRED DTWEXBGS (lags ~1 week)")
+
+    # 2b. same-day treasury yields ------------------------------------------
+    live_yields = _safe("treasury yields", yields_fetcher, {"_meta": {"ok": False, "error": "exception"}})
+    if isinstance(live_yields, dict) and bool(live_yields.get("_meta", {}).get("ok")):
+        for key, snapshot in live_yields.items():
+            if key == "_meta" or not isinstance(snapshot, dict):
+                continue
+            if key in enriched:
+                enriched[f"{key}_fred"] = enriched[key]
+            enriched[key] = {k: v for k, v in snapshot.items() if k != "_meta"}
+        for warning in live_yields.get("_meta", {}).get("warnings", []) or []:
+            warnings.append(f"yahoo yields: {warning}")
+    else:
+        err = live_yields.get("_meta", {}).get("error", "") if isinstance(live_yields, dict) else "unknown"
+        warnings.append(f"same-day treasury yields unavailable ({err}); using FRED daily closes (lag ~1 day)")
 
     # 3. positioning ---------------------------------------------------------
     positioning = _safe("positioning", positioning_fetcher, {"_meta": {"ok": False, "error": "exception"}})
