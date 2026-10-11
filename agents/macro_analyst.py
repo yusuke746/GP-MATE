@@ -52,7 +52,7 @@ SYSTEM_PROMPT = (
 # Provenance only: what each field is and how fresh it is. No "this means gold up".
 DATA_NOTES: Final[dict[str, str]] = {
     "dxy": "ドル指数。source が mt5:* なら日次で遅延なし(ICE-DXY相当の先物/合成)、fred:DTWEXBGS なら約1週間遅れの広義ドル指数。direction は30日変化の符号、direction_5d は5日変化の符号。",
-    "us2y": "米2年債利回り。source が yahoo:* なら当日の値(数分遅延、2YY=F は2年金利先物)、fred:DGS2 なら日次終値で約1日遅れ。change_30d / change_5d は同期間の変化幅(pt)。",
+    "us2y": "米2年債利回り(fred:DGS2、日次終値で約1日遅れ。当日値の無料ソースが無いため FRED のまま)。change_30d / change_5d は同期間の変化幅(pt)。",
     "us10y": "米10年債利回り。source が yahoo:^TNX なら当日の値(数分遅延)、fred:DGS10 なら日次終値で約1日遅れ。",
     "us5y": "米5年債利回り(yahoo:^FVX、当日の値)。",
     "us30y": "米30年債利回り(yahoo:^TYX、当日の値)。",

@@ -75,8 +75,9 @@ gaps) and answers with D1 / execution trend, alignment, a `regime_view`
 invalidation price. The macro analyst receives the FRED / dollar-index /
 positioning / release data with provenance notes only (what a series is and how
 fresh it is, not what it means for gold) and answers with `macro_bias`,
-US Treasury yields come same-day from Yahoo Finance (`^TNX`, `^TYX`, `^FVX`,
-`2YY=F`; no key) with `change_1d` and `stale_minutes`, because the FRED closes
+US Treasury yields (5y/10y/30y) come same-day from Yahoo Finance (`^FVX`,
+`^TNX`, `^TYX`; no key; the 2-year stays on FRED) with `change_1d` and
+`stale_minutes`, because the FRED closes
 arrive a day late and the 2026-10-08 losses were taken against a bond-market
 reversal that FRED could not show yet; the FRED values stay under `*_fred`.
 The analyst answers with `macro_bias`,
