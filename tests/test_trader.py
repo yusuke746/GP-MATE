@@ -642,3 +642,26 @@ def test_trend_pending_orders_follow_the_panel_direction_not_the_bias_number() -
     fade = {**hold, "directional_bias": "NEUTRAL", "bias_strength": 0.0}
     result = _run_with_debate(fade, no_debate, technical)
     assert len(result["pending_orders"]) == 1 and result["pending_regime"]["source"] == "rule_based"
+
+
+def test_trade_horizon_is_normalized_and_the_prompt_states_the_atr_rule() -> None:
+    import json
+
+    from agents.trader import PLACE_TRADE_ORDER_SCHEMA, SYSTEM_PROMPT
+
+    technical = {"direction_context": {"h1": {"close": 4050.0, "atr_14": 10.0}, "h4": {"close": 4050.0, "atr_14": 30.0}}}
+    swing = _run_with_payload({"action": "BUY", "symbol": "GOLD#", "reasoning": "H4の流れ", "trade_horizon": "SWING"}, technical)
+    assert swing["trade_horizon"] == "SWING"
+    default = _run_with_payload({"action": "BUY", "symbol": "GOLD#", "reasoning": "x"}, technical)
+    assert default["trade_horizon"] == "INTRADAY"
+    junk = _run_with_payload({"action": "HOLD", "symbol": "GOLD#", "reasoning": "x", "trade_horizon": "weekly"}, technical)
+    assert junk["trade_horizon"] == "INTRADAY"
+
+    assert PLACE_TRADE_ORDER_SCHEMA["parameters"]["properties"]["trade_horizon"]["enum"] == ["INTRADAY", "SWING"]
+    assert "【時間軸】" in SYSTEM_PROMPT
+    assert "INTRADAY は H1 ATR" in SYSTEM_PROMPT and "SWING は H4 ATR" in SYSTEM_PROMPT
+    assert "宣言が無ければ INTRADAY" in SYSTEM_PROMPT
+    # The horizon is the trader's call: no "use SWING when ..." directive.
+    for directive in ("SWING を選ぶこと", "INTRADAY を選ぶこと", "SWING にすべき"):
+        assert directive not in SYSTEM_PROMPT
+    assert json.dumps(PLACE_TRADE_ORDER_SCHEMA["parameters"]["required"]) == '["action", "symbol", "reasoning"]'

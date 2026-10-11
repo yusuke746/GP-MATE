@@ -17,6 +17,9 @@ SYSTEM_PROMPT = (
     "単一材料のみならHOLDを維持してください。"
     "確信度の数値は求めない。あなたの判断がそのまま採用される。迷いがあればHOLDを選び、"
     "保有根拠が明確に崩れたと判断したときだけCLOSEを選ぶこと。"
+    "position.trade_horizon は建玉時にトレーダーが宣言した時間軸で、INTRADAY は H1 ATR、SWING は H4 ATR を基準に "
+    "SL/TP が置かれている(atr_at_entry / atr_timeframe がその値)。SWING の建玉は H1 の逆行を織り込んで SL が置かれているので、"
+    "保有根拠が崩れたかどうかはその時間軸(H4/D1 の構造)で判断する。UNKNOWN は時間軸の記録が無い建玉。"
     "必ず evaluate_position_action 関数を呼び出して返答してください。"
 )
 

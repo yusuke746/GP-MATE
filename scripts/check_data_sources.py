@@ -77,6 +77,24 @@ def check_fred() -> None:
         print(f"      {key:<10} {SERIES_MAP[key]:<9} value={block.get('value')} 30d={block.get('change_30d')} 5d={block.get('change_5d')} as_of={block.get('as_of')}")
 
 
+def check_yahoo_yields() -> None:
+    print("\n[Yahoo treasury yields (same-day)]")
+    from agents.data.yahoo_rates import YIELD_SYMBOLS, get_treasury_yields_snapshot
+
+    snap = get_treasury_yields_snapshot()
+    meta = snap.get("_meta", {})
+    _line("get_treasury_yields_snapshot", bool(meta.get("ok")), f"error={meta.get('error') or '-'} warnings={meta.get('warnings')}")
+    for key, symbol in YIELD_SYMBOLS.items():
+        block = snap.get(key)
+        if not isinstance(block, dict):
+            print(f"      {key:<10} {symbol:<7} unavailable")
+            continue
+        print(
+            f"      {key:<10} {symbol:<7} value={block.get('value')} 1d={block.get('change_1d')} 5d={block.get('change_5d')} "
+            f"30d={block.get('change_30d')} as_of={str(block.get('as_of'))[:16]} stale_min={block.get('stale_minutes')}"
+        )
+
+
 def check_positioning() -> None:
     print("\n[Positioning]")
     cot = fetch_cot_gold()
@@ -108,6 +126,7 @@ def main() -> int:
     check_feeds()
     check_calendar()
     check_fred()
+    check_yahoo_yields()
     check_positioning()
     if not args.no_mt5:
         check_mt5_dollar_index()

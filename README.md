@@ -39,7 +39,7 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 
 1. Connection check (no trading):
    - `python scripts/check_connection.py`
-   - Data-source health (RSS feeds, economic calendar, FRED, CFTC COT, GLD holdings, MT5 dollar index):
+   - Data-source health (RSS feeds, economic calendar, FRED, Yahoo same-day yields, CFTC COT, GLD holdings, MT5 dollar index):
      `python scripts/check_data_sources.py`
 2. Manual single run (with order confirmation):
    - `python scripts/run_manual.py`
@@ -75,6 +75,11 @@ gaps) and answers with D1 / execution trend, alignment, a `regime_view`
 invalidation price. The macro analyst receives the FRED / dollar-index /
 positioning / release data with provenance notes only (what a series is and how
 fresh it is, not what it means for gold) and answers with `macro_bias`,
+US Treasury yields come same-day from Yahoo Finance (`^TNX`, `^TYX`, `^FVX`,
+`2YY=F`; no key) with `change_1d` and `stale_minutes`, because the FRED closes
+arrive a day late and the 2026-10-08 losses were taken against a bond-market
+reversal that FRED could not show yet; the FRED values stay under `*_fred`.
+The analyst answers with `macro_bias`,
 `regime_view` and an invalidation condition; it is not asked for a confidence
 number. The sentiment analyst is asked what is *new* in the headlines and
 whether it supports continuation or reversal. Rule-based reads survive only as
@@ -149,6 +154,29 @@ says TRANSITION is recorded with `chair_overrode_majority`.
   (IMPULSE / PULLBACK / REVERSAL_ATTEMPT / NOISE) and
   `timeframe_relationship`, so an H1 dip inside an H4 uptrend can be read as a
   pullback instead of a divergence.
+
+## Trade horizon (INTRADAY / SWING)
+
+The panel's thesis is usually a D1/H4 read, but every execution rule used to be
+measured in the H1 ATR, so a swing idea was given an hourly-sized stop and was
+stopped by noise before the idea could play out. The trader now declares
+`trade_horizon` with every decision:
+
+- `INTRADAY` (default when absent): SL box (1.0–1.5 ATR), 2R TP cap and the
+  pending-trigger distance (0.1–3.0 ATR) are measured in the **H1 ATR**.
+- `SWING`: the same rules are measured in the **H4 ATR** (falls back to H1 when
+  no H4 ATR is available; the log says which one was used).
+
+The prompt only states these facts; which horizon fits is the trader's call.
+The lot still targets `RISK_PERCENT`; because the 0.01-lot floor can make a
+wide (SWING) stop risk more than that, the realised risk is reported as
+`effective_risk_pct` and the order is skipped with `skipped_risk_cap` when it
+exceeds `MAX_RISK_PERCENT` (default 0.02). The horizon and ATR of every sent
+order are stored per ticket in `logs/trade_meta.json`, so the position
+evaluator sees `position.trade_horizon` / `atr_at_entry` and judges the
+holding on the timescale it was planned on (`UNKNOWN` for older tickets).
+Trade-log columns: `trade_horizon`, `atr_timeframe`, `atr_used`,
+`effective_risk_pct`.
 
 ## Regime (Trend vs Range)
 

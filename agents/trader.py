@@ -5,6 +5,7 @@ from typing import Any
 
 from agents.base import decision_model, get_default_client
 from indicators.price_levels import resolve_level
+from risk.risk_manager import normalize_horizon
 from config import SYMBOL
 
 SYSTEM_PROMPT = (
@@ -24,11 +25,17 @@ SYSTEM_PROMPT = (
     "pending_orders は最大1件が採用され、レジームに応じて受理される: TREND では direction_if_trend 側の注文のみ、"
     "RANGE では帯の端の LIMIT のみ(方向バイアスは不要、STOP は受理されない)、TRANSITION では受理されない。"
     "指値のトリガーは現値から 0.1〜3.0 ATR の範囲にあるものだけが発注され、NY 11:00〜16:45 の判断では指値は発注されない。"
+    "【時間軸】trade_horizon は、この判断の根拠が置かれている時間軸の宣言で、以下の距離計算に使う ATR を決める: "
+    "INTRADAY は H1 ATR(technical.direction_context.h1.atr_14)、SWING は H4 ATR(同 h4.atr_14)。"
+    "D1/H4 の流れを根拠にした判断を INTRADAY にすると、SL は H1 の値幅で置かれ、その流れが実現する前に H1 のノイズで止まる。"
+    "SWING は SL が広くなる分ロットが小さくなり、最小ロット 0.01 でも口座の 1% を超えることがある(上限 2% まで許容、超えると発注されない)。"
+    "宣言が無ければ INTRADAY として扱われる。市場注文と指値の両方に同じ trade_horizon が適用される。"
     "SL: 基準は ATR×1.5。suggested_sl は『シナリオ否定点』の構造水準そのもの(ヒゲ抜け用のバッファはシステムが付与する)で、"
     "バッファ後の距離が 1.0〜1.5 ATR に収まるときだけ採用され、それ以外は ATR×1.5 になる。null なら ATR×1.5。"
     "TP: suggested_tp は 2R が上限で、超える分は 2R に丸められる。null なら 2R。"
     "スプレッド控除後のリスクリワードが 1.5 未満の注文は発注されない。その場合、TP を遠ざけるより、より有利な水準の指値に替えるか見送る方が通る。"
-    "【書き方】action が BUY/SELL なら suggested_tp_level_id と suggested_sl_level_id を指定し、根拠を suggested_tp_basis / suggested_sl_basis に書く。"
+    "【書き方】trade_horizon(INTRADAY / SWING)を宣言し、その時間軸を選んだ理由が reasoning から読めるようにする。"
+    "action が BUY/SELL なら suggested_tp_level_id と suggested_sl_level_id を指定し、根拠を suggested_tp_basis / suggested_sl_basis に書く。"
     "HOLD で条件付きの計画があるなら pending_orders に1件(type, entry_level_id, 任意の tp_level_id / sl_level_id, basis)。"
     "ブレイク待ちは BUY_STOP / SELL_STOP、押し目・戻り・帯の端待ちは BUY_LIMIT / SELL_LIMIT。"
     "directional_bias / bias_strength / trigger_conditions は方向の見方があれば書き、無ければ NEUTRAL / 0 / []。"
@@ -48,6 +55,11 @@ PLACE_TRADE_ORDER_SCHEMA: dict[str, Any] = {
             "symbol": {"type": "string"},
             "reasoning": {"type": "string", "description": "判断根拠（日本語）"},
             "risk_level": {"type": "string", "enum": ["LOW", "MID", "HIGH"]},
+            "trade_horizon": {
+                "type": "string",
+                "enum": ["INTRADAY", "SWING"],
+                "description": "判断の根拠が置かれている時間軸。INTRADAY=H1 ATR、SWING=H4 ATR で SL/TP/指値距離が計算される",
+            },
             "directional_bias": {"type": "string", "enum": ["BULLISH", "BEARISH", "NEUTRAL"]},
             "bias_strength": {"type": "number", "description": "方向性バイアスの強さ0-1"},
             "trigger_conditions": {"type": "array", "items": {"type": "string"}, "description": "バイアス発動の価格条件"},
@@ -446,6 +458,9 @@ def decide_trade(
     # Not requested; if the model volunteers one it is logged, never used.
     payload["confidence"] = _safe_float_or_none(payload.get("confidence"))
     payload["risk_level"] = risk_level
+    # The declared horizon picks the ATR (H1 / H4) the execution geometry is
+    # measured in; main.run_once applies it to market and pending orders.
+    payload["trade_horizon"] = normalize_horizon(payload.get("trade_horizon"))
 
     current_price = _extract_current_price_for_tp_sanity(technical_report)
     price_levels, atr_h1 = _levels_and_atr(technical_report)

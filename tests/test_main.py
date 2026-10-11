@@ -1730,3 +1730,220 @@ def test_decision_layers_take_direction_from_a_range_fade_order() -> None:
     trader = {"directional_bias": "NEUTRAL", "pending_orders": [{"type": "SELL_LIMIT", "price": 4164.88}]}
     layers = main._decision_layers({}, range_panel, trader, final_action="HOLD", order_sent=False, market_filter_ok=True, market_filter_reason="OK", pending_status="placed")
     assert layers == {"market_state": "RANGE", "direction": "DOWN", "setup": "FADE", "executability": "WAIT", "executability_reason": "pending order placed, waiting for the trigger"}
+
+
+def _tf_rates(atr_by_tf: dict[str, float]) -> Any:
+    """get_rates stub whose ATR depends on the timeframe (H1 vs H4 vs D1)."""
+
+    def _rates(symbol, tf, bars):
+        atr = atr_by_tf.get(str(tf).upper(), 2.0)
+        return pd.DataFrame(
+            [
+                {
+                    "close": 100.0,
+                    "rsi_14": 58.0,
+                    "macd": 1.0,
+                    "macd_signal": 0.5,
+                    "macd_hist": 0.5,
+                    "bb_upper": 110.0,
+                    "bb_mid": 100.0,
+                    "bb_lower": 90.0,
+                    "atr_14": atr,
+                    "recent_high_20": 111.0,
+                    "recent_low_20": 89.0,
+                }
+            ]
+            * main.MIN_CONFIRMED_BARS
+        )
+
+    return _rates
+
+
+def _trader_stub(**fields: Any):
+    def _decide(technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None):
+        return {
+            "action": "BUY",
+            "reasoning": "test",
+            "risk_level": "MID",
+            "_meta": {"model": "decision-test", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+            **fields,
+        }
+
+    return _decide
+
+
+def test_run_once_swing_horizon_executes_on_h4_atr_and_records_the_horizon(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "get_rates", _tf_rates({"H1": 2.0, "H4": 6.0, "D1": 15.0}))
+    seen: dict[str, Any] = {}
+
+    def _risk_plan(action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs):
+        seen["atr"] = atr
+        return {"ok": True, "action": action, "lot": 0.01, "sl": entry_price - 9.0, "tp": entry_price + 18.0, "effective_risk_pct": 0.015, "reason": "OK"}
+
+    monkeypatch.setattr(main, "build_risk_plan", _risk_plan)
+    monkeypatch.setattr(main, "send_order", lambda symbol, action, lot, sl, tp: {"success": True, "retcode": "0", "order": 4242})
+    monkeypatch.setattr(main, "decide_trade", _trader_stub(trade_horizon="SWING"))
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "BUY"
+    assert seen["atr"] == 6.0  # H4 ATR, not the H1 2.0
+    row = _read_single_row(log_path)
+    assert row["trade_horizon"] == "SWING" and row["atr_timeframe"] == "H4" and row["atr_used"] == "6.0"
+    assert row["effective_risk_pct"] == "0.015"
+    # The horizon is remembered per ticket so the position evaluator sees it later.
+    stored = json.loads((tmp_path / main.TRADE_META_FILENAME).read_text(encoding="utf-8"))
+    assert stored["4242"]["trade_horizon"] == "SWING" and stored["4242"]["atr_timeframe"] == "H4"
+    assert stored["4242"]["atr_used"] == 6.0 and stored["4242"]["entry_kind"] == "market"
+    context = main._position_context_from_details({"ticket": 4242, "symbol": "GOLD#", "type": "BUY", "price_open": 100.0}, 1)
+    assert context["trade_horizon"] == "SWING" and context["atr_timeframe"] == "H4" and context["atr_at_entry"] == 6.0
+
+
+def test_run_once_defaults_to_intraday_h1_atr_when_no_horizon_declared(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "get_rates", _tf_rates({"H1": 2.0, "H4": 6.0}))
+    seen: dict[str, Any] = {}
+
+    def _risk_plan(action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs):
+        seen["atr"] = atr
+        return {"ok": True, "action": action, "lot": 0.01, "sl": 97.0, "tp": 106.0, "reason": "OK"}
+
+    monkeypatch.setattr(main, "build_risk_plan", _risk_plan)
+    monkeypatch.setattr(main, "decide_trade", _trader_stub())
+
+    main.run_once(baseline_spread=10.0)
+
+    assert seen["atr"] == 2.0
+    row = _read_single_row(log_path)
+    assert row["trade_horizon"] == "INTRADAY" and row["atr_timeframe"] == "H1" and row["atr_used"] == "2.0"
+
+
+def test_run_once_swing_falls_back_to_h1_atr_when_h4_atr_missing(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "get_rates", _tf_rates({"H1": 2.0, "H4": 0.0}))
+    seen: dict[str, Any] = {}
+
+    def _risk_plan(action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs):
+        seen["atr"] = atr
+        return {"ok": True, "action": action, "lot": 0.01, "sl": 97.0, "tp": 106.0, "reason": "OK"}
+
+    monkeypatch.setattr(main, "build_risk_plan", _risk_plan)
+    monkeypatch.setattr(main, "decide_trade", _trader_stub(trade_horizon="SWING"))
+
+    main.run_once(baseline_spread=10.0)
+
+    assert seen["atr"] == 2.0
+    row = _read_single_row(log_path)
+    assert row["trade_horizon"] == "SWING" and row["atr_timeframe"] == "H1"  # the log says which ATR was really used
+
+
+def test_run_once_skips_market_order_when_risk_cap_is_exceeded(tmp_path: Path, monkeypatch) -> None:
+    log_path = _patch_run_once_common(monkeypatch, tmp_path)
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(main, "send_order", lambda **kwargs: sent.append(kwargs) or {"success": True, "retcode": "0", "order": 1})
+    monkeypatch.setattr(
+        main,
+        "build_risk_plan",
+        lambda action, entry_price, atr, balance_jpy, suggested_tp=None, suggested_sl=None, jpy_usd_rate=None, **kwargs: {
+            "ok": False,
+            "action": "HOLD",
+            "lot": 0.01,
+            "sl": 91.0,
+            "tp": 118.0,
+            "effective_risk_pct": 0.031,
+            "reason": "risk_cap",
+        },
+    )
+    monkeypatch.setattr(main, "decide_trade", _trader_stub(trade_horizon="SWING"))
+
+    result = main.run_once(baseline_spread=10.0)
+
+    assert result["action"] == "HOLD" and sent == []
+    row = _read_single_row(log_path)
+    assert row["filter_reason"] == "skipped_risk_cap" and row["allowed"] == "False"
+    assert row["executability"] == "BLOCKED" and row["executability_reason"] == "skipped_risk_cap"
+    assert row["effective_risk_pct"] == "0.031" and row["trade_horizon"] == "SWING"
+    assert not (tmp_path / main.TRADE_META_FILENAME).exists()
+
+
+def test_handle_pending_orders_uses_horizon_atr_and_records_meta(tmp_path: Path, monkeypatch) -> None:
+    log_path, placed = _pending_common(monkeypatch, tmp_path)
+
+    # With the H1 ATR (15) this trigger is 6.9 ATR away and would be skipped;
+    # on the SWING horizon the H4 ATR (45) puts it at 2.3 ATR.
+    outcome = main._handle_pending_orders(
+        pendings=[{"type": "BUY_LIMIT", "price": 4300.0, "tp": None, "basis": "H4押し目"}],
+        current_price=4404.0,
+        atr=45.0,
+        spread=10.0,
+        baseline_spread=10.0,
+        consecutive_losses=0,
+        daily_loss_pct=0.0,
+        balance=1_000_000.0,  # 0.01 lot on a 67.5 USD stop ~ 1.0% here (2.5% on 400k would hit the cap)
+        trader_confidence=None,
+        now_iso="2026-10-12T12:00:00+00:00",
+        trade_horizon="SWING",
+        atr_timeframe="H4",
+    )
+
+    assert outcome["status"] == "placed" and len(placed) == 1
+    assert outcome["fields"]["trade_horizon"] == "SWING" and outcome["fields"]["atr_timeframe"] == "H4"
+    assert outcome["fields"]["atr_used"] == 45.0
+    main._append_trade_log(outcome["log_row"])
+    row = _read_single_row(log_path)
+    assert row["trade_horizon"] == "SWING" and row["atr_used"] == "45.0"
+    stored = json.loads((tmp_path / main.TRADE_META_FILENAME).read_text(encoding="utf-8"))
+    assert stored["777"]["trade_horizon"] == "SWING" and stored["777"]["entry_kind"] == "pending"
+    assert stored["777"]["order_type"] == "BUY_LIMIT" and stored["777"]["entry_price"] == 4300.0
+
+
+def test_handle_pending_orders_reports_risk_cap(tmp_path: Path, monkeypatch) -> None:
+    _, placed = _pending_common(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        main,
+        "build_risk_plan",
+        lambda **kwargs: {"ok": False, "action": "HOLD", "lot": 0.01, "sl": 1.0, "tp": 2.0, "effective_risk_pct": 0.04, "reason": "risk_cap"},
+    )
+
+    outcome = main._handle_pending_orders(
+        pendings=[{"type": "BUY_LIMIT", "price": 4382.45, "tp": None, "basis": "x"}],
+        current_price=4404.0,
+        atr=15.0,
+        spread=10.0,
+        baseline_spread=10.0,
+        consecutive_losses=0,
+        daily_loss_pct=0.0,
+        balance=400_000.0,
+        trader_confidence=None,
+        now_iso="2026-10-12T12:00:00+00:00",
+    )
+
+    assert outcome["status"] == "skipped_risk_cap" and placed == []
+    assert outcome["fields"]["effective_risk_pct"] == 0.04
+
+
+def test_position_context_without_meta_reports_unknown_horizon(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    context = main._position_context_from_details({"ticket": 99, "symbol": "GOLD#", "type": "SELL", "price_open": 4100.0}, 1)
+    assert context["trade_horizon"] == "UNKNOWN" and context["atr_timeframe"] == "" and context["atr_at_entry"] is None
+
+
+def test_remember_trade_meta_prunes_stale_entries_and_survives_bad_files(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    path = tmp_path / main.TRADE_META_FILENAME
+    old = (datetime.now(main.UTC) - main.timedelta(days=main.TRADE_META_STALE_DAYS + 1)).isoformat()
+    path.write_text(json.dumps({"1": {"trade_horizon": "SWING", "recorded_at_utc": old}, "2": {"trade_horizon": "INTRADAY"}}), encoding="utf-8")
+
+    main._remember_trade_meta(3, {"trade_horizon": "SWING"})
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert "1" not in stored and stored["2"]["trade_horizon"] == "INTRADAY" and stored["3"]["trade_horizon"] == "SWING"
+    assert stored["3"]["recorded_at_utc"]
+    main._remember_trade_meta(None, {"trade_horizon": "SWING"})  # no ticket: ignored
+    main._remember_trade_meta(0, {"trade_horizon": "SWING"})
+    assert set(json.loads(path.read_text(encoding="utf-8"))) == {"2", "3"}
+    path.write_text("{not json", encoding="utf-8")
+    assert main._trade_meta_for(3) == {}
+    main._remember_trade_meta(4, {"trade_horizon": "INTRADAY"})  # unreadable store is replaced, not raised on
+    assert json.loads(path.read_text(encoding="utf-8"))["4"]["trade_horizon"] == "INTRADAY"
