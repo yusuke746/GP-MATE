@@ -76,13 +76,14 @@ def test_get_treasury_yields_snapshot_requires_the_10y_and_lists_missing_symbols
             return _payload(symbol, [5.2, 5.3, 5.17], last_day, live=5.17, live_time=datetime(2026, 10, 8, 21, 0))
         if symbol == "^TYX":
             return _payload(symbol, [5.6, 5.7, 5.55], last_day, live=5.55, live_time=datetime(2026, 10, 8, 21, 0))
-        return None  # 2YY=F and ^FVX unreachable
+        return None  # ^FVX unreachable
 
     snap = get_treasury_yields_snapshot(now=datetime(2026, 10, 8, 22, 0, tzinfo=UTC), fetch=_fetch)
     assert snap["_meta"]["ok"] is True and snap["_meta"]["cached"] is False
     assert set(snap) == {"us10y", "us30y", "_meta"}
     assert snap["us10y"]["value"] == 5.17 and snap["us30y"]["source"] == "yahoo:^TYX"
-    assert sorted(snap["_meta"]["warnings"]) == ["us2y (2YY=F) unavailable", "us5y (^FVX) unavailable"]
+    assert snap["_meta"]["warnings"] == ["us5y (^FVX) unavailable"]
+    assert "us2y" not in yahoo_rates.YIELD_SYMBOLS  # stays on FRED DGS2
 
     failed = get_treasury_yields_snapshot(now=datetime(2026, 10, 8, 22, 0, tzinfo=UTC), fetch=lambda symbol: None)
     assert failed["_meta"]["ok"] is False and "us10y" in failed["_meta"]["error"]
@@ -151,3 +152,27 @@ def test_macro_analyst_data_notes_explain_live_yields_without_directional_words(
         assert key in DATA_NOTES
     for forbidden in ("ポジティブ", "ネガティブ", "追い風", "逆風"):
         assert forbidden not in " ".join(DATA_NOTES.values())
+
+
+def test_get_treasury_yields_snapshot_drops_dead_symbols_with_stale_quotes() -> None:
+    # Seen on 2026-10-11: a future whose last quote was 18 days old and 0.3pt
+    # off the real yield. A weekend-old quote (Friday close read on Saturday)
+    # is fine; an 18-day-old one is dropped so FRED is used for that key.
+    last_day = datetime(2026, 10, 9, 20, 0)
+
+    def _fetch(symbol: str):
+        if symbol == "^TNX":
+            return _payload(symbol, [5.2, 5.3, 5.244], last_day, live=5.244, live_time=datetime(2026, 10, 9, 18, 59))
+        if symbol == "DEAD=F":
+            return _payload(symbol, [4.4, 4.41, 4.422], datetime(2026, 9, 22, 18, 0), live=4.422, live_time=datetime(2026, 9, 22, 18, 45))
+        return None
+
+    snap = get_treasury_yields_snapshot(
+        now=datetime(2026, 10, 11, 5, 36, tzinfo=UTC),
+        fetch=_fetch,
+        symbols={"us10y": "^TNX", "us2y": "DEAD=F"},
+    )
+    assert snap["_meta"]["ok"] is True
+    assert "us10y" in snap and snap["us10y"]["stale_minutes"] > 2000  # Saturday: Friday close, kept
+    assert "us2y" not in snap
+    assert any(w.startswith("us2y (DEAD=F) stale") for w in snap["_meta"]["warnings"])

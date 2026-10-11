@@ -36,12 +36,16 @@ CHART_INTERVAL: Final[str] = "1d"
 CACHE_TTL_SECONDS: Final[int] = 600
 
 # Macro key -> Yahoo symbol. ^TNX/^TYX/^FVX are quoted in percent (4.25 = 4.25%).
+# The 2-year has no live Yahoo index: the yield future 2YY=F was found 18 days
+# stale and 0.3pt off FRED on 2026-10-11, so the 2-year stays on FRED DGS2.
 YIELD_SYMBOLS: Final[dict[str, str]] = {
-    "us2y": "2YY=F",
     "us5y": "^FVX",
     "us10y": "^TNX",
     "us30y": "^TYX",
 }
+# A quote older than this (a long weekend plus a holiday) is a dead symbol,
+# not a fresh read; it is dropped so the FRED close is used instead.
+MAX_STALE_MINUTES: Final[float] = 5 * 24 * 60.0
 # Without the 10-year the snapshot is not worth replacing FRED with.
 REQUIRED_KEYS: Final[frozenset[str]] = frozenset({"us10y"})
 
@@ -209,6 +213,10 @@ def get_treasury_yields_snapshot(
             snapshot = None
         if snapshot is None:
             warnings.append(f"{key} ({symbol}) unavailable")
+            continue
+        stale = snapshot.get("stale_minutes")
+        if stale is not None and float(stale) > MAX_STALE_MINUTES:
+            warnings.append(f"{key} ({symbol}) stale: quote is {float(stale) / 1440.0:.1f} days old")
             continue
         out[key] = snapshot
 
