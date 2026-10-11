@@ -145,3 +145,23 @@ def test_evaluate_position_schema_and_prompt_do_not_ask_for_confidence() -> None
     schema = fake_client.call_function.call_args.kwargs["function_schema"]
     assert "confidence" not in schema["parameters"]["properties"]
     assert "確信度の数値は求めない" in fake_client.call_function.call_args.kwargs["system_prompt"]
+
+
+def test_evaluate_position_passes_the_trade_horizon_to_the_model() -> None:
+    import json
+
+    from agents.evaluate_position import SYSTEM_PROMPT
+
+    fake_client = Mock()
+    fake_client.call_function.return_value = _fake_result("HOLD", 0.5)
+    with patch("agents.evaluate_position.get_default_client", return_value=fake_client):
+        evaluate_position(
+            position_context={"symbol": "GOLD#", "type": "SELL", "price_open": 4155.0, "profit": -20.0, "trade_horizon": "SWING", "atr_timeframe": "H4", "atr_at_entry": 31.2},
+            technical_report={"signal": "BUY"},
+            sentiment_report={"score": 0.1},
+            debate_report={"judge_summary": {"stronger_side": "bull"}},
+        )
+
+    sent = json.loads(fake_client.call_function.call_args.kwargs["user_prompt"])
+    assert sent["position"]["trade_horizon"] == "SWING" and sent["position"]["atr_at_entry"] == 31.2
+    assert "position.trade_horizon" in SYSTEM_PROMPT and "SWING は H4 ATR" in SYSTEM_PROMPT and "UNKNOWN" in SYSTEM_PROMPT

@@ -68,7 +68,7 @@ from indicators.horizontal_levels import build_horizontal_levels
 from indicators.price_levels import build_price_levels
 from indicators.regime import classify_regime
 from indicators.structure import build_structure_context
-from risk.risk_manager import build_risk_plan, check_filters
+from risk.risk_manager import build_risk_plan, check_filters, normalize_horizon, select_atr
 from risk.breakeven import should_move_to_breakeven
 
 LOGGER = logging.getLogger(__name__)
@@ -78,6 +78,12 @@ TRADE_LOG_PATH = LOG_DIR / "trade_log.csv"
 CLOSED_DEAL_STATE_PATH = LOG_DIR / "closed_deal_state.json"
 EXCURSION_STATE_FILENAME = "position_excursions.json"
 EXCURSION_STALE_DAYS = 14
+# Per-ticket facts fixed at order time (trade horizon, ATR used) that MT5
+# does not keep, so the position evaluator sees the horizon the trade was
+# planned on. Keyed by order ticket (= position ticket for market and
+# pending entries).
+TRADE_META_FILENAME = "trade_meta.json"
+TRADE_META_STALE_DAYS = 30
 
 # TP reference proximity in USD. Used only for TP-target confluence labels.
 TP_PROXIMITY_ROUND_NUMBER = 5.0
@@ -203,6 +209,10 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "tp_level_id",
     "sl_level_id",
     "analyst_data_quality",
+    "trade_horizon",
+    "atr_timeframe",
+    "atr_used",
+    "effective_risk_pct",
 )
 
 # Fewest closed bars a judgment may be based on (indicators need ~26 for
@@ -1168,9 +1178,63 @@ def _blocked_hold_result(
     return result
 
 
+def _trade_meta_path() -> Path:
+    # Derived from LOG_DIR at call time so tests can redirect it.
+    return LOG_DIR / TRADE_META_FILENAME
+
+
+def _load_trade_meta() -> dict[str, dict[str, Any]]:
+    path = _trade_meta_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.warning("trade_meta unreadable; ignoring: %s", exc)
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def _remember_trade_meta(ticket: Any, meta: dict[str, Any]) -> None:
+    """Persist order-time facts for ``ticket`` (never raises)."""
+    try:
+        ticket_key = str(int(ticket))
+    except (TypeError, ValueError):
+        return
+    if ticket_key in {"", "0"}:
+        return
+    try:
+        store = _load_trade_meta()
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=TRADE_META_STALE_DAYS)
+        kept: dict[str, dict[str, Any]] = {}
+        for key, value in store.items():
+            recorded = str(value.get("recorded_at_utc", "") or "")
+            try:
+                if recorded and datetime.fromisoformat(recorded) < cutoff:
+                    continue
+            except ValueError:
+                pass
+            kept[key] = value
+        kept[ticket_key] = {**meta, "recorded_at_utc": now.isoformat()}
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _trade_meta_path().write_text(json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        LOGGER.warning("trade_meta write failed safely: %s", exc)
+
+
+def _trade_meta_for(ticket: Any) -> dict[str, Any]:
+    try:
+        return dict(_load_trade_meta().get(str(int(ticket)), {}))
+    except (TypeError, ValueError):
+        return {}
+
+
 def _position_context_from_details(details: dict[str, Any], position_count: int) -> dict[str, Any]:
-    return {
-        "ticket": int(details.get("ticket") or 0),
+    ticket = int(details.get("ticket") or 0)
+    meta = _trade_meta_for(ticket)
+    context = {
+        "ticket": ticket,
         "symbol": str(details.get("symbol") or SYMBOL),
         "type": str(details.get("type") or "UNKNOWN"),
         "volume": float(details.get("volume") or 0.0),
@@ -1180,11 +1244,29 @@ def _position_context_from_details(details: dict[str, Any], position_count: int)
         "tp": float(details.get("tp") or 0.0),
         "profit": float(details.get("profit") or 0.0),
         "position_count": int(position_count),
+        # Horizon the trade was planned on (UNKNOWN for tickets opened before
+        # the meta store existed); the evaluator judges on that timescale.
+        "trade_horizon": str(meta.get("trade_horizon") or "UNKNOWN"),
+        "atr_timeframe": str(meta.get("atr_timeframe") or ""),
+        "atr_at_entry": meta.get("atr_used"),
+        "planned_at_utc": str(meta.get("recorded_at_utc") or ""),
+    }
+    return context
+
+
+def _horizon_log_fields(trade_horizon: str, atr_timeframe: str, atr_used: float, risk_plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    risk = (risk_plan or {}).get("effective_risk_pct", "")
+    return {
+        "trade_horizon": trade_horizon,
+        "atr_timeframe": atr_timeframe,
+        "atr_used": round(float(atr_used), 5) if atr_used not in (None, "") else "",
+        "effective_risk_pct": risk if risk not in (None, "") else "",
     }
 
 
 # Pending-order placement guards: the trigger level must be a meaningful
-# distance from the current price (in H1 ATR units), but still reachable.
+# distance from the current price (in ATR units of the trade horizon: H1 for
+# INTRADAY, H4 for SWING), but still reachable.
 PENDING_MIN_DISTANCE_ATR = 0.1
 PENDING_MAX_DISTANCE_ATR = 3.0
 
@@ -1368,12 +1450,16 @@ def _handle_pending_orders(
     trader_confidence: Any,
     now_iso: str,
     spread_usd: float = 0.0,
+    trade_horizon: str = "INTRADAY",
+    atr_timeframe: str = "H1",
 ) -> dict[str, Any]:
     """Place the trader's conditional entry as a broker-side pending order.
 
     Runs only on trader-intent HOLD with a validated pending plan. All risk
     filters except the confidence threshold apply (a pending order fills only
-    after the market confirms the price condition). Never raises.
+    after the market confirms the price condition). ``atr`` is the ATR of the
+    declared ``trade_horizon`` (H1 or H4); distance guard, SL box and TP cap
+    all scale with it. Never raises.
 
     Returns {"status": <str>, "log_row": <dict | None>}. ``status`` is
     recorded on the parent HOLD row so unplaced plans stay auditable in the
@@ -1442,11 +1528,18 @@ def _handle_pending_orders(
             jpy_usd_rate=jpy_usd_rate,
             spread_usd=spread_usd,
         )
-        plan_fields = {**intent, **_risk_plan_log_fields(risk_plan)}
+        plan_fields = {
+            **intent,
+            **_risk_plan_log_fields(risk_plan),
+            **_horizon_log_fields(trade_horizon, atr_timeframe, atr, risk_plan),
+        }
         if not bool(risk_plan.get("ok")):
             reason = str(risk_plan.get("reason", "") or "")
             LOGGER.info("Pending order skipped: risk plan failed (%s)", reason)
-            status = "skipped_low_rr" if reason == "low_rr" else f"skipped_risk_plan:{reason}"
+            if reason in {"low_rr", "risk_cap"}:
+                status = f"skipped_{reason}"
+            else:
+                status = f"skipped_risk_plan:{reason}"
             return {"status": status, "log_row": None, "fields": plan_fields}
 
         order_result = place_pending_order(
@@ -1483,12 +1576,29 @@ def _handle_pending_orders(
         }
         if placed:
             LOGGER.info(
-                "Pending order placed: %s @ %.2f lot=%.2f sl=%.2f tp=%.2f",
+                "Pending order placed: %s @ %.2f lot=%.2f sl=%.2f tp=%.2f horizon=%s atr=%.2f(%s)",
                 order_type,
                 price,
                 float(risk_plan["lot"]),
                 float(risk_plan["sl"]),
                 float(risk_plan["tp"]),
+                trade_horizon,
+                atr,
+                atr_timeframe,
+            )
+            _remember_trade_meta(
+                order_result.get("order"),
+                {
+                    "trade_horizon": trade_horizon,
+                    "atr_timeframe": atr_timeframe,
+                    "atr_used": round(float(atr), 5),
+                    "entry_kind": "pending",
+                    "order_type": order_type,
+                    "entry_price": price,
+                    "sl": float(risk_plan.get("sl", 0.0) or 0.0),
+                    "tp": float(risk_plan.get("tp", 0.0) or 0.0),
+                    "basis": basis,
+                },
             )
         return {"status": "placed" if placed else "order_failed", "log_row": log_row, "fields": plan_fields}
     except Exception as exc:
@@ -1921,7 +2031,13 @@ def run_once(
 
         action = str(trader_report.get("action", "HOLD"))
         entry_price = float(h1.iloc[-1].get("close", 0.0))
-        atr = float(h1.iloc[-1].get("atr_14", 0.0))
+        # The trader's declared horizon picks the ATR every distance rule is
+        # measured in: INTRADAY -> H1, SWING -> H4 (a D1/H4 thesis executed
+        # with an H1 stop was being stopped by hourly noise).
+        trade_horizon = normalize_horizon(trader_report.get("trade_horizon") if isinstance(trader_report, dict) else None)
+        atr_h1 = float(h1.iloc[-1].get("atr_14", 0.0) or 0.0)
+        atr_h4 = float(h4.iloc[-1].get("atr_14", 0.0) or 0.0)
+        atr, atr_timeframe = select_atr(trade_horizon, atr_h1, atr_h4)
 
         jpy_usd_rate: float | None = None
         if action in {"BUY", "SELL"}:
@@ -1967,6 +2083,19 @@ def run_once(
                 risk_plan.get("sl_source", ""),
                 risk_plan.get("tp_source", ""),
             )
+        elif action in {"BUY", "SELL"} and market_filter_ok and str(risk_plan.get("reason", "")) == "risk_cap":
+            # Even the minimum lot would risk more than MAX_RISK_PERCENT on
+            # this stop (typically a SWING plan on a small balance).
+            market_filter_ok = False
+            market_filter_reason = "skipped_risk_cap"
+            LOGGER.info(
+                "Market order skipped: realised risk %.2f%% at lot %.2f exceeds the cap (horizon=%s atr=%.2f %s)",
+                100.0 * float(risk_plan.get("effective_risk_pct", 0.0) or 0.0),
+                float(risk_plan.get("lot", 0.0) or 0.0),
+                trade_horizon,
+                atr,
+                atr_timeframe,
+            )
         if filter_result.ok and bool(risk_plan.get("ok")) and final_action in {"BUY", "SELL"}:
             order_result = send_order(
                 symbol=SYMBOL,
@@ -1975,6 +2104,21 @@ def run_once(
                 sl=float(risk_plan["sl"]),
                 tp=float(risk_plan["tp"]),
             )
+            if bool(order_result.get("success", False)):
+                _remember_trade_meta(
+                    order_result.get("order"),
+                    {
+                        "trade_horizon": trade_horizon,
+                        "atr_timeframe": atr_timeframe,
+                        "atr_used": round(float(atr), 5),
+                        "entry_kind": "market",
+                        "order_type": final_action,
+                        "entry_price": entry_price,
+                        "sl": float(risk_plan.get("sl", 0.0) or 0.0),
+                        "tp": float(risk_plan.get("tp", 0.0) or 0.0),
+                        "effective_risk_pct": risk_plan.get("effective_risk_pct", ""),
+                    },
+                )
         else:
             final_action = "HOLD"
 
@@ -2001,6 +2145,7 @@ def run_once(
             "sl": float(risk_plan.get("sl", 0.0) or 0.0),
             "tp": float(risk_plan.get("tp", 0.0) or 0.0),
             **_risk_plan_log_fields(risk_plan),
+            **_horizon_log_fields(trade_horizon, atr_timeframe, atr, risk_plan),
             "order_success": bool(order_result.get("success", False)),
             "retcode": order_result.get("retcode", ""),
             "prompt_tokens": usage["prompt_tokens"],
@@ -2034,6 +2179,8 @@ def run_once(
                     trader_confidence=_confidence_for_log(trader_report),
                     now_iso=now_iso,
                     spread_usd=spread_usd,
+                    trade_horizon=trade_horizon,
+                    atr_timeframe=atr_timeframe,
                 )
             else:
                 # The trader explains whether nothing was proposed or the

@@ -255,11 +255,55 @@ def test_build_risk_plan_passes_fx_rate_to_lot_calc() -> None:
     assert float(plan_low["lot"]) > float(plan_high["lot"])
 
 
-def test_build_risk_plan_small_balance_floors_to_min_lot() -> None:
-    plan = build_risk_plan(action="BUY", entry_price=2300.0, atr=100.0, balance_jpy=10_000)
-    assert plan["ok"]
-    assert plan["action"] == "BUY"
+def test_build_risk_plan_small_balance_floors_to_min_lot_then_hits_risk_cap() -> None:
+    # 0.01 lot on a $150 stop = $150 loss on a 10,000 JPY balance (~230%):
+    # the floor applies, but the realised risk is far beyond the cap.
+    plan = build_risk_plan(action="BUY", entry_price=2300.0, atr=100.0, balance_jpy=10_000, jpy_usd_rate=155.0)
+    assert plan["ok"] is False
+    assert plan["action"] == "HOLD"
+    assert plan["reason"] == "risk_cap"
     assert float(plan["lot"]) == 0.01
+    assert float(plan["effective_risk_pct"]) > 1.0
+    # SL/TP are left as computed so the log shows the geometry that was capped.
+    assert float(plan["sl"]) == 2150.0 and float(plan["tp"]) == 2600.0
+
+
+def test_build_risk_plan_accepts_min_lot_overshoot_up_to_the_cap() -> None:
+    # SWING-sized stop on a small account: 1% target would need 0.0067 lot,
+    # the 0.01 floor realises ~1.5% -> accepted (cap 2%), reported in the plan.
+    plan = build_risk_plan(action="SELL", entry_price=4000.0, atr=10.0, balance_jpy=155_000, jpy_usd_rate=155.0, max_risk_pct=0.02)
+    assert plan["ok"] is True
+    assert float(plan["lot"]) == 0.01
+    assert abs(float(plan["effective_risk_pct"]) - 0.015) < 1e-6
+    tighter = build_risk_plan(action="SELL", entry_price=4000.0, atr=10.0, balance_jpy=155_000, jpy_usd_rate=155.0, max_risk_pct=0.012)
+    assert tighter["ok"] is False and tighter["reason"] == "risk_cap"
+    disabled = build_risk_plan(action="SELL", entry_price=4000.0, atr=10.0, balance_jpy=155_000, jpy_usd_rate=155.0, max_risk_pct=0.0)
+    assert disabled["ok"] is True
+
+
+def test_realised_risk_pct_and_regular_plan_reports_it() -> None:
+    from risk.risk_manager import realised_risk_pct
+
+    assert realised_risk_pct(lot=0.01, sl_distance_usd=15.0, balance_jpy=155_000, jpy_usd_rate=155.0) == 0.015
+    assert realised_risk_pct(lot=0.0, sl_distance_usd=15.0, balance_jpy=155_000, jpy_usd_rate=155.0) == 0.0
+    assert realised_risk_pct(lot=0.01, sl_distance_usd=15.0, balance_jpy=0.0, jpy_usd_rate=155.0) == 0.0
+    plan = build_risk_plan(action="BUY", entry_price=2300.0, atr=10.0, balance_jpy=500_000, jpy_usd_rate=155.0)
+    assert plan["ok"] and 0.0 < float(plan["effective_risk_pct"]) <= 0.0105
+
+
+def test_horizon_helpers_select_h4_atr_for_swing_only() -> None:
+    from risk.risk_manager import normalize_horizon, select_atr
+
+    assert normalize_horizon("SWING") == "SWING"
+    assert normalize_horizon(" swing ") == "SWING"
+    assert normalize_horizon("INTRADAY") == "INTRADAY"
+    assert normalize_horizon(None) == "INTRADAY"
+    assert normalize_horizon("WEEKLY") == "INTRADAY"
+    assert select_atr("INTRADAY", 10.0, 30.0) == (10.0, "H1")
+    assert select_atr("SWING", 10.0, 30.0) == (30.0, "H4")
+    assert select_atr("SWING", 10.0, 0.0) == (10.0, "H1")  # no H4 ATR: fall back, say so
+    assert select_atr("SWING", 10.0, None) == (10.0, "H1")
+    assert select_atr(None, 10.0, 30.0) == (10.0, "H1")
 
 
 def test_build_risk_plan_sl_is_unchanged_with_suggested_tp() -> None:

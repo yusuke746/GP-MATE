@@ -7,6 +7,7 @@ from config import (
     CONSECUTIVE_LOSS_LIMIT,
     JPY_USD_RATE_FALLBACK,
     MAX_DAILY_LOSS_PCT,
+    MAX_RISK_PERCENT,
     MIN_RISK_REWARD_RATIO,
     RISK_PERCENT,
     RISK_REWARD_RATIO,
@@ -15,6 +16,57 @@ from config import (
 )
 
 MIN_LOT = 0.01
+CONTRACT_SIZE = 100.0
+
+# Trade horizon declared by the trader. It selects the ATR every geometry
+# rule (SL box, 2R TP cap, pending-trigger distance) is measured in, so a
+# thesis built on the D1/H4 flow is not executed with an H1-sized stop.
+HORIZON_INTRADAY = "INTRADAY"
+HORIZON_SWING = "SWING"
+TRADE_HORIZONS = (HORIZON_INTRADAY, HORIZON_SWING)
+HORIZON_TIMEFRAME = {HORIZON_INTRADAY: "H1", HORIZON_SWING: "H4"}
+
+
+def normalize_horizon(value: object) -> str:
+    """INTRADAY unless the trader explicitly said SWING."""
+    text = str(value or "").upper().strip()
+    return text if text in TRADE_HORIZONS else HORIZON_INTRADAY
+
+
+def select_atr(horizon: object, atr_h1: float, atr_h4: float) -> tuple[float, str]:
+    """-> (atr, timeframe) the plan is measured in.
+
+    SWING uses the H4 ATR; INTRADAY the H1 ATR. A missing/invalid H4 ATR
+    falls back to H1 (reported as "H1" so the log shows what was used).
+    """
+    try:
+        h1 = float(atr_h1 or 0.0)
+    except (TypeError, ValueError):
+        h1 = 0.0
+    try:
+        h4 = float(atr_h4 or 0.0)
+    except (TypeError, ValueError):
+        h4 = 0.0
+    if normalize_horizon(horizon) == HORIZON_SWING and h4 > 0:
+        return h4, "H4"
+    return h1, "H1"
+
+
+def realised_risk_pct(
+    lot: float,
+    sl_distance_usd: float,
+    balance_jpy: float,
+    jpy_usd_rate: float,
+    contract_size: float = CONTRACT_SIZE,
+) -> float:
+    """Fraction of the balance lost if the SL is hit at this lot (0.0 when unknown)."""
+    try:
+        if balance_jpy <= 0 or jpy_usd_rate <= 0 or lot <= 0 or sl_distance_usd <= 0:
+            return 0.0
+        loss_jpy = lot * sl_distance_usd * contract_size * jpy_usd_rate
+        return round(loss_jpy / balance_jpy, 6)
+    except (TypeError, ValueError):
+        return 0.0
 
 # Structural SL (suggested_sl) minimum distance in ATR units (noise-stop guard).
 # The maximum is the ATR default itself (atr * atr_mult): suggested values may
@@ -32,13 +84,14 @@ def calc_lot(
     balance_jpy: float,
     risk_pct: float,
     sl_distance_usd: float,
-    contract_size: float = 100.0,
+    contract_size: float = CONTRACT_SIZE,
     jpy_usd_rate: float = JPY_USD_RATE_FALLBACK,
 ) -> float:
     """Calculate lot size from account risk and SL distance.
 
     Returns minimum MIN_LOT (0.01) for valid inputs, so small accounts can
-    still trade; note the effective risk then exceeds risk_pct.
+    still trade; note the effective risk then exceeds risk_pct (build_risk_plan
+    caps that overshoot at MAX_RISK_PERCENT).
     Returns 0.0 when inputs are invalid to force a no-trade decision.
     """
     if balance_jpy <= 0 or risk_pct <= 0 or sl_distance_usd <= 0 or contract_size <= 0:
@@ -191,10 +244,20 @@ def build_risk_plan(
     jpy_usd_rate: float | None = None,
     min_rr: float = MIN_RISK_REWARD_RATIO,
     spread_usd: float = 0.0,
+    max_risk_pct: float = MAX_RISK_PERCENT,
 ) -> dict[str, float | str | bool]:
     """Build lot/SL/TP plan with safe fallback for invalid cases.
 
     This function never raises and is suitable for production call paths.
+
+    ``atr`` is whatever ATR the caller's trade horizon is measured in (H1 for
+    INTRADAY, H4 for SWING); every distance rule below scales with it.
+
+    The lot targets ``risk_pct`` of the balance. Because the broker's 0.01-lot
+    floor can make a wide stop risk more than that, the realised risk
+    (``effective_risk_pct``) is reported and the plan is rejected with
+    ``reason: "risk_cap"`` when it exceeds ``max_risk_pct``; up to the cap
+    the overshoot is accepted.
 
     After SL and TP are final, the reward/risk NET of the current spread is
     checked against ``min_rr``: crossing the spread costs on entry and again
@@ -313,7 +376,8 @@ def build_risk_plan(
                 "reason": "Lot calculation failed",
             }
 
-        return {
+        effective_risk = realised_risk_pct(lot, sl_distance, balance_jpy, effective_rate)
+        plan: dict[str, float | str | bool] = {
             "ok": True,
             "action": normalized_action,
             "lot": lot,
@@ -327,8 +391,14 @@ def build_risk_plan(
             "spread_cost": round(spread_cost, 5),
             "net_rr": net_rr,
             "rr_rejection_reason": "",
+            "effective_risk_pct": effective_risk,
             "reason": "OK",
         }
+        if max_risk_pct > 0 and effective_risk > max_risk_pct:
+            # The minimum lot already risks more than the cap: the stop is
+            # too wide for this balance, so the trade is reported, not sent.
+            plan.update({"ok": False, "action": "HOLD", "reason": "risk_cap"})
+        return plan
     except Exception as exc:
         return {
             "ok": False,

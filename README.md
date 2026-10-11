@@ -150,6 +150,29 @@ says TRANSITION is recorded with `chair_overrode_majority`.
   `timeframe_relationship`, so an H1 dip inside an H4 uptrend can be read as a
   pullback instead of a divergence.
 
+## Trade horizon (INTRADAY / SWING)
+
+The panel's thesis is usually a D1/H4 read, but every execution rule used to be
+measured in the H1 ATR, so a swing idea was given an hourly-sized stop and was
+stopped by noise before the idea could play out. The trader now declares
+`trade_horizon` with every decision:
+
+- `INTRADAY` (default when absent): SL box (1.0–1.5 ATR), 2R TP cap and the
+  pending-trigger distance (0.1–3.0 ATR) are measured in the **H1 ATR**.
+- `SWING`: the same rules are measured in the **H4 ATR** (falls back to H1 when
+  no H4 ATR is available; the log says which one was used).
+
+The prompt only states these facts; which horizon fits is the trader's call.
+The lot still targets `RISK_PERCENT`; because the 0.01-lot floor can make a
+wide (SWING) stop risk more than that, the realised risk is reported as
+`effective_risk_pct` and the order is skipped with `skipped_risk_cap` when it
+exceeds `MAX_RISK_PERCENT` (default 0.02). The horizon and ATR of every sent
+order are stored per ticket in `logs/trade_meta.json`, so the position
+evaluator sees `position.trade_horizon` / `atr_at_entry` and judges the
+holding on the timescale it was planned on (`UNKNOWN` for older tickets).
+Trade-log columns: `trade_horizon`, `atr_timeframe`, `atr_used`,
+`effective_risk_pct`.
+
 ## Regime (Trend vs Range)
 
 `indicators/regime.py` classifies every cycle as TREND / RANGE / TRANSITION from
