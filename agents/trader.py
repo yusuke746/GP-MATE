@@ -5,7 +5,7 @@ from typing import Any
 
 from agents.base import decision_model, get_default_client
 from indicators.price_levels import resolve_level
-from risk.risk_manager import normalize_horizon
+from risk.risk_manager import execution_geometry, normalize_horizon
 from config import SYMBOL
 
 SYSTEM_PROMPT = (
@@ -30,6 +30,8 @@ SYSTEM_PROMPT = (
     "D1/H4 の流れを根拠にした判断を INTRADAY にすると、SL は H1 の値幅で置かれ、その流れが実現する前に H1 のノイズで止まる。"
     "SWING は SL が広くなる分ロットが小さくなり、最小ロット 0.01 でも口座の 1% を超えることがある(上限 2% まで許容、超えると発注されない)。"
     "宣言が無ければ INTRADAY として扱われる。市場注文と指値の両方に同じ trade_horizon が適用される。"
+    "execution_geometry に、時間軸ごとの SL の箱(min〜max、箱の外なら default)、TP の 2R 上限、"
+    "RR 1.5 を満たすのに必要な最小 TP 距離、指値トリガーの距離範囲が USD で入っている(スプレッド込み)。"
     "SL: 基準は ATR×1.5。suggested_sl は『シナリオ否定点』の構造水準そのもの(ヒゲ抜け用のバッファはシステムが付与する)で、"
     "バッファ後の距離が 1.0〜1.5 ATR に収まるときだけ採用され、それ以外は ATR×1.5 になる。null なら ATR×1.5。"
     "TP: suggested_tp は 2R が上限で、超える分は 2R に丸められる。null なら 2R。"
@@ -173,6 +175,23 @@ def _levels_and_atr(technical_report: dict[str, Any]) -> tuple[list[dict[str, An
     levels = context.get("price_levels") if isinstance(context.get("price_levels"), list) else []
     h1 = context.get("h1") if isinstance(context.get("h1"), dict) else {}
     return levels, _safe_float_or_none(h1.get("atr_14"))
+
+
+def _execution_geometry(technical_report: dict[str, Any], spread_usd: float | None) -> dict[str, Any]:
+    """USD distances the risk manager will enforce, per horizon (facts for the trader)."""
+    context = technical_report.get("direction_context") if isinstance(technical_report, dict) else None
+    context = context if isinstance(context, dict) else {}
+    h1 = context.get("h1") if isinstance(context.get("h1"), dict) else {}
+    h4 = context.get("h4") if isinstance(context.get("h4"), dict) else {}
+    try:
+        return execution_geometry(
+            current_price=_safe_float_or_none(h1.get("close")) or 0.0,
+            atr_h1=_safe_float_or_none(h1.get("atr_14")) or 0.0,
+            atr_h4=_safe_float_or_none(h4.get("atr_14")) or 0.0,
+            spread_usd=spread_usd,
+        )
+    except Exception:
+        return {}
 
 
 def _anchor(levels: list[dict[str, Any]], level_id: Any, price: Any, atr: float | None) -> dict[str, Any]:
@@ -389,6 +408,7 @@ def decide_trade(
     macro_report: dict[str, Any] | None = None,
     confidence_threshold: float | None = None,  # deprecated: no longer gates anything; kept for callers
     recent_context: dict[str, Any] | None = None,
+    spread_usd: float | None = None,
 ) -> dict[str, Any]:
     """Final decision. The trader's action stands; there is no confidence gate.
 
@@ -416,6 +436,7 @@ def decide_trade(
         "debate": _strip_debater_confidence(debate_report),
         "judge_summary": _strip_debater_confidence(judge_summary),
         "recent_context": recent_context or {"decisions": [], "recent_closed": []},
+        "execution_geometry": _execution_geometry(technical_report, spread_usd),
         "constraints": {
             "symbol": SYMBOL,
         },

@@ -226,7 +226,7 @@ def _patch_run_once_common(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> P
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -491,7 +491,7 @@ def test_run_once_uses_evaluate_position_when_position_exists(tmp_path: Path, mo
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: called.__setitem__("decide", called["decide"] + 1) or {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: called.__setitem__("decide", called["decide"] + 1) or {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -699,7 +699,7 @@ def test_run_once_without_position_keeps_decide_trade_flow(tmp_path: Path, monke
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: called.__setitem__("decide", called["decide"] + 1) or {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: called.__setitem__("decide", called["decide"] + 1) or {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "test",
@@ -875,22 +875,27 @@ def test_load_recent_decisions_summarizes_history(tmp_path: Path, monkeypatch) -
 
     log_path = tmp_path / "trade_log.csv"
     now = datetime.now(UTC)
+    fields = ["timestamp_utc", "action", "confidence", "reasoning", "directional_bias", "pnl", "position_id", "order_success", "entry_price", "exit_price", "trade_horizon", "pending_status"]
     rows = [
-        # Too old: outside the 24h window.
-        {"timestamp_utc": (now - timedelta(hours=30)).isoformat(), "action": "BUY", "confidence": "0.8", "reasoning": "old entry", "directional_bias": "BULLISH", "pnl": ""},
-        # Recent decisions.
-        {"timestamp_utc": (now - timedelta(hours=5)).isoformat(), "action": "HOLD", "confidence": "0.62", "reasoning": "過熱のため見送り", "directional_bias": "BULLISH", "pnl": ""},
+        # Too old for both windows.
+        {"timestamp_utc": (now - timedelta(days=9)).isoformat(), "action": "SELL", "confidence": "", "reasoning": "closed_trade_sync", "pnl": "-100", "position_id": "1"},
+        # Old decision (outside 24h) but its pending order opened the ticket that closed 3 days ago.
+        {"timestamp_utc": (now - timedelta(days=4)).isoformat(), "action": "BUY", "confidence": "0.8", "reasoning": "old entry", "directional_bias": "BULLISH", "pnl": ""},
+        {"timestamp_utc": (now - timedelta(days=4)).isoformat(), "action": "SELL_LIMIT", "confidence": "", "reasoning": "pending_order: 戻り売り", "position_id": "992", "order_success": "True", "entry_price": "4123.13", "trade_horizon": "SWING"},
+        {"timestamp_utc": (now - timedelta(days=3)).isoformat(), "action": "SELL", "confidence": "", "reasoning": "closed_trade_sync", "pnl": "-7151", "position_id": "992", "exit_price": "4145.84"},
+        # Recent decisions; the first has no confidence (the trader no longer reports one) and must still appear.
+        {"timestamp_utc": (now - timedelta(hours=5)).isoformat(), "action": "HOLD", "confidence": "", "reasoning": "過熱のため見送り", "directional_bias": "BULLISH", "pnl": "", "trade_horizon": "SWING", "pending_status": "skipped_low_rr"},
         {"timestamp_utc": (now - timedelta(hours=3)).isoformat(), "action": "BUY", "confidence": "0.74", "reasoning": "押し目買い", "directional_bias": "BULLISH", "pnl": ""},
-        # Realized close (loss).
-        {"timestamp_utc": (now - timedelta(hours=1)).isoformat(), "action": "SELL", "confidence": "", "reasoning": "closed_trade_sync", "directional_bias": "", "pnl": "-8468"},
+        # Realized close (loss) within 24h, no opening row known.
+        {"timestamp_utc": (now - timedelta(hours=1)).isoformat(), "action": "SELL", "confidence": "", "reasoning": "closed_trade_sync", "directional_bias": "", "pnl": "-8468", "exit_price": "4172.39"},
         # Non-decision rows must be excluded.
         {"timestamp_utc": (now - timedelta(minutes=30)).isoformat(), "action": "HOLD", "confidence": "", "reasoning": "breakeven_monitor", "directional_bias": "", "pnl": "10"},
     ]
     with log_path.open("w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=["timestamp_utc", "action", "confidence", "reasoning", "directional_bias", "pnl"])
+        writer = csv.DictWriter(fp, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow({k: row.get(k, "") for k in fields})
 
     monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
 
@@ -898,9 +903,29 @@ def test_load_recent_decisions_summarizes_history(tmp_path: Path, monkeypatch) -
 
     assert [d["action"] for d in context["decisions"]] == ["HOLD", "BUY"]
     assert context["decisions"][0]["reasoning_head"] == "過熱のため見送り"
-    assert len(context["recent_closed"]) == 1
-    assert context["recent_closed"][0]["result"] == "LOSS"
-    assert context["recent_closed"][0]["pnl"] == -8468.0
+    assert "confidence" not in context["decisions"][0] and context["decisions"][1]["confidence"] == 0.74
+    assert context["decisions"][0]["trade_horizon"] == "SWING" and context["decisions"][0]["pending_status"] == "skipped_low_rr"
+    # Closes: 7-day window, the 9-day-old one is gone; the 3-day-old loss is joined to its opening row.
+    assert [c["pnl"] for c in context["recent_closed"]] == [-7151.0, -8468.0]
+    first = context["recent_closed"][0]
+    assert first["side"] == "SELL" and first["exit_price"] == 4145.84 and first["entry_price"] == 4123.13
+    assert first["trade_horizon"] == "SWING" and first["entry_basis"].startswith("pending_order")
+    assert context["recent_closed"][1]["entry_price"] is None and context["recent_closed"][1]["result"] == "LOSS"
+
+
+def test_run_once_passes_spread_to_the_trader(tmp_path: Path, monkeypatch) -> None:
+    _patch_run_once_common(monkeypatch, tmp_path)
+    _action_aware_risk_plan(monkeypatch)
+    monkeypatch.setattr(main, "get_spread_price", lambda symbol: 0.35)
+    seen: dict[str, Any] = {}
+
+    def _trader(technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs):
+        seen.update(kwargs)
+        return {"action": "HOLD", "reasoning": "t", "risk_level": "MID", "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}}
+
+    monkeypatch.setattr(main, "decide_trade", _trader)
+    main.run_once(baseline_spread=10.0)
+    assert seen["spread_usd"] == 0.35
 
 
 def test_load_recent_decisions_missing_file_returns_empty(tmp_path: Path, monkeypatch) -> None:
@@ -1026,7 +1051,7 @@ def test_run_once_places_pending_order_on_hold_with_plan(tmp_path: Path, monkeyp
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: {
             "action": "HOLD",
             "confidence": 0.66,
             "reasoning": "押し目待ち",
@@ -1066,7 +1091,7 @@ def test_run_once_records_none_proposed_when_hold_has_no_pending_plan(tmp_path: 
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: {
             "action": "HOLD",
             "confidence": 0.7,
             "reasoning": "様子見",
@@ -1208,7 +1233,7 @@ def test_run_once_market_order_skipped_on_low_rr_is_logged(tmp_path: Path, monke
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: {
             "action": "BUY",
             "confidence": 0.8,
             "reasoning": "押し目買い",
@@ -1270,7 +1295,7 @@ def _hold_with_pending_plan(monkeypatch: pytest.MonkeyPatch, placed: list[dict[s
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: {
             "action": "HOLD",
             "confidence": 0.7,
             "reasoning": "押し目待ち",
@@ -1349,7 +1374,7 @@ def test_run_once_logs_weak_bias_drop_with_intended_order(tmp_path: Path, monkey
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: {
             "action": "HOLD",
             "confidence": 0.7,
             "reasoning": "確信弱い",
@@ -1565,7 +1590,7 @@ def test_run_once_holds_when_news_feeds_are_dead_but_trades_on_healthy_zero_news
     monkeypatch.setattr(main, "fetch_news_with_meta", lambda hours: ([], {"feeds_total": 3, "feeds_live": 0}))
     seen: dict[str, Any] = {}
 
-    def _trader(technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None):
+    def _trader(technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs):
         seen["evidence_status"] = sentiment_report.get("evidence_status")
         from agents.trader import decide_trade as real_decide  # noqa: F401  (the real trader is not called; emulate its rule)
 
@@ -1626,7 +1651,7 @@ def test_run_once_rejects_market_order_when_net_rr_after_spread_is_too_low(tmp_p
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: {
             "action": "BUY", "confidence": 0.8, "reasoning": "t", "risk_level": "MID", "suggested_tp": 104.6,
             "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
         },
@@ -1684,7 +1709,7 @@ def test_run_once_logs_layers_level_ids_and_analyst_quality(tmp_path: Path, monk
     monkeypatch.setattr(
         main,
         "decide_trade",
-        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None: {
+        lambda technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs: {
             "action": "BUY", "confidence": 0.8, "reasoning": "t", "risk_level": "MID", "suggested_tp_level_id": "ROUND_150", "suggested_sl_level_id": "H4_SWING_LOW_1",
             "_meta": {"usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
         },
@@ -1760,7 +1785,7 @@ def _tf_rates(atr_by_tf: dict[str, float]) -> Any:
 
 
 def _trader_stub(**fields: Any):
-    def _decide(technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None):
+    def _decide(technical_report, sentiment_report, debate_report, macro_report=None, recent_context=None, **kwargs):
         return {
             "action": "BUY",
             "reasoning": "test",

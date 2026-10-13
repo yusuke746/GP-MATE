@@ -178,6 +178,12 @@ evaluator sees `position.trade_horizon` / `atr_at_entry` and judges the
 holding on the timescale it was planned on (`UNKNOWN` for older tickets).
 Trade-log columns: `trade_horizon`, `atr_timeframe`, `atr_used`,
 `effective_risk_pct`.
+The trader also receives `execution_geometry`: for each horizon the SL box,
+the 2R TP cap, the smallest TP distance that still clears the net-RR floor
+after spread, and the pending-trigger distance range, all in USD, so a plan
+can be checked against the rules before it is proposed. Its `recent_context`
+shows the last 24h of its own decisions and the realized closes of the last
+7 days (side, entry/exit price, horizon, entry basis).
 
 ## Regime (Trend vs Range)
 
