@@ -68,7 +68,14 @@ from indicators.horizontal_levels import build_horizontal_levels
 from indicators.price_levels import build_price_levels
 from indicators.regime import classify_regime
 from indicators.structure import build_structure_context
-from risk.risk_manager import build_risk_plan, check_filters, normalize_horizon, select_atr
+from risk.risk_manager import (
+    PENDING_MAX_DISTANCE_ATR,
+    PENDING_MIN_DISTANCE_ATR,
+    build_risk_plan,
+    check_filters,
+    normalize_horizon,
+    select_atr,
+)
 from risk.breakeven import should_move_to_breakeven
 
 LOGGER = logging.getLogger(__name__)
@@ -1264,13 +1271,6 @@ def _horizon_log_fields(trade_horizon: str, atr_timeframe: str, atr_used: float,
     }
 
 
-# Pending-order placement guards: the trigger level must be a meaningful
-# distance from the current price (in ATR units of the trade horizon: H1 for
-# INTRADAY, H4 for SWING), but still reachable.
-PENDING_MIN_DISTANCE_ATR = 0.1
-PENDING_MAX_DISTANCE_ATR = 3.0
-
-
 def _is_past_pending_placement_cutoff(reference: datetime | None = None) -> bool:
     """True between PENDING_ORDER_LAST_PLACEMENT_NY and the daily cutoff (NY time).
 
@@ -1608,6 +1608,11 @@ def _handle_pending_orders(
 
 RECENT_CONTEXT_HOURS = 24
 RECENT_CONTEXT_LIMIT = 5
+# Realized closes are shown over a longer window than decisions: a losing
+# trade from three days ago is still the most relevant thing the trader
+# should know before taking the same setup again.
+RECENT_CLOSED_DAYS = 7
+RECENT_CLOSED_LIMIT = 3
 RECENT_REASONING_HEAD_CHARS = 220
 _NON_DECISION_REASONS = {"closed_trade_sync", "breakeven_monitor", "weekend_flat_close"}
 
@@ -1615,12 +1620,16 @@ _NON_DECISION_REASONS = {"closed_trade_sync", "breakeven_monitor", "weekend_flat
 def _load_recent_decisions(
     hours: int = RECENT_CONTEXT_HOURS,
     limit: int = RECENT_CONTEXT_LIMIT,
+    closed_days: int = RECENT_CLOSED_DAYS,
+    closed_limit: int = RECENT_CLOSED_LIMIT,
 ) -> dict[str, Any]:
     """Summarize the trader's own recent decisions and realized closes.
 
     Passed to decide_trade so consecutive judgments are not memoryless:
     without this, the trader flip-flopped HOLD/BUY on near-identical inputs
     within hours and re-entered a setup right after it was stopped out.
+    Decisions cover the last ``hours``; closes the last ``closed_days`` with
+    side, exit price and the horizon the trade was planned on.
     Failures return an empty context (never block the pipeline).
     """
     context: dict[str, Any] = {"decisions": [], "recent_closed": []}
@@ -1628,7 +1637,10 @@ def _load_recent_decisions(
         if not TRADE_LOG_PATH.exists():
             return context
 
-        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(hours=hours)
+        closed_cutoff = now - timedelta(days=closed_days)
+        opened: dict[str, dict[str, Any]] = {}
         with TRADE_LOG_PATH.open("r", newline="", encoding="utf-8") as fp:
             reader = csv.DictReader(fp)
             for row in reader:
@@ -1638,47 +1650,63 @@ def _load_recent_decisions(
                         continue
                     ts = datetime.fromisoformat(ts_raw)
                     ts = ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
-                    if ts < cutoff:
+                    if ts < closed_cutoff:
                         continue
 
                     reasoning = str(row.get("reasoning", "") or "").strip()
                     action = str(row.get("action", "") or "").strip().upper()
+                    position_id = str(row.get("position_id", "") or "").strip()
 
                     if reasoning == "closed_trade_sync":
                         pnl_raw = str(row.get("pnl", "") or "").strip()
                         if not pnl_raw:
                             continue
-                        context["recent_closed"].append(
-                            {
-                                "time_utc": ts.isoformat(),
-                                "pnl": float(pnl_raw),
-                                "result": "LOSS" if float(pnl_raw) < 0 else "WIN",
-                            }
-                        )
+                        entry = opened.get(position_id, {})
+                        closed: dict[str, Any] = {
+                            "time_utc": ts.isoformat(),
+                            "side": action if action in {"BUY", "SELL"} else "",
+                            "pnl": float(pnl_raw),
+                            "result": "LOSS" if float(pnl_raw) < 0 else "WIN",
+                            "exit_price": _safe_float_or_none(row.get("exit_price")),
+                            "entry_price": entry.get("entry_price"),
+                            "trade_horizon": entry.get("trade_horizon", ""),
+                            "entry_basis": entry.get("reasoning_head", ""),
+                        }
+                        context["recent_closed"].append(closed)
                         continue
 
+                    # Remember what each ticket was opened on (market or pending row).
+                    if position_id and bool(str(row.get("order_success", "")).lower() == "true"):
+                        opened[position_id] = {
+                            "entry_price": _safe_float_or_none(row.get("entry_price")),
+                            "trade_horizon": str(row.get("trade_horizon", "") or ""),
+                            "reasoning_head": reasoning[:RECENT_REASONING_HEAD_CHARS],
+                        }
+
+                    if ts < cutoff:
+                        continue
                     if reasoning in _NON_DECISION_REASONS:
                         continue
                     if action not in {"BUY", "SELL", "HOLD"}:
                         continue
-                    confidence_raw = str(row.get("confidence", "") or "").strip()
-                    if not confidence_raw:
-                        continue
 
-                    context["decisions"].append(
-                        {
-                            "time_utc": ts.isoformat(),
-                            "action": action,
-                            "confidence": float(confidence_raw),
-                            "directional_bias": str(row.get("directional_bias", "") or ""),
-                            "reasoning_head": reasoning[:RECENT_REASONING_HEAD_CHARS],
-                        }
-                    )
+                    decision: dict[str, Any] = {
+                        "time_utc": ts.isoformat(),
+                        "action": action,
+                        "directional_bias": str(row.get("directional_bias", "") or ""),
+                        "trade_horizon": str(row.get("trade_horizon", "") or ""),
+                        "pending_status": str(row.get("pending_status", "") or ""),
+                        "reasoning_head": reasoning[:RECENT_REASONING_HEAD_CHARS],
+                    }
+                    confidence = _safe_float_or_none(row.get("confidence"))
+                    if confidence is not None:
+                        decision["confidence"] = confidence  # legacy rows only; not requested any more
+                    context["decisions"].append(decision)
                 except Exception:
                     continue
 
         context["decisions"] = context["decisions"][-limit:]
-        context["recent_closed"] = context["recent_closed"][-limit:]
+        context["recent_closed"] = context["recent_closed"][-closed_limit:]
         return context
     except Exception as exc:
         LOGGER.warning("_load_recent_decisions failed; empty context used: %s", exc)
@@ -2006,16 +2034,16 @@ def run_once(
             _append_trade_log(result)
             return result
 
+        spread = get_spread(SYMBOL)
+        spread_usd = get_spread_price(SYMBOL) or 0.0
         trader_report = debate_fallback_report or decide_trade(
             technical_report,
             sentiment_report,
             debate_report,
             macro_report=macro_report,
             recent_context=_load_recent_decisions(),
+            spread_usd=spread_usd,
         )
-
-        spread = get_spread(SYMBOL)
-        spread_usd = get_spread_price(SYMBOL) or 0.0
         filter_result = check_filters(
             spread=spread,
             baseline_spread=calibrated_baseline,

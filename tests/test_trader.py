@@ -665,3 +665,35 @@ def test_trade_horizon_is_normalized_and_the_prompt_states_the_atr_rule() -> Non
     for directive in ("SWING を選ぶこと", "INTRADAY を選ぶこと", "SWING にすべき"):
         assert directive not in SYSTEM_PROMPT
     assert json.dumps(PLACE_TRADE_ORDER_SCHEMA["parameters"]["required"]) == '["action", "symbol", "reasoning"]'
+
+
+def test_trader_receives_execution_geometry_in_usd_per_horizon() -> None:
+    import json
+
+    from agents.trader import SYSTEM_PROMPT
+
+    fake_client = Mock()
+    fake_client.call_function.return_value = _fake_result({"action": "HOLD", "symbol": "GOLD#", "reasoning": "x"})
+    technical = {"direction_context": {"h1": {"close": 4171.66, "atr_14": 12.018}, "h4": {"close": 4165.24, "atr_14": 26.903}}}
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        decide_trade(technical_report=technical, sentiment_report={"score": 0.0}, debate_report={"judge_summary": {}}, spread_usd=0.3)
+
+    sent = json.loads(fake_client.call_function.call_args.kwargs["user_prompt"])
+    geometry = sent["execution_geometry"]
+    assert geometry["current_price"] == 4171.66 and geometry["spread_usd"] == 0.3 and geometry["min_rr_after_spread"] == 1.5
+    swing = geometry["by_horizon"]["SWING"]
+    assert swing["atr_timeframe"] == "H4" and swing["atr"] == 26.9
+    assert swing["sl_distance_usd"]["min"] == 26.9 and swing["sl_distance_usd"]["max"] == 40.35
+    # (tp - spread) / (sl + spread) >= 1.5 on the default stop: 1.5 * (40.35 + 0.3) + 0.3
+    assert abs(swing["tp_distance_usd"]["min_for_rr_on_default_sl"] - 61.28) < 0.02
+    assert swing["tp_distance_usd"]["max_2r_on_default_sl"] == 80.7
+    assert swing["pending_trigger_distance_usd"] == {"min": 2.69, "max": 80.71}
+    intraday = geometry["by_horizon"]["INTRADAY"]
+    assert intraday["atr_timeframe"] == "H1" and intraday["sl_distance_usd"]["max"] == 18.03
+    assert "execution_geometry" in SYSTEM_PROMPT
+
+    # No ATR at all: the block says so instead of raising.
+    with patch("agents.trader.get_default_client", return_value=fake_client):
+        decide_trade(technical_report={}, sentiment_report={"score": 0.0}, debate_report={"judge_summary": {}})
+    sent = json.loads(fake_client.call_function.call_args.kwargs["user_prompt"])
+    assert sent["execution_geometry"]["by_horizon"]["SWING"]["available"] is False

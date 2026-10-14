@@ -73,6 +73,75 @@ def realised_risk_pct(
 # only tighten the baseline, never widen it.
 SUGGESTED_SL_MIN_ATR = 1.0
 
+# Pending-order placement guards: the trigger level must be a meaningful
+# distance from the current price (in ATR units of the trade horizon), but
+# still reachable.
+PENDING_MIN_DISTANCE_ATR = 0.1
+PENDING_MAX_DISTANCE_ATR = 3.0
+
+
+def execution_geometry(
+    current_price: float,
+    atr_h1: float,
+    atr_h4: float,
+    spread_usd: float | None = None,
+    atr_mult: float = ATR_MULTIPLIER_SL,
+    rr: float = RISK_REWARD_RATIO,
+    min_rr: float = MIN_RISK_REWARD_RATIO,
+    structure_buffer_usd: float = SL_STRUCTURE_BUFFER_USD,
+) -> dict[str, object]:
+    """The distance rules build_risk_plan will apply, in USD, per trade horizon.
+
+    Handed to the trader as facts so a plan can be checked against the box
+    before it is proposed (a SWING plan with an intraday-sized stop and a
+    near target was being rejected for low RR after the fact).
+    """
+    try:
+        spread = float(spread_usd) if spread_usd is not None and float(spread_usd) > 0 else 0.0
+    except (TypeError, ValueError):
+        spread = 0.0
+
+    def _for(atr: float, timeframe: str) -> dict[str, object]:
+        if atr <= 0:
+            return {"atr_timeframe": timeframe, "atr": None, "available": False}
+        sl_min = round(SUGGESTED_SL_MIN_ATR * atr, 2)
+        sl_default = round(atr_mult * atr, 2)
+
+        def _min_tp(sl_distance: float) -> float:
+            # (tp - spread) / (sl + spread) >= min_rr
+            return round(min_rr * (sl_distance + spread) + spread, 2)
+
+        return {
+            "atr_timeframe": timeframe,
+            "atr": round(atr, 2),
+            "available": True,
+            "sl_distance_usd": {
+                "min": sl_min,
+                "max": sl_default,
+                "default_when_suggested_sl_outside_box": sl_default,
+                "structure_buffer_added_to_suggested_sl": round(structure_buffer_usd, 2),
+            },
+            "tp_distance_usd": {
+                "max_2r_on_default_sl": round(rr * sl_default, 2),
+                "min_for_rr_on_default_sl": _min_tp(sl_default),
+                "min_for_rr_on_tightest_sl": _min_tp(sl_min),
+            },
+            "pending_trigger_distance_usd": {
+                "min": round(PENDING_MIN_DISTANCE_ATR * atr, 2),
+                "max": round(PENDING_MAX_DISTANCE_ATR * atr, 2),
+            },
+        }
+
+    return {
+        "current_price": round(float(current_price), 2) if current_price else None,
+        "spread_usd": round(spread, 2),
+        "min_rr_after_spread": min_rr,
+        "by_horizon": {
+            "INTRADAY": _for(float(atr_h1 or 0.0), "H1"),
+            "SWING": _for(float(atr_h4 or 0.0), "H4"),
+        },
+    }
+
 
 @dataclass(frozen=True)
 class FilterCheckResult:
