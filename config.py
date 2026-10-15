@@ -143,6 +143,13 @@ def _get_env_float(name: str, default: float) -> float:
     return float(value)
 
 
+def _resolve_max_risk_percent(configured: float, risk_percent: float) -> float:
+    """MAX_RISK_PERCENT: 2x the target when unset; never below the target itself."""
+    if configured <= 0:
+        return 2.0 * risk_percent
+    return max(configured, risk_percent)
+
+
 def _parse_hhmm(value: str, default: tuple[int, int]) -> tuple[int, int]:
     try:
         hour_text, minute_text = value.strip().split(":")
@@ -291,8 +298,11 @@ def load_settings() -> Settings:
         sl_structure_buffer_usd=_get_env_float("SL_STRUCTURE_BUFFER_USD", 2.0),
         # Hard ceiling on the realised risk of one order. The 0.01-lot floor
         # can push a wide-SL (SWING) plan above RISK_PERCENT; up to this cap
-        # the overshoot is accepted, beyond it the order is not sent.
-        max_risk_percent=_get_env_float("MAX_RISK_PERCENT", 0.02),
+        # the overshoot is accepted, beyond it the order is not sent. Default:
+        # twice the target (an explicit value below the target is raised to it).
+        max_risk_percent=_resolve_max_risk_percent(
+            _get_env_float("MAX_RISK_PERCENT", 0.0), _get_env_float("RISK_PERCENT", 0.01)
+        ),
         spread_multiplier_limit=2.0,
         spread_samples=20,
         spread_sample_interval=0.5,

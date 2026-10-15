@@ -23,6 +23,28 @@ def test_calc_lot_regular_case() -> None:
     assert round(lot, 2) == lot
 
 
+def test_calc_lot_floors_to_the_lot_step_so_realised_risk_never_exceeds_target() -> None:
+    from risk.risk_manager import realised_risk_pct
+
+    # 450k JPY, 2% target, 21.86 USD stop: ideal lot 0.0266. Rounding to the
+    # nearest step gave 0.03 (2.26% realised, above a 2% cap); flooring gives 0.02.
+    lot = calc_lot(balance_jpy=450_000, risk_pct=0.02, sl_distance_usd=21.86, jpy_usd_rate=155.0)
+    assert lot == 0.02
+    assert realised_risk_pct(lot, 21.86, 450_000, 155.0) <= 0.02
+    # Below one step the floor still applies (overshoot is then the cap's business).
+    assert calc_lot(balance_jpy=100_000, risk_pct=0.01, sl_distance_usd=30, jpy_usd_rate=155.0) == 0.01
+    # Exact multiples are not floored a step too far by float noise.
+    assert calc_lot(balance_jpy=155_000, risk_pct=0.02, sl_distance_usd=10, jpy_usd_rate=155.0) == 0.02
+
+
+def test_build_risk_plan_at_target_risk_passes_a_cap_equal_to_the_target() -> None:
+    # With the cap at the target level, a normal-size plan must still pass:
+    # the floored lot keeps realised risk at or below the target.
+    plan = build_risk_plan(action="SELL", entry_price=4123.89, atr=14.57, balance_jpy=450_000, jpy_usd_rate=155.0, risk_pct=0.02, max_risk_pct=0.02)
+    assert plan["ok"] is True
+    assert float(plan["effective_risk_pct"]) <= 0.02
+
+
 def test_calc_lot_uses_given_fx_rate() -> None:
     # A weaker JPY (higher USDJPY) means less USD risk budget -> smaller lot.
     lot_low_rate = calc_lot(balance_jpy=500_000, risk_pct=0.01, sl_distance_usd=10, jpy_usd_rate=100.0)
