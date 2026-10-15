@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from config import (
@@ -179,7 +180,11 @@ def calc_lot(
     if lot <= 0:
         return 0.0
 
-    return max(MIN_LOT, round(lot, 2))
+    # Floor to the 0.01 step (not round-to-nearest): rounding 0.026 up to 0.03
+    # realised ~15% more than risk_pct and, with the cap at the same level as
+    # the target, tripped risk_cap on every upward rounding.
+    stepped = math.floor(lot * 100.0 + 1e-9) / 100.0
+    return max(MIN_LOT, stepped)
 
 
 def calc_sl_tp(

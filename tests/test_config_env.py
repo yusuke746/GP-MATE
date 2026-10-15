@@ -48,3 +48,12 @@ def test_judgment_times_parse_sort_dedupe_and_fall_back() -> None:
     assert config._parse_judgment_times("") == config.DEFAULT_JUDGMENT_TIMES_NY
     assert config._parse_judgment_times("20:00, 03:00,08:00,20:00,junk,25:00") == ((3, 0), (8, 0), (20, 0))
     assert config._parse_judgment_times("nonsense") == config.DEFAULT_JUDGMENT_TIMES_NY
+
+
+def test_max_risk_percent_defaults_to_twice_the_target_and_never_below_it() -> None:
+    from config import _resolve_max_risk_percent
+
+    assert _resolve_max_risk_percent(0.0, 0.01) == 0.02
+    assert _resolve_max_risk_percent(0.0, 0.02) == 0.04
+    assert _resolve_max_risk_percent(0.015, 0.01) == 0.015
+    assert _resolve_max_risk_percent(0.01, 0.02) == 0.02  # an explicit cap below the target is raised to it
