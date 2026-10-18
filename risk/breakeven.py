@@ -76,3 +76,35 @@ def should_move_to_breakeven(
         return False, None
 
     return True, new_sl
+
+MIN_LOT = 0.01
+LOT_STEP = 0.01
+
+
+def partial_close_volume(volume: Any, fraction: Any, min_lot: float = MIN_LOT, step: float = LOT_STEP) -> float:
+    """Volume to close at the 1R trigger so the rest can run to the target.
+
+    ``fraction`` of the position, floored to the lot step. 0.0 when the
+    feature is off (fraction <= 0), when the position cannot be split (the
+    remainder would fall below ``min_lot``), or on invalid input.
+    """
+    try:
+        volume_f = float(volume)
+        fraction_f = float(fraction)
+    except Exception:
+        return 0.0
+    if volume_f <= 0 or fraction_f <= 0:
+        return 0.0
+    fraction_f = min(fraction_f, 1.0)
+    steps = int(volume_f * fraction_f / step + 1e-9)
+    part = round(steps * step, 2)
+    if part < min_lot:
+        return 0.0
+    remainder = round(volume_f - part, 2)
+    if remainder < min_lot:
+        # Closing this much would leave a sub-minimum remainder; take one
+        # step less if that still leaves a legal split, else do not split.
+        part = round(part - step, 2)
+        if part < min_lot or round(volume_f - part, 2) < min_lot:
+            return 0.0
+    return part

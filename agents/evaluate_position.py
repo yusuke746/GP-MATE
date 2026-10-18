@@ -20,6 +20,10 @@ SYSTEM_PROMPT = (
     "position.trade_horizon は建玉時にトレーダーが宣言した時間軸で、INTRADAY は H1 ATR、SWING は H4 ATR を基準に "
     "SL/TP が置かれている(atr_at_entry / atr_timeframe がその値)。SWING の建玉は H1 の逆行を織り込んで SL が置かれているので、"
     "保有根拠が崩れたかどうかはその時間軸(H4/D1 の構造)で判断する。UNKNOWN は時間軸の記録が無い建玉。"
+    "position.invalidation は、この建玉の SL とパネルの反転確認水準の位置関係。stop_decides_first が true のときは、"
+    "その水準の突破を待っている間に SL が先に執行される(待つという判断は、実際には SL に任せるという判断になる)。"
+    "position.r_multiple_now は現在の損益を R(建値から SL までの距離)で表した値。"
+    "1R 到達後は建玉の一部が利確され SL は建値付近に移動しているので、その後の評価対象は残りの建玉である。"
     "必ず evaluate_position_action 関数を呼び出して返答してください。"
 )
 

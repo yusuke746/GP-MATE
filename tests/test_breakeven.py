@@ -65,3 +65,17 @@ def test_safety_guard_never_moves_to_worse_direction() -> None:
 
     assert buy_worse == (False, None)
     assert sell_worse == (False, None)
+
+def test_partial_close_volume_floors_to_the_step_and_keeps_a_legal_remainder() -> None:
+    from risk.breakeven import partial_close_volume
+
+    assert partial_close_volume(0.03, 0.5) == 0.01  # 0.015 -> floor 0.01, remainder 0.02
+    assert partial_close_volume(0.02, 0.5) == 0.01
+    assert partial_close_volume(0.04, 0.5) == 0.02
+    assert partial_close_volume(0.10, 0.5) == 0.05
+    assert partial_close_volume(0.01, 0.5) == 0.0  # cannot split a minimum lot
+    assert partial_close_volume(0.03, 0.0) == 0.0  # feature off
+    assert partial_close_volume(0.03, 1.0) == 0.02  # "all" still leaves the minimum running
+    assert partial_close_volume(0.02, 0.9) == 0.01
+    assert partial_close_volume("x", 0.5) == 0.0
+    assert partial_close_volume(0.0, 0.5) == 0.0

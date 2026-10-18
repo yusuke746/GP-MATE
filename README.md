@@ -48,6 +48,14 @@ The system prioritizes capital protection and uses a staged workflow for safe op
 
 ## Forecast-only logger (research, no trading)
 
+**Status (2026-10-18): paused.** After 501 scored forecasts the LLM's Brier
+score (0.603) equals the rolling base-rate anchor (0.600, CI crosses zero),
+the panel debate made it worse within the same week (0.676 vs 0.540), and no
+single analyst report changes the score. The question "which of ±1 ATR is hit
+first within 6 H1 bars" is answered: not better than the base rate. Restart
+the logger only with a task shaped like the actual trades (entry at a level,
+SL and TP as the barriers).
+
 Records the LLM's triple-barrier probabilities (`p_up` / `p_down` / `p_timeout`)
 every confirmed H1 bar, labels them later from realised bars, and scores
 calibration (Brier / log loss / reliability) against uniform, base-rate and
@@ -178,6 +186,14 @@ evaluator sees `position.trade_horizon` / `atr_at_entry` and judges the
 holding on the timescale it was planned on (`UNKNOWN` for older tickets).
 Trade-log columns: `trade_horizon`, `atr_timeframe`, `atr_used`,
 `effective_risk_pct`.
+**Exit shape.** When price first reaches +1R the breakeven monitor closes
+`PARTIAL_CLOSE_FRACTION` of the position (default half, floored to the 0.01
+lot step; a 0.01-lot position cannot be split) and then moves the stop to
+breakeven; the remainder runs to the target. Once per ticket, recorded in
+`logs/trade_meta.json` and the `partial_close_*` columns. The position
+evaluator also receives `position.invalidation` (where the stop sits relative
+to the panel's reversal level, `stop_decides_first`) and `r_multiple_now`.
+
 The trader also receives `execution_geometry`: for each horizon the SL box,
 the 2R TP cap, the smallest TP distance that still clears the net-RR floor
 after spread, and the pending-trigger distance range, all in USD, so a plan

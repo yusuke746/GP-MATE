@@ -57,3 +57,9 @@ def test_max_risk_percent_defaults_to_twice_the_target_and_never_below_it() -> N
     assert _resolve_max_risk_percent(0.0, 0.02) == 0.04
     assert _resolve_max_risk_percent(0.015, 0.01) == 0.015
     assert _resolve_max_risk_percent(0.01, 0.02) == 0.02  # an explicit cap below the target is raised to it
+
+
+def test_partial_close_fraction_defaults_to_half() -> None:
+    from config import PARTIAL_CLOSE_FRACTION
+
+    assert PARTIAL_CLOSE_FRACTION == 0.5
