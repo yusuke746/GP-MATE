@@ -727,8 +727,12 @@ def cancel_pending_orders(symbol: str) -> dict[str, Any]:
         disconnect()
 
 
-def close_position(ticket: int) -> dict[str, Any]:
-    """Close an open position by ticket with an opposing market order."""
+def close_position(ticket: int, volume: float | None = None) -> dict[str, Any]:
+    """Close an open position by ticket with an opposing market order.
+
+    ``volume`` closes only that much (a partial close, MT5 keeps the same
+    position ticket for the remainder); None closes the whole position.
+    """
     if ticket <= 0:
         return {
             "success": False,
@@ -797,14 +801,27 @@ def close_position(ticket: int) -> dict[str, Any]:
             }
 
         price = float(tick_info.bid if current_type == "BUY" else tick_info.ask)
-        volume = float(position.get("volume") or 0.0)
-        if volume <= 0:
+        position_volume = float(position.get("volume") or 0.0)
+        if position_volume <= 0:
             return {
                 "success": False,
                 "action": "CLOSE_POSITION",
                 "reason": "Position volume must be positive",
                 "retcode": None,
             }
+        partial = volume is not None
+        if partial:
+            requested = round(float(volume), 2)
+            if requested <= 0 or requested > position_volume + 1e-9:
+                return {
+                    "success": False,
+                    "action": "CLOSE_POSITION",
+                    "reason": f"Invalid partial volume {requested} for position volume {position_volume}",
+                    "retcode": None,
+                }
+            volume = requested
+        else:
+            volume = position_volume
 
         request: dict[str, Any] = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -815,7 +832,7 @@ def close_position(ticket: int) -> dict[str, Any]:
             "price": price,
             "deviation": ORDER_DEVIATION,
             "magic": ORDER_MAGIC,
-            "comment": "GP-MATE close",
+            "comment": "GP-MATE partial" if partial else "GP-MATE close",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -827,6 +844,8 @@ def close_position(ticket: int) -> dict[str, Any]:
                 "symbol": symbol,
                 "volume": volume,
                 "price": price,
+                "partial": partial,
+                "remaining_volume": round(position_volume - volume, 2) if partial else 0.0,
             }
         )
         return response

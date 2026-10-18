@@ -84,6 +84,7 @@ class Settings:
     atr_multiplier_sl: float
     risk_reward_ratio: float
     breakeven_buffer: float
+    partial_close_fraction: float
     breakeven_monitor_times: tuple[str, ...]
 
     news_filter_minutes: int
@@ -286,6 +287,9 @@ def load_settings() -> Settings:
         atr_multiplier_sl=_get_env_float("ATR_MULTIPLIER_SL", 1.5),
         risk_reward_ratio=_get_env_float("RISK_REWARD_RATIO", 2.0),
         breakeven_buffer=_get_env_float("BREAKEVEN_BUFFER", 0.1),
+        # Fraction of the position closed when price first reaches +1R (the
+        # same moment the stop goes to breakeven). 0 disables the partial.
+        partial_close_fraction=_get_env_float("PARTIAL_CLOSE_FRACTION", 0.5),
         breakeven_monitor_times=_parse_breakeven_monitor_times(
             _get_env_str("BREAKEVEN_MONITOR_TIMES", "07,22,37,52")
         ),
@@ -338,6 +342,7 @@ CONSECUTIVE_LOSS_LIMIT: Final[int] = settings.consecutive_loss_limit
 ATR_MULTIPLIER_SL: Final[float] = settings.atr_multiplier_sl
 RISK_REWARD_RATIO: Final[float] = settings.risk_reward_ratio
 BREAKEVEN_BUFFER: Final[float] = settings.breakeven_buffer
+PARTIAL_CLOSE_FRACTION: Final[float] = settings.partial_close_fraction
 BREAKEVEN_MONITOR_TIMES: Final[tuple[str, ...]] = settings.breakeven_monitor_times
 
 NEWS_FILTER_MINUTES: Final[int] = settings.news_filter_minutes

@@ -352,3 +352,73 @@ def test_run_monitor_once_cancels_pendings_before_high_impact_news(monkeypatch: 
 
     assert calls == [run_breakeven_monitor.SYMBOL]
     assert result["success"] is True
+
+
+def test_monitor_takes_partial_profit_at_1r_then_moves_breakeven_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    log_path = tmp_path / "trade_log.csv"
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+    monkeypatch.setattr(main, "PARTIAL_CLOSE_FRACTION", 0.5)
+    position = {"ticket": 555, "symbol": "GOLD#", "type": "SELL", "volume": 0.03, "price_open": 4185.79, "price_current": 4168.0, "sl": 4202.43, "tp": 4148.95, "profit": 80.0}
+    monkeypatch.setattr(run_breakeven_monitor, "get_position_details", lambda symbol: [dict(position)])
+    closes: list[tuple[int, float]] = []
+    modifies: list[tuple[int, float]] = []
+    monkeypatch.setattr(main, "close_position", lambda ticket, volume=None: closes.append((ticket, volume)) or {"success": True, "retcode": 10009, "price": 4168.1, "volume": volume, "partial": True})
+    monkeypatch.setattr(main, "modify_sl", lambda ticket, new_sl: modifies.append((ticket, new_sl)) or {"success": True, "retcode": 10009})
+    monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "is_high_impact_soon", lambda minutes: False)
+
+    result = run_breakeven_monitor.run_monitor_once()
+
+    assert result["moved_positions"] == 1
+    assert closes == [(555, 0.01)]  # half of 0.03 floored to the lot step
+    assert modifies == [(555, round(4185.79 - main.BREAKEVEN_BUFFER, 5))]
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert rows[0]["breakeven_reason"] == "PARTIAL_AND_MOVED"
+    assert rows[0]["partial_close_lot"] == "0.01" and rows[0]["partial_close_success"] == "True" and rows[0]["partial_close_price"] == "4168.1"
+    assert rows[0]["r_multiple_now"] == "1.07"
+    meta = json.loads((tmp_path / main.TRADE_META_FILENAME).read_text(encoding="utf-8"))["555"]
+    assert meta["partial_lot"] == 0.01 and meta["partial_closed_at"]
+
+    # A later cycle where the SL modify had failed earlier: the stop is still
+    # the initial one, but the partial must not be taken twice.
+    run_breakeven_monitor.run_monitor_once()
+    assert closes == [(555, 0.01)]
+    assert len(modifies) == 2
+
+
+def test_monitor_moves_breakeven_even_when_the_partial_close_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log_path = tmp_path / "trade_log.csv"
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", log_path)
+    monkeypatch.setattr(main, "PARTIAL_CLOSE_FRACTION", 0.5)
+    monkeypatch.setattr(run_breakeven_monitor, "get_position_details", lambda symbol: [{"ticket": 556, "symbol": symbol, "type": "BUY", "volume": 0.02, "price_open": 100.0, "price_current": 105.0, "sl": 95.0, "tp": 110.0, "profit": 50.0}])
+    monkeypatch.setattr(main, "close_position", lambda ticket, volume=None: {"success": False, "retcode": 10019, "reason": "no money"})
+    modifies: list[tuple[int, float]] = []
+    monkeypatch.setattr(main, "modify_sl", lambda ticket, new_sl: modifies.append((ticket, new_sl)) or {"success": True, "retcode": 0})
+    monkeypatch.setattr(run_breakeven_monitor, "_is_weekend_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "_is_pending_flat_window", lambda: False)
+    monkeypatch.setattr(run_breakeven_monitor, "is_high_impact_soon", lambda minutes: False)
+
+    run_breakeven_monitor.run_monitor_once()
+
+    assert modifies == [(556, 100.0 + main.BREAKEVEN_BUFFER)]
+    rows = list(csv.DictReader(log_path.open("r", encoding="utf-8")))
+    assert rows[0]["breakeven_reason"] == "MOVED" and rows[0]["partial_close_success"] == "False" and rows[0]["partial_close_retcode"] == "10019"
+    assert not (tmp_path / main.TRADE_META_FILENAME).exists()  # nothing recorded for a failed partial
+
+
+def test_monitor_skips_partial_when_disabled_or_unsplittable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(main, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(main, "TRADE_LOG_PATH", tmp_path / "trade_log.csv")
+    calls: list[tuple[int, float]] = []
+    monkeypatch.setattr(main, "close_position", lambda ticket, volume=None: calls.append((ticket, volume)) or {"success": True, "retcode": 0, "price": 1.0})
+    monkeypatch.setattr(main, "modify_sl", lambda ticket, new_sl: {"success": True, "retcode": 0})
+    for fraction, volume in ((0.0, 0.04), (0.5, 0.01)):
+        monkeypatch.setattr(main, "PARTIAL_CLOSE_FRACTION", fraction)
+        _, log, _, ok = main.manage_breakeven_for_position({"ticket": 7, "type": "BUY", "volume": volume, "price_open": 100.0, "price_current": 106.0, "sl": 95.0, "tp": 110.0})
+        assert ok and log["breakeven_reason"] == "MOVED" and log["partial_close_lot"] == ""
+    assert calls == []

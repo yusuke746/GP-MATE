@@ -165,3 +165,10 @@ def test_evaluate_position_passes_the_trade_horizon_to_the_model() -> None:
     sent = json.loads(fake_client.call_function.call_args.kwargs["user_prompt"])
     assert sent["position"]["trade_horizon"] == "SWING" and sent["position"]["atr_at_entry"] == 31.2
     assert "position.trade_horizon" in SYSTEM_PROMPT and "SWING は H4 ATR" in SYSTEM_PROMPT and "UNKNOWN" in SYSTEM_PROMPT
+
+
+def test_evaluate_position_prompt_states_the_stop_vs_panel_level_fact() -> None:
+    from agents.evaluate_position import SYSTEM_PROMPT
+
+    assert "position.invalidation" in SYSTEM_PROMPT and "stop_decides_first" in SYSTEM_PROMPT
+    assert "position.r_multiple_now" in SYSTEM_PROMPT

@@ -1972,3 +1972,19 @@ def test_remember_trade_meta_prunes_stale_entries_and_survives_bad_files(tmp_pat
     assert main._trade_meta_for(3) == {}
     main._remember_trade_meta(4, {"trade_horizon": "INTRADAY"})  # unreadable store is replaced, not raised on
     assert json.loads(path.read_text(encoding="utf-8"))["4"]["trade_horizon"] == "INTRADAY"
+
+
+def test_attach_invalidation_context_says_when_the_stop_fires_before_the_panel_level() -> None:
+    debate = {"regime_summary": {"key_levels": {"reversal_confirms": 4177.51, "reversal_level_id": "H4_FVG_BEARISH_TOP_1"}}}
+    short = main._attach_invalidation_context({"ticket": 1, "type": "SELL", "price_open": 4149.17, "price_current": 4157.99, "sl": 4172.3, "tp": 4111.8}, debate)
+    assert short["invalidation"]["stop_decides_first"] is True
+    assert short["invalidation"]["panel_reversal_level_id"] == "H4_FVG_BEARISH_TOP_1"
+    assert abs(short["invalidation"]["distance_sl_to_panel_level_usd"] - 5.21) < 1e-6
+    assert short["r_multiple_now"] == -0.38 and abs(short["risk_per_unit_usd"] - 23.13) < 1e-6
+
+    long = main._attach_invalidation_context({"ticket": 2, "type": "BUY", "price_open": 100.0, "price_current": 108.0, "sl": 95.0, "tp": 110.0}, {"regime_summary": {"key_levels": {"reversal_confirms": 96.0}}})
+    assert long["invalidation"]["stop_decides_first"] is False  # panel level (96) is above the stop (95): the panel level can fire first
+    assert long["r_multiple_now"] == 1.6
+
+    none = main._attach_invalidation_context({"ticket": 3, "type": "BUY", "price_open": 100.0, "price_current": 101.0, "sl": 0.0}, {})
+    assert none["invalidation"]["stop_decides_first"] is None and none["r_multiple_now"] == ""

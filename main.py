@@ -28,6 +28,7 @@ from agents.technical import analyze_technical
 from agents.trader import decide_trade
 from config import (
     BREAKEVEN_BUFFER,
+    PARTIAL_CLOSE_FRACTION,
     CONSECUTIVE_LOSS_LIMIT,
     DAILY_PENDING_CUTOFF_NY,
     FRIDAY_FLAT_TIME_NY,
@@ -76,7 +77,7 @@ from risk.risk_manager import (
     normalize_horizon,
     select_atr,
 )
-from risk.breakeven import should_move_to_breakeven
+from risk.breakeven import partial_close_volume, should_move_to_breakeven
 
 LOGGER = logging.getLogger(__name__)
 
@@ -220,6 +221,11 @@ TRADE_LOG_COLUMNS: tuple[str, ...] = (
     "atr_timeframe",
     "atr_used",
     "effective_risk_pct",
+    "partial_close_lot",
+    "partial_close_success",
+    "partial_close_retcode",
+    "partial_close_price",
+    "r_multiple_now",
 )
 
 # Fewest closed bars a judgment may be based on (indicators need ~26 for
@@ -259,6 +265,49 @@ def _append_trade_log(row: dict[str, Any]) -> None:
         writer.writerow(payload)
 
 
+def _r_multiple(side: str, entry: float, initial_sl: float, price: float) -> Any:
+    """Open P&L in R (distance entry->SL = 1R); '' when it cannot be computed."""
+    try:
+        if float(entry) <= 0 or float(initial_sl) <= 0 or not price:
+            return ""
+        risk = abs(float(entry) - float(initial_sl))
+        if risk <= 0:
+            return ""
+        move = (float(price) - float(entry)) if str(side).upper() == "BUY" else (float(entry) - float(price))
+        return round(move / risk, 2)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _attach_invalidation_context(position_context: dict[str, Any], debate_report: Any) -> dict[str, Any]:
+    """Facts about where this position's stop sits relative to the panel's
+    reversal level. On 10/15 the evaluator held a short four times "until
+    4177.51 is reclaimed" while the stop was 4172.3: the stop always fired
+    first, so the evaluation never had a say. Also adds the open P&L in R."""
+    context = dict(position_context)
+    side = str(context.get("type", "") or "").upper()
+    entry = float(context.get("price_open", 0.0) or 0.0)
+    sl = float(context.get("sl", 0.0) or 0.0)
+    price = float(context.get("price_current", 0.0) or 0.0)
+    context["r_multiple_now"] = _r_multiple(side, entry, sl, price)
+    context["risk_per_unit_usd"] = round(abs(entry - sl), 5) if entry and sl else None
+
+    summary = debate_report.get("regime_summary") if isinstance(debate_report, dict) else None
+    levels = summary.get("key_levels") if isinstance(summary, dict) and isinstance(summary.get("key_levels"), dict) else {}
+    reversal = _safe_float_or_none(levels.get("reversal_confirms"))
+    stop_first: bool | None = None
+    if reversal is not None and sl > 0 and side in {"BUY", "SELL"}:
+        stop_first = (sl > reversal) if side == "BUY" else (sl < reversal)
+    context["invalidation"] = {
+        "sl": sl if sl > 0 else None,
+        "panel_reversal_level": reversal,
+        "panel_reversal_level_id": levels.get("reversal_level_id"),
+        "stop_decides_first": stop_first,
+        "distance_sl_to_panel_level_usd": round(abs(sl - reversal), 5) if (reversal is not None and sl > 0) else None,
+    }
+    return context
+
+
 def manage_breakeven_for_position(
     position_context: dict[str, Any],
     now_iso: str | None = None,
@@ -282,17 +331,24 @@ def manage_breakeven_for_position(
         "breakeven_modify_success": "",
         "breakeven_modify_retcode": "",
         "breakeven_reason": "",
+        "partial_close_lot": "",
+        "partial_close_success": "",
+        "partial_close_retcode": "",
+        "partial_close_price": "",
+        "r_multiple_now": "",
     }
 
     entry_price = float(position_context.get("price_open", 0.0) or 0.0)
     initial_sl = float(position_context.get("sl", 0.0) or 0.0)
     current_price = float(position_context.get("price_current", 0.0) or 0.0)
     side = str(position_context.get("type", "") or "")
+    ticket = int(position_context.get("ticket", 0) or 0)
     risk_r = abs(entry_price - initial_sl)
     if side == "BUY":
         breakeven_log["breakeven_trigger_price"] = round(entry_price + risk_r, 5)
     elif side == "SELL":
         breakeven_log["breakeven_trigger_price"] = round(entry_price - risk_r, 5)
+    breakeven_log["r_multiple_now"] = _r_multiple(side, entry_price, initial_sl, current_price)
 
     should_move, new_sl = should_move_to_breakeven(
         entry=entry_price,
@@ -306,11 +362,30 @@ def manage_breakeven_for_position(
         breakeven_log["breakeven_triggered"] = True
         breakeven_log["breakeven_new_sl"] = float(new_sl)
         breakeven_log["breakeven_time"] = now_iso
-        breakeven_result = modify_sl(int(position_context["ticket"]), float(new_sl))
+
+        # Bank part of the move at +1R before the stop goes to breakeven, so a
+        # reversal from 1.9R back to entry (10/16: +14,377 JPY -> +47) is not
+        # a scratch. Once per ticket; the remainder runs to the target.
+        meta = _trade_meta_for(ticket)
+        part = partial_close_volume(position_context.get("volume"), PARTIAL_CLOSE_FRACTION)
+        if part > 0 and not meta.get("partial_closed_at"):
+            partial_result = close_position(ticket, volume=part)
+            partial_ok = bool(partial_result.get("success", False))
+            breakeven_log["partial_close_lot"] = part
+            breakeven_log["partial_close_success"] = partial_ok
+            breakeven_log["partial_close_retcode"] = partial_result.get("retcode", "")
+            breakeven_log["partial_close_price"] = partial_result.get("price", "")
+            if partial_ok:
+                _remember_trade_meta(ticket, {**meta, "partial_closed_at": now_iso, "partial_lot": part})
+                LOGGER.info("Partial close at +1R: ticket=%s lot=%.2f price=%s", ticket, part, partial_result.get("price", ""))
+            else:
+                LOGGER.warning("Partial close failed (SL still moves): ticket=%s reason=%s", ticket, partial_result.get("reason", ""))
+
+        breakeven_result = modify_sl(ticket, float(new_sl))
         breakeven_log["breakeven_modify_success"] = bool(breakeven_result.get("success", False))
         breakeven_log["breakeven_modify_retcode"] = breakeven_result.get("retcode", "")
         if bool(breakeven_result.get("success", False)):
-            breakeven_log["breakeven_reason"] = "MOVED"
+            breakeven_log["breakeven_reason"] = "PARTIAL_AND_MOVED" if breakeven_log["partial_close_success"] is True else "MOVED"
             return breakeven_result, breakeven_log, "Position hold + breakeven moved", True
 
         breakeven_log["breakeven_reason"] = "MOVE_FAILED"
@@ -1593,6 +1668,7 @@ def _handle_pending_orders(
                     "atr_timeframe": atr_timeframe,
                     "atr_used": round(float(atr), 5),
                     "entry_kind": "pending",
+                    "lot": float(risk_plan.get("lot", 0.0) or 0.0),
                     "order_type": order_type,
                     "entry_price": price,
                     "sl": float(risk_plan.get("sl", 0.0) or 0.0),
@@ -1940,7 +2016,10 @@ def run_once(
                     extra=debate_log_fields,
                 )
 
-            position_context = _position_context_from_details(position_details[0], len(position_details))
+            position_context = _attach_invalidation_context(
+                _position_context_from_details(position_details[0], len(position_details)),
+                debate_report,
+            )
             evaluation_report = debate_fallback_report or evaluate_position(
                 position_context=position_context,
                 technical_report=technical_report,
@@ -1969,6 +2048,7 @@ def run_once(
                 "breakeven_modify_success": "",
                 "breakeven_modify_retcode": "",
                 "breakeven_reason": "",
+                "r_multiple_now": position_context.get("r_multiple_now", ""),
             }
             evaluation_action = str(evaluation_report.get("action", "HOLD"))
             evaluation_confidence = _confidence_for_log(evaluation_report)
@@ -2140,6 +2220,7 @@ def run_once(
                         "atr_timeframe": atr_timeframe,
                         "atr_used": round(float(atr), 5),
                         "entry_kind": "market",
+                        "lot": float(risk_plan.get("lot", 0.0) or 0.0),
                         "order_type": final_action,
                         "entry_price": entry_price,
                         "sl": float(risk_plan.get("sl", 0.0) or 0.0),

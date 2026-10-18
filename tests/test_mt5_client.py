@@ -393,3 +393,22 @@ def test_cancel_pending_orders_safe_without_mt5(monkeypatch) -> None:
     result = mt5_client.cancel_pending_orders("GOLD#")
     assert result["success"] is False
     assert result["canceled"] == 0
+
+
+def test_close_position_partial_volume_closes_only_that_much(monkeypatch) -> None:
+    fake_mt5 = _FakeMt5(positions=[_FakeStruct(ticket=789, symbol="GOLD#", type=_FakeMt5.POSITION_TYPE_SELL, volume=0.03, price_open=4185.79, price_current=4168.0, sl=4202.43, tp=4148.95, profit=50.0)])
+    monkeypatch.setattr(mt5_client, "mt5", fake_mt5)
+    monkeypatch.setattr(mt5_client, "connect", lambda: True)
+    monkeypatch.setattr(mt5_client, "disconnect", lambda: None)
+
+    result = mt5_client.close_position(789, volume=0.01)
+
+    assert result["success"] is True and result["partial"] is True
+    assert result["volume"] == 0.01 and result["remaining_volume"] == 0.02
+    assert fake_mt5.sent_requests[0]["volume"] == 0.01 and fake_mt5.sent_requests[0]["position"] == 789
+    assert fake_mt5.sent_requests[0]["comment"] == "GP-MATE partial"
+
+    too_much = mt5_client.close_position(789, volume=0.05)
+    assert too_much["success"] is False and "Invalid partial volume" in too_much["reason"]
+    full = mt5_client.close_position(789)
+    assert full["success"] is True and full["partial"] is False and full["volume"] == 0.03
