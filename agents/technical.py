@@ -6,8 +6,8 @@ from typing import Any, Final, Literal, TypedDict, cast
 from agents.base import analysis_model, get_default_client
 from indicators.price_levels import accepted, resolve_level
 
-SYSTEM_PROMPT = (
-    "あなたはGOLD(XAU/USD)のテクニカル分析官です。"
+SYSTEM_PROMPT_TEMPLATE = (
+    "あなたは__INSTRUMENT__のテクニカル分析官です。"
     "与えられた多時間軸(D1/H4/H1)の指標スナップショット、水平帯(supports/resistances)、"
     "価格構造(直近スイングの高値安値の並び、未充填のFVG)だけを材料に、自分の判断で相場を読んでください。"
     "採点表や『この条件ならこう答える』という固定の規則はありません。あなたの読みがそのまま採用されます。"
@@ -35,6 +35,15 @@ SYSTEM_PROMPT = (
     "evidence: string[], counter_evidence: string[], data_quality: 'GOOD'|'PARTIAL'|'POOR', abstain_reason: string|null, "
     "what_would_change_view: string, reasoning: string(日本語)}"
 )
+
+# Gold wording (the default instrument); other instruments fill the template.
+SYSTEM_PROMPT = SYSTEM_PROMPT_TEMPLATE.replace("__INSTRUMENT__", "GOLD(XAU/USD)")
+
+
+def system_prompt_for(instrument: Any = None) -> str:
+    label = str(getattr(instrument, "label", "") or "GOLD(XAU/USD)")
+    return SYSTEM_PROMPT_TEMPLATE.replace("__INSTRUMENT__", label)
+
 
 REGIME_VIEW_VALUES: Final[tuple[str, ...]] = ("TREND_CONTINUATION", "MEAN_REVERSION", "UNCLEAR")
 H1_ROLE_VALUES: Final[tuple[str, ...]] = ("IMPULSE", "PULLBACK", "REVERSAL_ATTEMPT", "NOISE")
@@ -473,7 +482,7 @@ def _analyst_view(payload: dict[str, Any], levels: list[dict[str, Any]] | None =
     }
 
 
-def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
+def analyze_technical(indicator_payload: dict[str, Any], instrument: Any = None) -> dict[str, Any]:
     direction_payload = _extract_direction_context(indicator_payload)
     tp_reference_only = _extract_tp_reference_only(indicator_payload)
     horizontal_levels = _extract_horizontal_levels(direction_payload, tp_reference_only)
@@ -511,7 +520,7 @@ def analyze_technical(indicator_payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     result = get_default_client().call_json(
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt_for(instrument),
         user_prompt=user_prompt,
         model=analysis_model(),
         fallback_payload={},

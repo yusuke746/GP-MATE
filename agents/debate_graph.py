@@ -1554,6 +1554,7 @@ def run_debate_graph(
     llm_override: RoleLLMCallable | None = None,
     axis: str | None = None,
     regime_hint: dict[str, Any] | None = None,
+    instrument: Any = None,
 ) -> dict[str, Any]:
     """Run the two-advocate + Judge debate with LangGraph and return a report.
 
@@ -1571,7 +1572,7 @@ def run_debate_graph(
         from agents.panel_debate import run_panel_debate
 
         try:
-            return run_panel_debate(technical_report, sentiment_report, macro_report, regime_hint=hint)
+            return run_panel_debate(technical_report, sentiment_report, macro_report, regime_hint=hint, instrument=instrument)
         except Exception as exc:
             LOGGER.warning("run_panel_debate failed: %s", exc)
             return _failed_report(AXIS_PANEL, exc)

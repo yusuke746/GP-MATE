@@ -177,18 +177,23 @@ def _levels_and_atr(technical_report: dict[str, Any]) -> tuple[list[dict[str, An
     return levels, _safe_float_or_none(h1.get("atr_14"))
 
 
-def _execution_geometry(technical_report: dict[str, Any], spread_usd: float | None) -> dict[str, Any]:
-    """USD distances the risk manager will enforce, per horizon (facts for the trader)."""
+def _execution_geometry(technical_report: dict[str, Any], spread_usd: float | None, instrument: Any = None) -> dict[str, Any]:
+    """Price-unit distances the risk manager will enforce, per horizon (facts for the trader)."""
     context = technical_report.get("direction_context") if isinstance(technical_report, dict) else None
     context = context if isinstance(context, dict) else {}
     h1 = context.get("h1") if isinstance(context.get("h1"), dict) else {}
     h4 = context.get("h4") if isinstance(context.get("h4"), dict) else {}
+    buffer = getattr(instrument, "structure_buffer", None)
     try:
+        kwargs: dict[str, Any] = {}
+        if buffer is not None:
+            kwargs["structure_buffer_usd"] = float(buffer)
         return execution_geometry(
             current_price=_safe_float_or_none(h1.get("close")) or 0.0,
             atr_h1=_safe_float_or_none(h1.get("atr_14")) or 0.0,
             atr_h4=_safe_float_or_none(h4.get("atr_14")) or 0.0,
             spread_usd=spread_usd,
+            **kwargs,
         )
     except Exception:
         return {}
@@ -409,6 +414,8 @@ def decide_trade(
     confidence_threshold: float | None = None,  # deprecated: no longer gates anything; kept for callers
     recent_context: dict[str, Any] | None = None,
     spread_usd: float | None = None,
+    instrument: Any = None,
+    symbol: str | None = None,
 ) -> dict[str, Any]:
     """Final decision. The trader's action stands; there is no confidence gate.
 
@@ -436,9 +443,10 @@ def decide_trade(
         "debate": _strip_debater_confidence(debate_report),
         "judge_summary": _strip_debater_confidence(judge_summary),
         "recent_context": recent_context or {"decisions": [], "recent_closed": []},
-        "execution_geometry": _execution_geometry(technical_report, spread_usd),
+        "execution_geometry": _execution_geometry(technical_report, spread_usd, instrument),
         "constraints": {
-            "symbol": SYMBOL,
+            "symbol": symbol or SYMBOL,
+            "instrument": str(getattr(instrument, "label", "") or "GOLD(XAU/USD)"),
         },
     }
 
@@ -475,7 +483,7 @@ def decide_trade(
     payload["trigger_conditions"] = [str(x) for x in tc] if isinstance(tc, list) else []
 
     payload["action"] = action
-    payload["symbol"] = str(payload.get("symbol") or SYMBOL)
+    payload["symbol"] = str(symbol or payload.get("symbol") or SYMBOL)
     # Not requested; if the model volunteers one it is logged, never used.
     payload["confidence"] = _safe_float_or_none(payload.get("confidence"))
     payload["risk_level"] = risk_level

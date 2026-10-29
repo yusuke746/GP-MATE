@@ -21,15 +21,15 @@ LOGGER = logging.getLogger(__name__)
 REGIME_VIEW_VALUES: Final[tuple[str, ...]] = ("SUPPORTS_CONTINUATION", "SUPPORTS_REVERSAL", "UNCLEAR")
 BIAS_SCORE: Final[dict[str, float]] = {"BULLISH": 0.5, "BEARISH": -0.5, "NEUTRAL": 0.0}
 
-SYSTEM_PROMPT = (
-    "あなたはGOLD(XAU/USD)のニュースを読む専門家です。"
+SYSTEM_PROMPT_TEMPLATE = (
+    "あなたは__INSTRUMENT__のニュースを読む専門家です。"
     "与えられた見出し(と、あれば本文の抜粋・経済指標の結果)だけを材料に、あなた自身の判断で答えてください。"
     "見出しの種類ごとの採点規則はありません。あなたの読みがそのまま採用されます。"
-    "答える問い: (1) この中で『金価格にとって新しい情報』は何か(すでに起きた値動きをなぞるだけの見出しと区別する)。"
-    "(2) 新しい情報を総合すると、金にとって強気・弱気・中立のどれか。"
+    "答える問い: (1) この中で『__ASSET__にとって新しい情報』は何か(すでに起きた値動きをなぞるだけの見出しと区別する)。"
+    "(2) 新しい情報を総合すると、__ASSET__にとって強気・弱気・中立のどれか(__BIAS__)。"
     "(3) それはいまの価格トレンドの継続を支えるか、反転を促すか、どちらとも言えないか。"
     "(4) 最も影響の大きい見出しはどれか。"
-    "株式やドルへの影響ではなく、金価格への影響として評価すること。"
+    "他の市場への影響ではなく、__ASSET__への影響として評価すること。"
     "材料が乏しい、または互いに打ち消し合うときはNEUTRAL/UNCLEARでよく、無理に方向を出さないこと。"
     "結論に反する見出し(counter_evidence)も探して列挙し(無ければ空)、"
     "データ品質 data_quality を GOOD / PARTIAL(重複・古い記事・文脈不足あり) / POOR(判断に足りない) で答え、"
@@ -40,6 +40,21 @@ SYSTEM_PROMPT = (
     "counter_evidence: string[], data_quality: 'GOOD'|'PARTIAL'|'POOR', abstain_reason: string|null, "
     "dominant_news: string, reasoning: string(日本語)}"
 )
+
+def _fill(template: str, instrument: Any) -> str:
+    label = str(getattr(instrument, "label", "") or "GOLD(XAU/USD)")
+    asset = str(getattr(instrument, "asset_noun", "") or "金価格")
+    bias = str(getattr(instrument, "bias_meaning", "") or "BULLISH は金価格(XAU/USD)の上昇、BEARISH は下落")
+    return template.replace("__INSTRUMENT__", label).replace("__ASSET__", asset).replace("__BIAS__", bias)
+
+
+# Gold wording (the default instrument); other instruments fill the template.
+SYSTEM_PROMPT = _fill(SYSTEM_PROMPT_TEMPLATE, None)
+
+
+def system_prompt_for(instrument: Any = None) -> str:
+    return _fill(SYSTEM_PROMPT_TEMPLATE, instrument)
+
 
 FALLBACK_RESPONSE: dict[str, Any] = {
     "score": 0.0,
@@ -195,7 +210,7 @@ def sentiment_for_feed_state(news_items: list[dict[str, Any]], feed_meta: Any) -
     return None
 
 
-def analyze_sentiment(news_items: list[dict[str, Any]]) -> dict[str, Any]:
+def analyze_sentiment(news_items: list[dict[str, Any]], instrument: Any = None) -> dict[str, Any]:
     if len(news_items) == 0:
         return {
             "score": 0.0,
@@ -215,14 +230,15 @@ def analyze_sentiment(news_items: list[dict[str, Any]]) -> dict[str, Any]:
             },
         }
 
+    asset = str(getattr(instrument, "asset_noun", "") or "金")
     user_prompt = (
-        "以下の見出し群について、金にとって新しい情報は何か、総合して強気/弱気/中立のどれか、"
+        f"以下の見出し群について、{asset}にとって新しい情報は何か、総合して強気/弱気/中立のどれか、"
         "いまのトレンドの継続を支えるか反転を促すかを、あなた自身の判断で答えてください。\n"
         f"{json.dumps(news_items, ensure_ascii=False)}"
     )
 
     result = get_default_client().call_json(
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt_for(instrument),
         user_prompt=user_prompt,
         model=analysis_model(),
         fallback_payload=FALLBACK_RESPONSE,

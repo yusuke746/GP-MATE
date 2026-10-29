@@ -11,7 +11,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from config import JST_TZ, MARKET_TIMEZONE_NAME, MARKET_TZ, NY_RUN_TIMES, STAGE
+from config import JST_TZ, MARKET_TIMEZONE_NAME, MARKET_TZ, NY_RUN_TIMES, SHADOW_JUDGMENT_TIMES_NY, SHADOW_SYMBOLS, STAGE
 from data.mt5_client import get_account_info
 from main import run_once
 
@@ -79,6 +79,32 @@ def _job_wrapper() -> None:
     finally:
         elapsed = time.time() - started
         LOGGER.info("run_once end elapsed=%.2fs", elapsed)
+    _run_shadow_if_due()
+
+
+def _shadow_slot_due(reference: datetime | None = None) -> bool:
+    """Shadow instruments run at every production slot unless SHADOW_JUDGMENT_TIMES_NY narrows it."""
+    if not SHADOW_SYMBOLS:
+        return False
+    if not SHADOW_JUDGMENT_TIMES_NY:
+        return True
+    now_ny = (reference or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    return any(abs((now_ny.hour * 60 + now_ny.minute) - (h * 60 + m)) <= 5 for h, m in SHADOW_JUDGMENT_TIMES_NY)
+
+
+def _run_shadow_if_due() -> None:
+    if not _shadow_slot_due():
+        return
+    started = time.time()
+    try:
+        from shadow import run_shadow_cycle
+
+        results = run_shadow_cycle()
+        LOGGER.info("shadow cycle done: %s", {k: (v.get("ok", v) if isinstance(v, dict) else v) for k, v in results.items()})
+    except Exception as exc:
+        LOGGER.exception("shadow cycle error (scheduler continues): %s", exc)
+    finally:
+        LOGGER.info("shadow cycle end elapsed=%.2fs", time.time() - started)
 
 
 def _confirm_real_stage_warning(trade_mode: int) -> bool:

@@ -42,8 +42,8 @@ CONSENSUS_VALUES: Final[tuple[str, ...]] = ("UNANIMOUS", "MAJORITY", "SPLIT")
 # from anyone's self-reported number.
 CONSENSUS_CONFIDENCE: Final[dict[str, float]] = {"UNANIMOUS": 0.8, "MAJORITY": 0.6, "SPLIT": 0.4}
 
-PANEL_SYSTEM_PROMPT = (
-    "あなたはGOLD(XAU/USD)の分析官パネルの一員として討論に参加します。"
+PANEL_SYSTEM_PROMPT_TEMPLATE = (
+    "あなたは__INSTRUMENT__の分析官パネルの一員として討論に参加します。"
     "あなたの専門は__ROLE__です。論点はただ一つ: いまの相場はトレンド継続局面(押し目買い/戻り売りやブレイク追随が機能する)か、"
     "反転・平均回帰局面(帯の端で逆方向に戻りやすい)か、判断できないか。"
     "自分の専門のレポート(your_report)を出発点に、他の分析官のレポート(other_reports)を読み、"
@@ -61,6 +61,15 @@ PANEL_SYSTEM_PROMPT = (
     "key_levels: {continuation_level_id: string|null, reversal_level_id: string|null}, "
     "what_would_change_view: string, changed_view: boolean, change_reason: string}"
 )
+
+# Gold wording (the default instrument); other instruments fill the template.
+PANEL_SYSTEM_PROMPT = PANEL_SYSTEM_PROMPT_TEMPLATE.replace("__INSTRUMENT__", "GOLD(XAU/USD)")
+
+
+def panel_system_prompt_for(instrument: Any = None) -> str:
+    label = str(getattr(instrument, "label", "") or "GOLD(XAU/USD)")
+    return PANEL_SYSTEM_PROMPT_TEMPLATE.replace("__INSTRUMENT__", label)
+
 
 DEBATE_PROTOCOL_VERSION: Final[str] = "panel-v2-symmetric-round1"
 JUDGE_MAX_ATTEMPTS: Final[int] = 2
@@ -353,8 +362,10 @@ def run_panel_debate(
     regime_hint: dict[str, Any] | None = None,
     model: str = MODEL_DEBATE,
     client: Any = None,
+    instrument: Any = None,
 ) -> dict[str, Any]:
     llm = client or get_default_client()
+    panel_prompt = panel_system_prompt_for(instrument)
     reports = {
         "technical": technical_report if isinstance(technical_report, dict) else {},
         "macro": macro_report if isinstance(macro_report, dict) else {},
@@ -388,7 +399,7 @@ def run_panel_debate(
             }
             try:
                 result = llm.call_json(
-                    system_prompt=PANEL_SYSTEM_PROMPT.replace("__ROLE__", ROLE_LABELS[role]),
+                    system_prompt=panel_prompt.replace("__ROLE__", ROLE_LABELS[role]),
                     user_prompt=json.dumps(user_payload, ensure_ascii=False),
                     model=model,
                     fallback_payload={},
