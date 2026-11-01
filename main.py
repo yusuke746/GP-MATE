@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import json
 import logging
 import sys
@@ -29,6 +30,7 @@ from agents.trader import decide_trade
 from config import (
     BREAKEVEN_BUFFER,
     PARTIAL_CLOSE_FRACTION,
+    SL_STRUCTURE_BUFFER_USD,
     CONSECUTIVE_LOSS_LIMIT,
     DAILY_PENDING_CUTOFF_NY,
     FRIDAY_FLAT_TIME_NY,
@@ -62,7 +64,7 @@ from data.mt5_client import (
     place_pending_order,
     send_order,
 )
-from data.news_client import fetch_news_with_meta, is_high_impact_soon
+from data.news_client import fetch_calendar_events, fetch_news_with_meta, is_high_impact_soon
 from agents.technical import EXTENSION_ATR_CAUTION, calc_extension_atr
 from indicators.ta_calc import add_indicators
 from indicators.horizontal_levels import build_horizontal_levels
@@ -78,6 +80,8 @@ from risk.risk_manager import (
     select_atr,
 )
 from risk.breakeven import partial_close_volume, should_move_to_breakeven
+from instruments import GOLD, Instrument, instrument_for
+from analysis.shadow_store import append_plan, build_plan_record, next_slot_utc
 
 LOGGER = logging.getLogger(__name__)
 
@@ -92,6 +96,14 @@ EXCURSION_STALE_DAYS = 14
 # pending entries).
 TRADE_META_FILENAME = "trade_meta.json"
 TRADE_META_STALE_DAYS = 30
+
+# The instrument the production symbol is: gold keeps the configured wick
+# buffer (SL_STRUCTURE_BUFFER_USD); other profiles carry their own units.
+PRODUCTION_INSTRUMENT: Instrument = (
+    dataclasses.replace(instrument_for(SYMBOL), structure_buffer=SL_STRUCTURE_BUFFER_USD)
+    if instrument_for(SYMBOL).key == GOLD.key
+    else instrument_for(SYMBOL)
+)
 
 # TP reference proximity in USD. Used only for TP-target confluence labels.
 TP_PROXIMITY_ROUND_NUMBER = 5.0
@@ -759,7 +771,10 @@ def _is_weekend_flat_window(reference: datetime | None = None) -> bool:
     return weekday in {5, 6}
 
 
-def _build_round_numbers(current_price: float, scan_range: float = TP_ROUND_SCAN_RANGE) -> list[float]:
+def _build_round_numbers(current_price: float, scan_range: float | None = None, instrument: Instrument | None = None) -> list[float]:
+    inst = instrument or PRODUCTION_INSTRUMENT
+    if scan_range is None:
+        scan_range = inst.round_scan_range if instrument is not None else TP_ROUND_SCAN_RANGE
     if current_price <= 0 or scan_range <= 0:
         return []
 
@@ -767,7 +782,8 @@ def _build_round_numbers(current_price: float, scan_range: float = TP_ROUND_SCAN
     upper = current_price + scan_range
     levels: set[float] = set()
 
-    for step in (TP_ROUND_STEP_MINOR, TP_ROUND_STEP_MAJOR):
+    steps = (TP_ROUND_STEP_MINOR, TP_ROUND_STEP_MAJOR) if instrument is None else (inst.round_step_minor, inst.round_step_major)
+    for step in steps:
         if step <= 0:
             continue
         start = int(lower // step)
@@ -791,7 +807,11 @@ def _build_tp_reference_only(
     d1_frame: Any,
     h4_frame: Any,
     current_price: float,
+    instrument: Instrument | None = None,
 ) -> dict[str, Any]:
+    prox_round = instrument.tp_proximity_round if instrument is not None else TP_PROXIMITY_ROUND_NUMBER
+    prox_prev = instrument.tp_proximity_prev_day if instrument is not None else TP_PROXIMITY_PREV_DAY
+    prox_ma = instrument.tp_proximity_ma if instrument is not None else TP_PROXIMITY_MOVING_AVERAGE
     prev_day = {"high": None, "low": None}
     try:
         if d1_frame is not None and not d1_frame.empty and len(d1_frame.index) >= 2:
@@ -810,7 +830,7 @@ def _build_tp_reference_only(
         "d1_ma200": _calc_latest_ma(d1_frame, 200),
     }
 
-    round_numbers = _build_round_numbers(current_price)
+    round_numbers = _build_round_numbers(current_price, instrument=instrument)
 
     safe_levels = horizontal_levels if isinstance(horizontal_levels, dict) else {}
     supports_raw = safe_levels.get("supports", []) if isinstance(safe_levels.get("supports", []), list) else []
@@ -826,7 +846,7 @@ def _build_tp_reference_only(
         if touch_count >= TP_CONFLUENCE_TOUCH_COUNT_MIN:
             confluence.append(f"タッチ{touch_count}回")
 
-        near_rounds = [lv for lv in round_numbers if _is_near(price, lv, TP_PROXIMITY_ROUND_NUMBER)]
+        near_rounds = [lv for lv in round_numbers if _is_near(price, lv, prox_round)]
         if near_rounds:
             nearest_round = min(near_rounds, key=lambda lv: abs(lv - price))
             label = int(nearest_round) if float(nearest_round).is_integer() else nearest_round
@@ -834,9 +854,9 @@ def _build_tp_reference_only(
 
         prev_high = _safe_float_or_none(prev_day.get("high"))
         prev_low = _safe_float_or_none(prev_day.get("low"))
-        if _is_near(price, prev_high, TP_PROXIMITY_PREV_DAY):
+        if _is_near(price, prev_high, prox_prev):
             confluence.append("前日高値付近")
-        if _is_near(price, prev_low, TP_PROXIMITY_PREV_DAY):
+        if _is_near(price, prev_low, prox_prev):
             confluence.append("前日安値付近")
 
         ma_labels = {
@@ -846,7 +866,7 @@ def _build_tp_reference_only(
             "d1_ma200": "D1 MA200",
         }
         for key, label in ma_labels.items():
-            if _is_near(price, _safe_float_or_none(moving_averages.get(key)), TP_PROXIMITY_MOVING_AVERAGE):
+            if _is_near(price, _safe_float_or_none(moving_averages.get(key)), prox_ma):
                 confluence.append(f"{label}近接")
 
         note = "、".join(confluence) if confluence else "根拠重なりなし"
@@ -1061,14 +1081,24 @@ def _insufficient_bars_reason(bars_meta: dict[str, dict[str, Any]], minimum: int
 
 def _build_market_reports(
     now_utc: datetime | None = None,
+    instrument: Instrument | None = None,
+    symbol: str | None = None,
 ) -> tuple[Any, Any, Any, list[dict[str, Any]], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    """Bars, indicators, levels and the three analyst reports for one instrument.
+
+    Defaults to the production symbol (gold). ``instrument`` selects the
+    analysts' wording, headline keywords, calendar currencies and price-unit
+    constants; ``symbol`` is the broker symbol the bars are fetched for.
+    """
+    inst = instrument or PRODUCTION_INSTRUMENT
+    broker_symbol = symbol or SYMBOL
     # Closed bars only: the forming bar MT5 returns last is dropped BEFORE any
     # indicator, swing, gap or level is computed (shared with the forecast logger).
     now = now_utc or datetime.now(UTC)
     bars_meta: dict[str, dict[str, Any]] = {}
     frames: dict[str, Any] = {}
     for timeframe in ("D1", "H4", "H1"):
-        confirmed, meta = get_confirmed_rates(SYMBOL, timeframe, 300, now, fetch=get_rates)
+        confirmed, meta = get_confirmed_rates(broker_symbol, timeframe, 300, now, fetch=get_rates)
         bars_meta[timeframe] = meta
         frames[timeframe] = add_indicators(confirmed) if not confirmed.empty else confirmed
     d1, h4, h1 = frames["D1"], frames["H4"], frames["H1"]
@@ -1112,6 +1142,7 @@ def _build_market_reports(
         d1_frame=d1,
         h4_frame=h4,
         current_price=float(h1_latest.get("close", 0.0) or 0.0),
+        instrument=inst if instrument is not None else None,
     )
     # ID-tagged candidate levels: analysts, chair and trader refer to these by
     # level_id instead of inventing prices.
@@ -1123,21 +1154,30 @@ def _build_market_reports(
         tp_reference=tp_reference_only,
     )
 
-    news_items, feed_meta = fetch_news_with_meta(hours=24)
+    if instrument is None:
+        news_items, feed_meta = fetch_news_with_meta(hours=24)
+    else:
+        news_items, feed_meta = fetch_news_with_meta(hours=24, keywords=inst.news_keywords)
     # FRED series + live dollar index + positioning + calendar surprises.
-    macro_data = build_macro_inputs(get_macro_data(force_refresh=False))
-    macro_report = analyze_macro_environment(macro_data)
+    if instrument is None:
+        macro_data = build_macro_inputs(get_macro_data(force_refresh=False))
+    else:
+        currencies = set(inst.calendar_currencies)
+        macro_data = build_macro_inputs(
+            get_macro_data(force_refresh=False),
+            calendar_fetcher=lambda: fetch_calendar_events(currencies=currencies),
+        )
+    macro_report = analyze_macro_environment(macro_data, instrument=inst) if instrument is not None else analyze_macro_environment(macro_data)
     # Structured prints are the highest-signal headlines a gold trader gets and
     # keep the sentiment input alive on release days when RSS feeds are thin.
     release_items = releases_as_news_items(macro_data.get("recent_releases", []) or [])
     if release_items:
         news_items = release_items + list(news_items)
-    technical_report = analyze_technical(
-        {
-            "direction_context": direction_context,
-            "tp_reference_only": tp_reference_only,
-        }
-    )
+    technical_payload = {
+        "direction_context": direction_context,
+        "tp_reference_only": tp_reference_only,
+    }
+    technical_report = analyze_technical(technical_payload, instrument=inst) if instrument is not None else analyze_technical(technical_payload)
     # Rule-based regime read (TREND / RANGE / TRANSITION + entry style) shared
     # by the debate (as regime_hint), the trader and the forecast logger.
     if isinstance(technical_report, dict):
@@ -1147,7 +1187,9 @@ def _build_market_reports(
             LOGGER.warning("classify_regime failed safely: %s", exc)
     # Feed state first: dead feeds -> INSUFFICIENT (hold); healthy feeds with
     # nothing new -> NO_NEWS (neutral, no analyst call); otherwise analyse.
-    sentiment_report = sentiment_for_feed_state(news_items, feed_meta) or analyze_sentiment(news_items)
+    sentiment_report = sentiment_for_feed_state(news_items, feed_meta) or (
+        analyze_sentiment(news_items, instrument=inst) if instrument is not None else analyze_sentiment(news_items)
+    )
     if isinstance(sentiment_report, dict):
         sentiment_report["feed_meta"] = feed_meta
     return d1, h4, h1, news_items, macro_report, technical_report, sentiment_report, bars_meta
@@ -1176,15 +1218,21 @@ def _build_debate_and_decision_reports(
     technical_report: dict[str, Any],
     sentiment_report: dict[str, Any],
     macro_report: dict[str, Any],
+    symbol: str | None = None,
+    instrument: Instrument | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
     gate = should_execute_debate(technical_report, sentiment_report, macro_report)
     if gate["should_debate"]:
+        debate_kwargs: dict[str, Any] = {}
+        if instrument is not None:
+            debate_kwargs["instrument"] = instrument
         debate_report = run_debate_graph(
             technical_report,
             sentiment_report,
             macro_report,
             axis=DEBATE_AXIS,
             regime_hint=technical_report.get("regime") if isinstance(technical_report, dict) else None,
+            **debate_kwargs,
         )
         debate_meta = debate_report.get("_meta", {}) if isinstance(debate_report, dict) else {}
         debate_ok = bool(debate_meta.get("ok", False)) if isinstance(debate_meta, dict) else False
@@ -1195,7 +1243,7 @@ def _build_debate_and_decision_reports(
             debate_report,
             {
                 "action": "HOLD",
-                "symbol": SYMBOL,
+                "symbol": symbol or SYMBOL,
                 "confidence": 0.0,
                 "reasoning": "議論エンジン失敗のためHOLD",
                 "risk_level": "HIGH",
@@ -1896,6 +1944,70 @@ def calc_today_risk_stats() -> tuple[int, float]:
         return CONSECUTIVE_LOSS_LIMIT, MAX_DAILY_LOSS_PCT
 
 
+def _record_production_plan(
+    *,
+    now_iso: str,
+    trader_report: Any,
+    risk_plan: dict[str, Any],
+    pendings: list[Any],
+    pending_outcome: dict[str, Any],
+    final_action: str,
+    order_sent: bool,
+    current_price: float,
+    atr: float,
+    atr_timeframe: str,
+    trade_horizon: str,
+    market_filter_ok: bool,
+    market_filter_reason: str,
+    debate_report: Any,
+) -> None:
+    """Gold's judgment as a shadow plan (same record as the shadow symbols, no
+    extra LLM calls) so instruments are compared on one code path. Never raises."""
+    try:
+        action = str(trader_report.get("action", "HOLD") or "HOLD") if isinstance(trader_report, dict) else "HOLD"
+        pending = pendings[0] if pendings and isinstance(pendings[0], dict) else None
+        pending_status = str(pending_outcome.get("status", "") or "")
+        plan_for_record: dict[str, Any] = risk_plan
+        placed = order_sent
+        valid_until: str | None = None
+        if action == "HOLD" and pending is not None:
+            placed = pending_status == "placed"
+            # The pending geometry lives in the placement outcome's fields.
+            fields = pending_outcome.get("fields") if isinstance(pending_outcome.get("fields"), dict) else {}
+            log_row = pending_outcome.get("log_row") if isinstance(pending_outcome.get("log_row"), dict) else {}
+            if log_row:
+                plan_for_record = {"ok": True, "sl": log_row.get("sl"), "tp": log_row.get("tp"), "net_rr": fields.get("net_rr"), "sl_source": fields.get("sl_source"), "tp_source": fields.get("tp_source"), "reason": "OK"}
+            else:
+                plan_for_record = {"ok": False, "reason": pending_status, "net_rr": fields.get("net_rr"), "sl_source": fields.get("sl_source"), "tp_source": fields.get("tp_source")}
+            if placed:
+                valid_until = next_slot_utc(datetime.fromisoformat(now_iso), NY_RUN_TIMES, MARKET_TZ).isoformat()
+        elif action in {"BUY", "SELL"} and not market_filter_ok:
+            plan_for_record = {**risk_plan, "ok": False, "reason": market_filter_reason or risk_plan.get("reason", "")}
+        append_plan(
+            build_plan_record(
+                symbol=SYMBOL,
+                instrument_key=PRODUCTION_INSTRUMENT.key,
+                ts_utc=now_iso,
+                source="production",
+                trader_report=trader_report if isinstance(trader_report, dict) else None,
+                risk_plan=plan_for_record,
+                pending=pending,
+                pending_status=pending_status,
+                final_action=final_action,
+                current_price=current_price,
+                atr_used=atr,
+                atr_timeframe=atr_timeframe,
+                trade_horizon=trade_horizon,
+                valid_until_utc=valid_until,
+                placed=placed,
+                market_filter_reason=market_filter_reason if not market_filter_ok else "",
+                debate_report=debate_report if isinstance(debate_report, dict) else None,
+            )
+        )
+    except Exception as exc:
+        LOGGER.warning("shadow plan record failed safely: %s", exc)
+
+
 def run_once(
     baseline_spread: float | None = None,
     consecutive_losses: int | None = None,
@@ -2320,6 +2432,22 @@ def run_once(
         result["tp_level_id"] = str(trader_report.get("suggested_tp_level_id", "") or "") if isinstance(trader_report, dict) else ""
         result["sl_level_id"] = str(trader_report.get("suggested_sl_level_id", "") or "") if isinstance(trader_report, dict) else ""
         result.update(_analyst_quality_fields(technical_report, macro_report, sentiment_report))
+        _record_production_plan(
+            now_iso=now_iso,
+            trader_report=trader_report,
+            risk_plan=risk_plan,
+            pendings=pendings if isinstance(pendings, list) else [],
+            pending_outcome=pending_outcome,
+            final_action=final_action,
+            order_sent=bool(order_result.get("success", False)),
+            current_price=entry_price,
+            atr=atr,
+            atr_timeframe=atr_timeframe,
+            trade_horizon=trade_horizon,
+            market_filter_ok=market_filter_ok,
+            market_filter_reason=market_filter_reason,
+            debate_report=debate_report,
+        )
         _append_trade_log(result)
         pending_row = pending_outcome.get("log_row")
         if isinstance(pending_row, dict):

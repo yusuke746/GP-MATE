@@ -319,6 +319,7 @@ def build_risk_plan(
     min_rr: float = MIN_RISK_REWARD_RATIO,
     spread_usd: float = 0.0,
     max_risk_pct: float = MAX_RISK_PERCENT,
+    structure_buffer: float | None = None,
 ) -> dict[str, float | str | bool]:
     """Build lot/SL/TP plan with safe fallback for invalid cases.
 
@@ -372,6 +373,7 @@ def build_risk_plan(
             atr_mult=atr_mult,
             default_sl=default_sl,
             suggested_sl=suggested_sl,
+            structure_buffer_usd=float(structure_buffer) if structure_buffer is not None else SL_STRUCTURE_BUFFER_USD,
         )
 
         # Default to legacy 2R TP when AI suggestion is unavailable/invalid.

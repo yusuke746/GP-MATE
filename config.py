@@ -66,6 +66,27 @@ def _parse_judgment_times(value: str) -> tuple[tuple[int, int], ...]:
 
 
 NY_RUN_TIMES: Final[tuple[tuple[int, int], ...]] = _parse_judgment_times(os.getenv("JUDGMENT_TIMES_NY", "") or "")
+
+
+def _parse_shadow_symbols(value: str) -> tuple[str, ...]:
+    from instruments import parse_symbol_list  # local: instruments has no config dependency
+
+    return parse_symbol_list(value)
+
+
+def _parse_optional_times(value: str) -> tuple[tuple[int, int], ...]:
+    """Like _parse_judgment_times but empty when unset (no default slots)."""
+    if not value.strip():
+        return ()
+    return _parse_judgment_times(value)
+
+
+# Instruments judged every slot WITHOUT trading (plans recorded to
+# logs/shadow_plans.jsonl and resolved on realised bars). Empty = off.
+SHADOW_SYMBOLS: Final[tuple[str, ...]] = _parse_shadow_symbols(os.getenv("SHADOW_SYMBOLS", "") or "")
+# Optional subset of JUDGMENT_TIMES_NY at which the shadow instruments run
+# (to cap LLM cost); empty = every production slot.
+SHADOW_JUDGMENT_TIMES_NY: Final[tuple[tuple[int, int], ...]] = _parse_optional_times(os.getenv("SHADOW_JUDGMENT_TIMES_NY", "") or "")
 MARKET_TZ: Final[ZoneInfo] = ZoneInfo(MARKET_TIMEZONE_NAME)
 JST_TZ: Final[ZoneInfo] = ZoneInfo(JST_TIMEZONE_NAME)
 

@@ -28,10 +28,10 @@ MACRO_BIAS_VALUES: Final[tuple[Literal["BULLISH", "BEARISH", "NEUTRAL"], ...]] =
 REGIME_VIEW_VALUES: Final[tuple[str, ...]] = ("SUPPORTS_CONTINUATION", "SUPPORTS_REVERSAL", "UNCLEAR")
 DATA_QUALITY_VALUES: Final[tuple[str, ...]] = ("GOOD", "PARTIAL", "POOR")
 
-SYSTEM_PROMPT = (
-    "あなたはGOLD(XAU/USD)のマクロ環境を評価する分析官です。"
-    "与えられたmacro_dataだけを材料に、あなた自身の判断で、いまのマクロ環境が金価格にとって"
-    "強気(BULLISH)・弱気(BEARISH)・中立(NEUTRAL)のどれかを述べてください。"
+SYSTEM_PROMPT_TEMPLATE = (
+    "あなたは__INSTRUMENT__のマクロ環境を評価する分析官です。"
+    "与えられたmacro_dataだけを材料に、あなた自身の判断で、いまのマクロ環境が__ASSET__にとって"
+    "強気(BULLISH)・弱気(BEARISH)・中立(NEUTRAL)のどれかを述べてください(__BIAS__)。"
     "系列ごとの採点表や『この方向ならこう読む』という固定の規則はありません。あなたの読みがそのまま採用されます。"
     "教科書的な関係(ドル・金利・期待インフレ・ポジション)が現在も成り立っているかどうかも、"
     "与えられた数値から自分で判断してください。成り立っていないと考える根拠があればそう書いてよい。"
@@ -48,6 +48,21 @@ SYSTEM_PROMPT = (
     "key_drivers: string[], counter_evidence: string[], data_quality: 'GOOD'|'PARTIAL'|'POOR', "
     "abstain_reason: string|null, invalidation: string, reasoning: string(日本語)}"
 )
+
+def _fill(template: str, instrument: Any) -> str:
+    label = str(getattr(instrument, "label", "") or "GOLD(XAU/USD)")
+    asset = str(getattr(instrument, "asset_noun", "") or "金価格")
+    bias = str(getattr(instrument, "bias_meaning", "") or "BULLISH は金価格(XAU/USD)の上昇、BEARISH は下落")
+    return template.replace("__INSTRUMENT__", label).replace("__ASSET__", asset).replace("__BIAS__", bias)
+
+
+# Gold wording (the default instrument); other instruments fill the template.
+SYSTEM_PROMPT = _fill(SYSTEM_PROMPT_TEMPLATE, None)
+
+
+def system_prompt_for(instrument: Any = None) -> str:
+    return _fill(SYSTEM_PROMPT_TEMPLATE, instrument)
+
 
 # Provenance only: what each field is and how fresh it is. No "this means gold up".
 DATA_NOTES: Final[dict[str, str]] = {
@@ -138,7 +153,7 @@ def _analyst_input(macro_data: MacroData) -> dict[str, Any]:
     return data
 
 
-def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
+def analyze_macro_environment(fred_data: MacroData, instrument: Any = None) -> MacroAnalysisResult:
     meta = fred_data.get("_meta", {}) if isinstance(fred_data, dict) else {}
     if not isinstance(meta, dict) or not bool(meta.get("ok", False)):
         return _build_neutral_result(
@@ -152,7 +167,7 @@ def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
             "macro_data": _analyst_input(fred_data),
             "data_notes": DATA_NOTES,
             "question": (
-                "この環境は金価格にとって BULLISH / BEARISH / NEUTRAL のどれか。"
+                f"この環境は{str(getattr(instrument, 'asset_noun', '') or '金価格')}にとって BULLISH / BEARISH / NEUTRAL のどれか。"
                 "いまの価格トレンドの継続を支えるか、反転を促すか。読みが崩れる条件は何か。"
             ),
         },
@@ -162,7 +177,7 @@ def analyze_macro_environment(fred_data: MacroData) -> MacroAnalysisResult:
     client = get_default_client()
     try:
         result = client.call_json(
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=system_prompt_for(instrument),
             user_prompt=user_prompt,
             model=analysis_model(),
             fallback_payload={},

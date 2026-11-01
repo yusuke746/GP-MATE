@@ -201,6 +201,25 @@ can be checked against the rules before it is proposed. Its `recent_context`
 shows the last 24h of its own decisions and the realized closes of the last
 7 days (side, entry/exit price, horizon, entry basis).
 
+## Other instruments: shadow mode
+
+The method is written for XAU/USD but runs on other dollar pairs through
+`instruments.py` profiles (USDJPY, EURUSD): the analysts' wording and what
+BULLISH means, the headline keywords, the calendar currencies, and the
+price-unit constants (round-number steps, confluence proximities, the wick
+buffer behind a structural stop). Set `SHADOW_SYMBOLS=USDJPY,EURUSD` and the
+scheduler runs the full pipeline for those instruments after each gold
+judgment **without placing orders**, recording the plan (market or pending:
+entry, SL, TP, validity until the next slot) to `logs/shadow_plans.jsonl`.
+Gold's production judgments are recorded there too (no extra LLM calls).
+`shadow.resolve_shadow_plans` labels each plan from realised H1 bars: was a
+pending plan filled before it expired, and did the trade reach TP or SL first
+(timeout after 72 bars, Friday flat mirrors production).
+`python scripts/eval_shadow.py [--resolve]` prints, per instrument, the plan
+rate, fill rate, win rate, expectancy in R and how often +1R was reached.
+Cost: each shadow instrument is roughly one production run per slot;
+`SHADOW_JUDGMENT_TIMES_NY` limits the slots.
+
 ## Regime (Trend vs Range)
 
 `indicators/regime.py` classifies every cycle as TREND / RANGE / TRANSITION from

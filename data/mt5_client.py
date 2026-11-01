@@ -1124,6 +1124,32 @@ def find_symbol_variants(all_names: list[str], wanted: str) -> list[str]:
     return sorted(hits, key=len)
 
 
+def resolve_broker_symbol(candidates: tuple[str, ...] | list[str]) -> str | None:
+    """The broker's name for the first candidate it offers ('USDJPY' -> 'USDJPY#').
+
+    Suffixed/prefixed variants are found from the full symbol list; the
+    shortest match wins. None when nothing matches or MT5 is unavailable.
+    """
+    if not connect():
+        return None
+    try:
+        if mt5 is None:
+            return None
+        symbols = mt5.symbols_get() or []
+        all_names = [str(getattr(sym, "name", "") or "") for sym in symbols]
+        all_names = [name for name in all_names if name]
+        for wanted in candidates:
+            for name in find_symbol_variants(all_names, str(wanted)) or []:
+                if mt5.symbol_info(name) is not None:
+                    return name
+        return None
+    except Exception as exc:
+        LOGGER.warning("resolve_broker_symbol failed safely: %s", exc)
+        return None
+    finally:
+        disconnect()
+
+
 def get_dollar_index_snapshot(candidates: tuple[str, ...] | None = None) -> dict[str, Any]:
     """Live dollar-index snapshot in the FRED MacroSeriesSnapshot shape.
 
