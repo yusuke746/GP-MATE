@@ -347,8 +347,18 @@ def resolve_shadow_plans(now: datetime | None = None, rates_fetcher: Callable[[s
 
 
 def run_shadow_cycle(now: datetime | None = None) -> dict[str, Any]:
-    """All configured shadow instruments once, then resolve. Called by the scheduler."""
+    """All configured shadow instruments once, then resolve. Called by the scheduler.
+
+    Respects the same session gate as production (weekend, Friday flat window,
+    Monday pre-open): on 2026-11-01 (a Sunday) the shadow pipeline ran two full
+    judgments per instrument on a closed market because only run_once checked it.
+    """
     results: dict[str, Any] = {}
+    allowed, reason = main._is_trading_session_allowed(now)
+    if not allowed:
+        LOGGER.info("shadow cycle skipped: %s", reason)
+        results["skipped"] = reason
+        return results
     for instrument in shadow_instruments():
         results[instrument.key] = run_shadow_once(instrument.key, now=now)
     try:

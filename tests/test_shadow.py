@@ -285,3 +285,18 @@ def test_run_once_records_gold_judgment_as_a_production_plan(tmp_path: Path, mon
     assert len(rows) == 1 and rows[0]["source"] == "production" and rows[0]["instrument"] == "XAUUSD"
     assert rows[0]["plan_type"] == "MARKET" and rows[0]["status"] == "OPEN" and rows[0]["placed"] is True
     assert rows[0]["entry"] == 100.0 and rows[0]["sl"] == 95.0 and rows[0]["tp"] == 110.0
+
+
+def test_shadow_cycle_respects_the_trading_session_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(shadow, "shadow_instruments", lambda: [USDJPY, EURUSD])
+    monkeypatch.setattr(shadow, "run_shadow_once", lambda key, now=None: calls.append(key) or {"ok": True})
+    monkeypatch.setattr(shadow, "resolve_shadow_plans", lambda now=None, rates_fetcher=None: {"total": 0})
+
+    sunday_morning_ny = datetime(2026, 11, 1, 14, 46, tzinfo=UTC)  # 09:46 EST Sunday: market closed
+    result = shadow.run_shadow_cycle(now=sunday_morning_ny)
+    assert calls == [] and "Sunday" in result["skipped"] and "resolve" not in result
+
+    sunday_evening_ny = datetime(2026, 11, 2, 1, 0, tzinfo=UTC)  # 20:00 EST Sunday: reopened
+    result = shadow.run_shadow_cycle(now=sunday_evening_ny)
+    assert calls == ["USDJPY", "EURUSD"] and result["resolve"] == {"total": 0}
